@@ -29,9 +29,21 @@
 
 ## CI
 
-GitHub Actions workflow:
+GitHub Actions workflows:
 - `.github/workflows/ci.yml`
-- Runs backend tests and frontend typecheck + build on push/PR.
+  - Backend tests (`pytest`)
+  - Frontend typecheck + tests + build (`pnpm`)
+  - Docker build verification for backend/frontend images
+- `.github/workflows/security.yml`
+  - Dependency review on pull requests
+  - CodeQL static analysis on push/PR + weekly schedule
+- `.github/workflows/cd.yml`
+  - Builds and publishes versioned backend/frontend images to GHCR
+  - Auto-deploys to `staging` after successful `CI` on `main`
+  - Supports manual `staging` / `production` deployments
+Deployment runbook:
+- `ops/README.md`
+- `ops/deploy/.env.remote.example`
 
 ## Containers
 
@@ -46,6 +58,8 @@ Local production-like stack:
 
 - `GET /api/health/ready` returns `200`.
 - `python -m pytest -q backend/tests` passes.
-- `cd frontend && npx tsc --noEmit` passes.
-- `cd frontend && npm run build` passes.
+- `cd frontend && pnpm -s exec tsc --noEmit` passes.
+- `cd frontend && pnpm -s exec jest --ci --runInBand --passWithNoTests` passes.
+- `cd frontend && pnpm run build` passes.
 - OTP and SMTP test email verified in staging.
+- Staging deployment healthy after `CD` rollout.

@@ -1,7 +1,7 @@
 from collections import defaultdict
 import logging
 from time import perf_counter
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -735,6 +735,7 @@ def delete_slot_lock(
 @router.post("/timetable/generate", response_model=GenerateTimetableResponse)
 def generate_timetable(
     payload: GenerateTimetableRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> GenerateTimetableResponse:
@@ -812,7 +813,8 @@ def generate_timetable(
                         message=f"Official timetable updated from generated result ({version_label}).",
                         notification_type=NotificationType.timetable,
                         exclude_user_id=current_user.id,
-                        deliver_email=True,
+                        deliver_email=False,
+                        background_tasks=background_tasks,
                     )
                     db.commit()
                 except Exception:
@@ -865,6 +867,7 @@ def generate_timetable(
 @router.post("/timetable/generate-cycle", response_model=GenerateTimetableCycleResponse)
 def generate_timetable_cycle(
     payload: GenerateTimetableCycleRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> GenerateTimetableCycleResponse:
@@ -1140,7 +1143,8 @@ def generate_timetable_cycle(
                     ),
                     notification_type=NotificationType.timetable,
                     exclude_user_id=current_user.id,
-                    deliver_email=True,
+                    deliver_email=False,
+                    background_tasks=background_tasks,
                 )
                 db.commit()
             except Exception:
@@ -1328,7 +1332,7 @@ def run_curriculum_reevaluation(
                 message=f"Curriculum-driven re-evaluation published ({version_label}).",
                 notification_type=NotificationType.timetable,
                 exclude_user_id=current_user.id,
-                deliver_email=True,
+                deliver_email=False,
             )
             db.commit()
         except Exception:

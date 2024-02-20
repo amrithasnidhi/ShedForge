@@ -1,0 +1,237 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: Deployment environment
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: "Optional image tag override (for example: sha-<commit>)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: cd-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name || github.event.workflow_run.head_branch || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve Release Metadata
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.vars.outputs.source_sha }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+      owner_lc: ${{ steps.vars.outputs.owner_lc }}
+      repo_lc: ${{ steps.vars.outputs.repo_lc }}
+      backend_image: ${{ steps.vars.outputs.backend_image }}
+      frontend_image: ${{ steps.vars.outputs.frontend_image }}
+
+    steps:
+      - id: vars
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+            source_sha="${WR_SHA}"
+            repository="${WR_REPO}"
+          else
+            source_sha="${GITHUB_SHA}"
+            repository="${GITHUB_REPOSITORY}"
+          fi
+
+          owner="${repository%%/*}"
+          repo="${repository##*/}"
+          owner_lc="$(echo "${owner}" | tr '[:upper:]' '[:lower:]')"
+          repo_lc="$(echo "${repo}" | tr '[:upper:]' '[:lower:]')"
+
+          image_tag="${INPUT_IMAGE_TAG:-}"
+          if [[ -z "${image_tag}" ]]; then
+            image_tag="sha-${source_sha}"
+          fi
+
+          backend_image="ghcr.io/${owner_lc}/${repo_lc}-backend:${image_tag}"
+          frontend_image="ghcr.io/${owner_lc}/${repo_lc}-frontend:${image_tag}"
+
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag=${image_tag}" >> "${GITHUB_OUTPUT}"
+          echo "owner_lc=${owner_lc}" >> "${GITHUB_OUTPUT}"
+          echo "repo_lc=${repo_lc}" >> "${GITHUB_OUTPUT}"
+          echo "backend_image=${backend_image}" >> "${GITHUB_OUTPUT}"
+          echo "frontend_image=${frontend_image}" >> "${GITHUB_OUTPUT}"
+
+  build-and-push:
+    name: Build and Publish Images
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      backend_image: ${{ needs.prepare.outputs.backend_image }}
+      frontend_image: ${{ needs.prepare.outputs.frontend_image }}
+      image_tag: ${{ needs.prepare.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (backend)
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.prepare.outputs.owner_lc }}/${{ needs.prepare.outputs.repo_lc }}-backend
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.image_tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Docker metadata (frontend)
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.prepare.outputs.owner_lc }}/${{ needs.prepare.outputs.repo_lc }}-frontend
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.image_tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+
+  deploy-staging:
+    name: Deploy Staging
+    needs: build-and-push
+    if: >
+      github.event_name == 'workflow_run' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'staging')
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Upload deploy assets
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "ops/deploy/docker-compose.remote.yml,ops/deploy/deploy.sh"
+          target: ${{ secrets.DEPLOY_PATH }}
+          strip_components: 2
+          overwrite: true
+
+      - name: Deploy on remote host
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          BACKEND_IMAGE: ${{ needs.build-and-push.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ needs.build-and-push.outputs.frontend_image }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          envs: DEPLOY_PATH,GHCR_USERNAME,GHCR_PAT,BACKEND_IMAGE,FRONTEND_IMAGE,HEALTHCHECK_URL
+          script: |
+            set -euo pipefail
+            mkdir -p "${DEPLOY_PATH}"
+            cd "${DEPLOY_PATH}"
+            chmod +x ./deploy.sh
+            ./deploy.sh
+
+  deploy-production:
+    name: Deploy Production
+    needs: build-and-push
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'production'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Upload deploy assets
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "ops/deploy/docker-compose.remote.yml,ops/deploy/deploy.sh"
+          target: ${{ secrets.DEPLOY_PATH }}
+          strip_components: 2
+          overwrite: true
+
+      - name: Deploy on remote host
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          BACKEND_IMAGE: ${{ needs.build-and-push.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ needs.build-and-push.outputs.frontend_image }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          envs: DEPLOY_PATH,GHCR_USERNAME,GHCR_PAT,BACKEND_IMAGE,FRONTEND_IMAGE,HEALTHCHECK_URL
+          script: |
+            set -euo pipefail
+            mkdir -p "${DEPLOY_PATH}"
+            cd "${DEPLOY_PATH}"
+            chmod +x ./deploy.sh
+            ./deploy.sh

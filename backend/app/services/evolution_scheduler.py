@@ -104,6 +104,21 @@ class EvaluationResult:
 
 
 class EvolutionaryScheduler:
+    """
+    Implements a Genetic Algorithm (GA) to generate optimized academic timetables.
+    
+    The algorithm evolves a population of timetables over multiple generations to minimize
+    conflicts and optimize for soft constraints like faculty workload balance and preferred slots.
+    
+    Key Steps:
+    1.  **Initialization**: Creates a random population of valid timetables.
+    2.  **Fitness Evaluation**: Scores each timetable based on hard constraints (validity) and soft constraints (quality).
+    3.  **Selection**: Selects the best timetables to be parents for the next generation.
+    4.  **Crossover**: Combines genes (slot assignments) from two parents to create offspring.
+    5.  **Mutation**: Randomly alters genes to introduce diversity and avoid local optima.
+    6.  **Elitism**: Preserves the best solutions unchanged across generations.
+    """
+
     def __init__(
         self,
         *,
@@ -113,6 +128,16 @@ class EvolutionaryScheduler:
         settings: GenerationSettingsBase,
         reserved_resource_slots: list[dict] | None = None,
     ) -> None:
+        """
+        Initializes the scheduler with necessary context and loads all required resources.
+        
+        Args:
+            db: Database session for loading academic data.
+            program_id: The specific academic program to schedule.
+            term_number: The semester/term number.
+            settings: Configuration for the genetic algorithm (population size, mutation rate, etc.).
+            reserved_resource_slots: Pre-booked slots to treat as unavailable (e.g., maintenance, holidays).
+        """
         self.db = db
         self.program_id = program_id
         self.term_number = term_number
@@ -2637,6 +2662,17 @@ class EvolutionaryScheduler:
         return conflicts
 
     def _evaluate(self, genes: list[int]) -> EvaluationResult:
+        """
+        Calculates the fitness score for a given timetable (genome).
+        
+        The evaluation process:
+        1.  **Decodes** the genes into a concrete timetable.
+        2.  **Checks Hard Constraints**: Violations (e.g., room double booking, faculty overlap) 
+            add to the `hard_conflicts` count. Any hard conflict makes the solution invalid.
+        3.  **Calculates Soft Penalty**: Preference violations (e.g., gap between classes too small, 
+            faculty workload imbalance) add to the `soft_penalty` score.
+        4.  **Computes Fitness**: A weighted combination of hard and soft scores, used for ranking.
+        """
         key = tuple(genes)
         if key in self.eval_cache:
             return self.eval_cache[key]
@@ -3130,6 +3166,16 @@ class EvolutionaryScheduler:
         return harmonized
 
     def _crossover(self, parent_a: list[int], parent_b: list[int]) -> list[int]:
+        """
+        Creates a new child genome by combining genes from two parents.
+        
+        Args:
+            parent_a: The first parent genome (list of option indices).
+            parent_b: The second parent genome.
+        
+        Returns:
+            A new genome that inherits traits from both parents, typically using uniform crossover.
+        """
         child: list[int] = []
         for index, req in enumerate(self.block_requests):
             if req.request_id in self.fixed_genes:
@@ -3142,6 +3188,16 @@ class EvolutionaryScheduler:
         return self._harmonize_faculty_assignments(child)
 
     def _mutate(self, genes: list[int], *, mutation_rate: float | None = None) -> list[int]:
+        """
+        Randomly alters genes in the genome to introduce diversity.
+        
+        Args:
+            genes: The genome to mutate.
+            mutation_rate: Probability of mutation per gene. If None, uses default settings.
+        
+        Returns:
+            A new mutated genome.
+        """
         mutated = list(genes)
         rate = mutation_rate if mutation_rate is not None else self.settings.mutation_rate
         changed = False
@@ -3156,6 +3212,16 @@ class EvolutionaryScheduler:
         return mutated
 
     def _select(self, population: list[list[int]], evaluations: list[EvaluationResult]) -> list[int]:
+        """
+        Selects a parent for the next generation based on fitness (Tournament Selection).
+        
+        Args:
+            population: Current population of genomes.
+            evaluations: Evaluation results for the population.
+        
+        Returns:
+            The selected genome.
+        """
         contenders = self.random.sample(range(len(population)), self.settings.tournament_size)
         best_index = max(contenders, key=lambda idx: evaluations[idx].fitness)
         return population[best_index]

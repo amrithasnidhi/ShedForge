@@ -1,0 +1,139 @@
+# ShedForge Developer Guide
+
+This comprehensive guide details the architecture, module breakdown, API structure, and frontend application organization of ShedForge.
+
+---
+
+## 1. Architecture Overview
+
+### Technology Stack
+-   **Backend**: Python (FastAPI), SQLAlchemy (ORM), Pydantic (Schema Validation).
+-   **Database**: SQLite (Development), PostgreSQL (Production ready).
+-   **Frontend**: TypeScript, React, Next.js (App Router), Tailwind CSS, Shadcn UI.
+-   **Tools**:
+    -   **Testing**: `pytest` (Backend), `jest` (Frontend).
+    -   **Linting**: `flake8`, `black` (Backend), `eslint` (Frontend).
+    -   **Package Managers**: `pip` (Python), `pnpm` (Node.js).
+
+### High-Level Design
+ShedForge follows a modern client-server architecture:
+1.  **Frontend Client**: Single Page Application (SPA) served via Next.js. Consumes the backend REST API and WebSocket events.
+2.  **API Gateway**: FastAPI handles routing, validation, and authentication.
+3.  **Service Layer**: Business logic resides in `app/services/` (Scheduling Engine, Notification Hub, Email Service).
+4.  **Data Layer**: SQLAlchemy models in `app/models/` map to database tables.
+
+---
+
+## 2. Backend Modules
+
+The backend is organized by feature domain in `backend/app/api/routes/`.
+
+| Module | Description | Key Endpoints |
+| :--- | :--- | :--- |
+| **Auth** | User authentication & session management | `/auth/login`, `/auth/register`, `/auth/refresh` |
+| **Generator** | Core timetable scheduling engine | `/generator/start`, `/generator/status`, `/generator/publish` |
+| **Timetable** | Access to generated schedules | `/timetable/official`, `/timetable/draft`, `/timetable/versions` |
+| **Conflicts** | Conflict detection & resolution service | `/conflicts/detect`, `/conflicts/resolve` |
+| **Notifications** | Real-time alerts & history | `/notifications/`, `/notifications/ws` (WebSocket) |
+| **Faculty** | Faculty profile & preference management | `/faculty/`, `/faculty/{id}/preferences` |
+| **Students** | Student data & enrollment | `/students/`, `/students/batch-upload` |
+| **Courses** | Course catalog & constraints | `/courses/`, `/courses/{id}/constraints` |
+| **Rooms** | Infrastructure management | `/rooms/`, `/rooms/availability` |
+| **Leaves** | Faculty leave requests & substitution | `/leaves/request`, `/leaves/approve`, `/leaves/substitute` |
+| **Feedback** | Issue reporting & suggestions | `/feedback/submit`, `/feedback/list` |
+| **Settings** | System-wide configuration (SMTP, Rules) | `/settings/smtp`, `/settings/academic-cycle` |
+
+### Core Services
+-   **Evolutionary Engine** (`app/services/evolution_scheduler.py`): The genetic algorithm implementation for timetable generation.
+-   **Notification Hub** (`app/services/notification_hub.py`): Manages WebSocket connections and broadcasts events.
+-   **Email Service** (`app/services/email.py`): Handles transactional emails (OTP, Alerts) with SMTP fallback.
+
+---
+
+## 3. Frontend Application Structure
+
+The frontend uses Next.js **App Router** (`frontend/app/`). Routes are grouped by user role/context.
+
+### 3.1 Public & Auth
+-   `/` (Landing/Login): Main entry point. handled by `app/page.tsx`.
+
+### 3.2 Dashboard (Admin/Scheduler Context)
+Located in `app/(dashboard)/`:
+-   `/dashboard`: Main administrative overview (Stats, Quick Actions).
+-   `/schedule`: The interactive timetable editor/viewer.
+-   `/generator`: Control panel for running the scheduling engine.
+-   `/conflicts`: dedicated conflict resolution interface.
+-   `/faculty`: Faculty management table.
+-   `/students`: Student enrollment management.
+-   `/courses`: Course catalog management.
+-   `/rooms`: Room inventory management.
+-   `/settings`: Global system settings.
+-   `/analytics`: System-wide reporting and charts.
+-   `/constraints`: Advanced constraint configuration.
+-   `/versions`: History of published timetables.
+
+### 3.3 Faculty Portal
+Located in `app/(faculty)/`:
+-   `/faculty-dashboard`: Personalized dashboard for faculty members.
+-   `/my-schedule`: Personal timetable view.
+-   `/leaves`: Leave request and substitution management.
+-   `/availability`: Availability/Preference input form.
+
+### 3.4 Student Portal
+Located in `app/(student)/`:
+-   `/student-dashboard`: Personalized dashboard for students.
+-   `/my-timetable`: Personal class schedule.
+
+### 3.5 Shared Portal Features
+Located in `app/(portal)/`:
+-   `/notifications`: Notification center.
+-   `/feedback`: Issue reporting form.
+-   `/help`: User guide/support page.
+-   `/issues`: List of reported scheduling issues.
+
+---
+
+## 4. Key Workflows
+
+### 4.1 Timetable Generation
+1.  **Input**: Admin configures `GenerationSettings` (population size, strategy) via `/generator` page.
+2.  **Process**: Backend starts async task (`EvolutionaryScheduler`).
+3.  **Updates**: Frontend polls `/generator/status` or listens to WS events.
+4.  **Result**: Draft timetable is created.
+5.  **Review**: Admin reviews in `/schedule` or `/conflicts`.
+6.  **Publish**: Admin calls `/generator/publish` to make it official for students/faculty.
+
+### 4.2 Leave Request & Substitution
+1.  **Request**: Faculty submits leave request via `/leaves`.
+2.  **Analysis**: System identifies impacted slots.
+3.  **Substitution**: System suggests available faculty based on workload/expertise.
+4.  **Approval**: Admin approves; substitute is notified via Email/In-App.
+5.  **Update**: Timetable is updated; students are notified.
+
+### 4.3 Conflict Resolution
+1.  **Detection**: `ConflictService` scans the schedule.
+2.  **Report**: Visualized in `/conflicts` page.
+3.  **Action**: Admin selects a resolution (Move Slot, Swap Faculty, Ignore).
+4.  **Commit**: Change is applied to the draft/official schedule.
+
+---
+
+## 5. Development Guidelines
+
+### Adding a New API Endpoint
+1.  Define the schema in `backend/app/schemas/`.
+2.  Create the route handler in `backend/app/api/routes/`.
+3.  Register the router in `backend/app/api/api.py`.
+4.  Add a test case in `backend/tests/`.
+
+### Adding a New Frontend Page
+1.  Create a folder in `frontend/app/` (use `()` groups for layout sharing).
+2.  Add `page.tsx` for the view.
+3.  Add `layout.tsx` if a unique layout is needed.
+4.  Update `frontend/components/nav-main.tsx` if it needs to appear in the sidebar.
+
+### Testing
+-   **Backend**: Run `pytest` from the root directory.
+-   **Frontend**: Run `npm test` from the `frontend/` directory.
+
+---

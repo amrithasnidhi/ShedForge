@@ -2404,6 +2404,14 @@ def get_official_timetable(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> OfficialTimetablePayload:
+    """
+    Retrieves the currently published 'Official' timetable.
+    
+    Data returned is scoped to the requesting user's role:
+    - **Admins**: See the full timetable.
+    - **Students**: See only their enrolled sections/courses.
+    - **Faculty**: See only their assigned classes.
+    """
     payload = _load_official_payload(db)
     return _scope_official_payload_for_user(payload, current_user, db)
 
@@ -2413,6 +2421,11 @@ def get_official_faculty_mapping(
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler, UserRole.faculty)),
     db: Session = Depends(get_db),
 ) -> list[FacultyCourseSectionMappingOut]:
+    """
+    Returns a mapping of faculty members to their assigned courses and sections.
+    
+    Used for generating faculty-specific view of the official timetable.
+    """
     payload = _load_official_payload(db)
     if current_user.role == UserRole.faculty:
         scoped_payload = _scope_official_payload_for_user(payload, current_user, db)
@@ -2543,6 +2556,11 @@ def get_timetable_conflicts(
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> list[TimetableConflict]:
+    """
+    Returns all detected conflicts in the current official timetable.
+    
+    Includes both unresolved conflicts and those that have been marked with a decision (ignored/resolved).
+    """
     payload = _load_official_payload(db)
     conflicts = _build_conflicts(payload, db)
     decisions = _load_conflict_decision_map(db)
@@ -2555,6 +2573,11 @@ def analyze_timetable_conflicts(
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> list[TimetableConflict]:
+    """
+    Analyzes a *proposed* timetable payload for conflicts without saving it.
+    
+    Useful for previewing the impact of changes before committing to the official schedule.
+    """
     del current_user
     return _build_conflicts(payload, db)
 
@@ -2566,6 +2589,12 @@ def decide_timetable_conflict(
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> ConflictDecisionOut:
+    """
+    Applies a decision to a specific conflict (e.g., 'ignore', 'resolve').
+    
+    If 'resolve' is chosen, the system attempts to automatically fix the conflict 
+    and creates a new version of the timetable.
+    """
     record = db.get(OfficialTimetable, 1)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Official timetable not found")
@@ -2682,6 +2711,11 @@ def list_timetable_versions(
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> list[TimetableVersionOut]:
+    """
+    Lists all historical versions of the official timetable.
+    
+    Versions are created automatically on publish or major modification (like conflict resolution).
+    """
     return list(db.execute(select(TimetableVersion).order_by(TimetableVersion.created_at.desc())).scalars())
 
 
@@ -2913,7 +2947,7 @@ def upsert_official_timetable(
                 ),
                 notification_type=NotificationType.timetable,
                 exclude_user_id=current_user.id,
-                deliver_email=True,
+                deliver_email=False,
             )
         if impacted_student_user_ids:
             notify_users(
@@ -2926,7 +2960,7 @@ def upsert_official_timetable(
                 ),
                 notification_type=NotificationType.timetable,
                 exclude_user_id=current_user.id,
-                deliver_email=True,
+                deliver_email=False,
             )
 
         notify_all_users(
@@ -2935,7 +2969,7 @@ def upsert_official_timetable(
             message=change_message,
             notification_type=NotificationType.timetable,
             exclude_user_id=current_user.id,
-            deliver_email=True,  # Re-enabled as per user request
+            deliver_email=False,
         )
         db.commit()
     except Exception:

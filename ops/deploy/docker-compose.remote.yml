@@ -1,0 +1,48 @@
+services:
+  backend:
+    image: ${BACKEND_IMAGE:?backend image is required}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      RESET_TOKEN_EXPIRE_MINUTES: ${RESET_TOKEN_EXPIRE_MINUTES:-30}
+      LOGIN_OTP_EXPIRE_MINUTES: ${LOGIN_OTP_EXPIRE_MINUTES:-10}
+      LOGIN_OTP_MAX_ATTEMPTS: ${LOGIN_OTP_MAX_ATTEMPTS:-5}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-ShedForge}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-[]}
+      SECURITY_ENABLE_HSTS: ${SECURITY_ENABLE_HSTS:-true}
+      SECURITY_HSTS_MAX_AGE_SECONDS: ${SECURITY_HSTS_MAX_AGE_SECONDS:-31536000}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/api/health/live', timeout=5)"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?frontend image is required}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?}
+      NEXT_PUBLIC_SESSION_IDLE_MINUTES: ${NEXT_PUBLIC_SESSION_IDLE_MINUTES:-30}
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"

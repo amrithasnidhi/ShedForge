@@ -5,13 +5,44 @@ from app.schemas.conflict import ConflictReport, ConflictDetail, ResolutionActio
 from app.models.room import RoomType
 
 class ConflictService:
+    """
+    Service for detecting and resolving scheduling conflicts in a given timetable.
+    
+    This service analyzes a proposed timetable (`OfficialTimetablePayload`) against
+    hard constraints such as room capacity, double bookings, and resource availability.
+    It produces a detailed report of conflicts and suggests potential resolutions.
+    """
+
     def __init__(self, payload: OfficialTimetablePayload, room_map: Dict[str, dict], faculty_map: Dict[str, dict]):
+        """
+        Args:
+            payload: The timetable data to analyze.
+            room_map: Dictionary mapping room IDs to room details (capacity, type).
+            faculty_map: Dictionary mapping faculty IDs to faculty details (name).
+        """
         self.payload = payload
         self.room_map = room_map
         self.faculty_map = faculty_map
         self.slots: List[TimeSlotPayload] = payload.timetable_data
 
     def detect_conflicts(self) -> ConflictReport:
+        """
+        Scans the timetable for all hard constraint violations.
+        
+        Algorithm:
+        1.  **Grouping**: Buckets slots by day to reduce comparisons.
+        2.  **Room Capacity Check**: Verifies if assigned room can hold the student count.
+        3.  **Room Type Check**: Verifies if lab sessions are in lab rooms (and vice versa).
+        4.  **Pairwise Overlap Check**: For each pair of slots on the same day:
+            -   Checks if time intervals overlap.
+            -   If valid overlap (not parallel batches), checks for shared resources:
+                -   Same Room (Room Conflict)
+                -   Same Faculty (Faculty Conflict)
+                -   Same Student Section (Section Conflict)
+        
+        Returns:
+            A report containing a list of all detected conflicts.
+        """
         conflicts: List[ConflictDetail] = []
         
         # Helper to parse time
@@ -103,6 +134,19 @@ class ConflictService:
         return ConflictReport(conflicts=conflicts, suggested_resolutions=[])
 
     def generate_resolutions(self, conflict: ConflictDetail) -> List[ResolutionAction]:
+        """
+        Proposes actionable resolutions for a specific conflict.
+        
+         Strategies:
+        -   **Room Conflicts/Capacity**: Suggest `change_room` to a larger or free room.
+        -   **Faculty/Section Conflicts**: Suggest `move_slot` to a different time.
+        
+        Args:
+            conflict: The detected conflict to resolve.
+            
+        Returns:
+            A list of potential actions the user can take.
+        """
         resolutions = []
         if conflict.conflict_type == "room_capacity" or conflict.conflict_type == "room_conflict":
              # Suggest finding another room

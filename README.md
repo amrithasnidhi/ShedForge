@@ -51,8 +51,10 @@ This hybrid approach balances solution quality and computation time, making it s
 
 ### Tooling & DevOps
 - Node.js (LTS)
-- npm
-- GitHub Actions (CI-ready)
+- pnpm
+- Docker + Docker Compose
+- GitHub Actions (CI, Security, CD)
+- GHCR image registry
 
 ---
 
@@ -61,7 +63,6 @@ This hybrid approach balances solution quality and computation time, making it s
 backend/           # FastAPI backend
   app/
     api/           # API routes
-      v1/          # Versioned endpoints
     core/          # Settings, config, security
     db/            # DB session, base, init
     models/        # ORM models
@@ -70,7 +71,8 @@ backend/           # FastAPI backend
   tests/           # Backend tests
 frontend/          # React + Tailwind app (teammate should push here)
 database/          # DB migrations/seeds
-ci/                # CI/CD configs (GitHub Actions, etc.)
+.github/workflows/ # CI/CD + security automation
+ops/deploy/        # Remote deployment stack + scripts
 docs/              # Project documentation
 scripts/           # Helper scripts
 ```
@@ -214,11 +216,85 @@ YELLA REDDY KALUVAI - CB.SC.U4CSE23463
 ```
 ---
 
+## API Endpoints
 
+All endpoints are prefixed with `/api`.
 
+### Auth (`/auth`)
+- `POST /login/access-token` - Login and get access token
+- `POST /login/test-token` - Test access token
+- `POST /password-recovery/{email}` - Recover password
+- `POST /reset-password` - Reset password
+- `POST /register` - Register new user
 
+### Faculty (`/faculty`)
+- `GET /` - List faculty
+- `POST /` - Create faculty
+- `GET /me` - Get current faculty profile
+- `PUT /{faculty_id}` - Update faculty
+- `DELETE /{faculty_id}` - Delete faculty
+- `GET /substitutes/suggestions` - Get substitute suggestions
 
+### Timetable (`/timetable`)
+- `GET /official` - Get official timetable
+- `PUT /official` - Update official timetable
+- `GET /official/faculty-mapping` - Get faculty-course-section mapping
+- `GET /conflicts` - Get conflicts
+- `POST /conflicts/analyze` - Analyze conflicts
+- `POST /conflicts/{conflict_id}/decision` - Make decision on conflict
+- `GET /analytics` - Get analytics
+- `GET /versions` - Get timetable versions
+- `GET /versions/compare` - Compare versions
+- `GET /trends` - Get trend data
+- `POST /publish-offline` - Publish timetable offline
+- `POST /publish-offline/all` - Publish all offline
 
+### Generator
+- `GET /timetable/generation-settings` - Get generation settings
+- `PUT /timetable/generation-settings` - Update generation settings
+- `POST /timetable/generate` - Start generation
+- `POST /timetable/generate-cycle` - Generate cycle
+- `POST /timetable/publish` - Publish timetable
+- `GET /timetable/locks` - Get slot locks
+- `POST /timetable/locks` - Create slot lock
+- `DELETE /timetable/locks/{lock_id}` - Delete slot lock
+- `GET /timetable/reevaluation/events` - Get reevaluation events
+- `POST /timetable/reevaluation/run` - Run reevaluation
 
+### Conflicts (`/conflicts`)
+- `POST /detect` - Detect conflicts
+- `POST /resolve` - Resolve conflict
 
+### Courses (`/courses`)
+- `GET /` - List courses
+- `POST /` - Create course
+- `PUT /{course_id}` - Update course
+- `DELETE /{course_id}` - Delete course
 
+### Rooms (`/rooms`)
+- `GET /` - List rooms
+- `POST /` - Create room
+- `PUT /{room_id}` - Update room
+- `DELETE /{room_id}` - Delete room
+
+### Students
+- `GET /students` - List students
+
+### Leaves
+- `GET /leaves` - List leave requests
+- `POST /leaves` - Create leave request
+- `PUT /leaves/{leave_id}/status` - Update leave status
+- `GET /leaves/substitute-offers` - Get substitute offers
+
+### Feedback (`/feedback`)
+- `GET /feedback` - List feedback
+- `POST /feedback` - Submit feedback
+- `GET /feedback/{feedback_id}` - Get feedback details
+- `POST /feedback/{feedback_id}/messages` - Add message to feedback
+- `PUT /feedback/{feedback_id}` - Update feedback status
+
+### Programs (`/programs`)
+- `GET /` - List programs
+- `POST /` - Create program
+- `PUT /{program_id}` - Update program
+- `DELETE /{program_id}` - Delete program

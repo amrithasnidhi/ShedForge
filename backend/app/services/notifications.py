@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import logging
 
 from anyio import from_thread
+from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -74,19 +75,26 @@ def create_notification(
     recipient: User | None = None,
     deliver_email: bool = False,
     deliver_realtime: bool = True,
+    background_tasks: BackgroundTasks | None = None,
 ) -> tuple[Notification, bool]:
+    # Set application-side timestamp for deterministic ordering even on DBs with coarse NOW() precision.
+    created_at = datetime.now(timezone.utc)
     record = Notification(
         user_id=user_id,
         title=title,
         message=message,
         notification_type=notification_type,
+        created_at=created_at,
     )
     db.add(record)
     db.flush()
 
     email_success = True
     if deliver_email and recipient is not None:
-        email_success = _send_notification_email(recipient, title=title, message=message)
+        if background_tasks:
+            background_tasks.add_task(_send_notification_email, recipient, title=title, message=message)
+        else:
+            email_success = _send_notification_email(recipient, title=title, message=message)
     if deliver_realtime:
         publish_realtime_notification(record, event="notification.created")
     return record, email_success
@@ -101,6 +109,7 @@ def notify_users(
     notification_type: NotificationType = NotificationType.system,
     exclude_user_id: str | None = None,
     deliver_email: bool = False,
+    background_tasks: BackgroundTasks | None = None,
 ) -> list[Notification]:
     requested_ids = [item for item in dict.fromkeys(user_ids) if item and item != exclude_user_id]
     if not requested_ids:
@@ -124,6 +133,7 @@ def notify_users(
             notification_type=notification_type,
             recipient=recipient,
             deliver_email=deliver_email,
+            background_tasks=background_tasks,
         )
         results.append(record)
     return results
@@ -138,6 +148,7 @@ def notify_roles(
     notification_type: NotificationType = NotificationType.system,
     exclude_user_id: str | None = None,
     deliver_email: bool = False,
+    background_tasks: BackgroundTasks | None = None,
 ) -> list[Notification]:
     if not roles:
         return []
@@ -161,6 +172,7 @@ def notify_roles(
             notification_type=notification_type,
             recipient=recipient,
             deliver_email=deliver_email,
+            background_tasks=background_tasks,
         )
         results.append(record)
     return results
@@ -174,6 +186,7 @@ def notify_all_users(
     notification_type: NotificationType = NotificationType.system,
     exclude_user_id: str | None = None,
     deliver_email: bool = False,
+    background_tasks: BackgroundTasks | None = None,
 ) -> list[Notification]:
     recipients = list(db.execute(select(User).where(User.is_active.is_(True))).scalars())
     results: list[Notification] = []
@@ -188,6 +201,7 @@ def notify_all_users(
             notification_type=notification_type,
             recipient=recipient,
             deliver_email=deliver_email,
+            background_tasks=background_tasks,
         )
         results.append(record)
     return results
@@ -201,6 +215,7 @@ def notify_admin_update(
     actor_user_id: str | None = None,
     include_students: bool = False,
     deliver_email: bool = False,
+    background_tasks: BackgroundTasks | None = None,
 ) -> list[Notification]:
     roles: list[UserRole] = [UserRole.admin, UserRole.scheduler, UserRole.faculty]
     if include_students:
@@ -213,4 +228,5 @@ def notify_admin_update(
         notification_type=NotificationType.system,
         exclude_user_id=actor_user_id,
         deliver_email=deliver_email,
+        background_tasks=background_tasks,
     )

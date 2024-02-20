@@ -1527,11 +1527,6 @@ def assign_leave_substitute(
         )
 
     day_name = request.leave_date.strftime("%A")
-    if substitute.availability and day_name not in {_normalize_day(item) for item in substitute.availability}:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{substitute.name} is unavailable on {day_name}",
-        )
 
     assignment = db.execute(
         select(LeaveSubstituteAssignment).where(LeaveSubstituteAssignment.leave_request_id == leave_id)
