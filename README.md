@@ -1,4 +1,4 @@
-# ShedForge 🧠📅
+# ShedForge
 
 **ShedForge** is a constraint-driven academic timetable scheduling platform that applies optimization and heuristic methods to generate, analyze, and adapt institutional timetables while ensuring **workload fairness** and **operational feasibility**.
 
@@ -6,7 +6,7 @@ The system is built as a **full-stack monorepo**, combining a modern React-based
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 - Automated timetable generation using optimization techniques
 - Constraint intelligence (faculty availability, room capacity, lab continuity, elective overlap)
@@ -18,7 +18,7 @@ The system is built as a **full-stack monorepo**, combining a modern React-based
 
 ---
 
-## 🧠 Optimization Approach
+## Optimization Approach
 
 ShedForge uses a **Genetic Algorithm with Local Search** to iteratively evolve feasible timetables:
 
@@ -31,7 +31,7 @@ This hybrid approach balances solution quality and computation time, making it s
 
 ---
 
-## 🖥️ Tech Stack
+## Tech Stack
 
 ### Frontend
 - React
@@ -56,7 +56,7 @@ This hybrid approach balances solution quality and computation time, making it s
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 ```
 backend/           # FastAPI backend
   app/
@@ -77,7 +77,7 @@ scripts/           # Helper scripts
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
@@ -115,20 +115,20 @@ uvicorn app.main:app --reload
 http://localhost:8000
 ```
 ---
-## 📊 Dashboard Highlights
+## Dashboard Highlights
 - Optimization summary with constraint satisfaction metrics
 - Faculty workload analytics (min / max / average hours)
 - Weekly timetable preview
 - Conflict resolution panel
 ---
 
-## 🔐 Environment Variables
+## Environment Variables
 ```
 DATABASE_URL=
 SECRET_KEY=
 ```
 ---
-## 🧪 Testing
+## Testing
 ```
 cd backend
 pytest
