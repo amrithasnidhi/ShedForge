@@ -21,3 +21,5 @@ ci/                # CI/CD configs (GitHub Actions, etc.)
 docs/              # Project documentation
 scripts/           # Helper scripts
 ```
+
+## Verified by Amritha
