@@ -38,7 +38,7 @@ export default function LoginPage() {
           <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary-foreground/10">
             <GraduationCap className="h-7 w-7 text-primary-foreground" />
           </div>
-          <span className="text-2xl font-semibold text-primary-foreground">UniSchedule</span>
+          <span className="text-2xl font-semibold text-primary-foreground">ShedForge</span>
         </div>
 
         <div className="space-y-6">
@@ -83,7 +83,7 @@ export default function LoginPage() {
             <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary">
               <GraduationCap className="h-7 w-7 text-primary-foreground" />
             </div>
-            <span className="text-2xl font-semibold text-foreground">UniSchedule</span>
+            <span className="text-2xl font-semibold text-foreground">ShedForge</span>
           </div>
 
           <Card className="border-border shadow-sm">
