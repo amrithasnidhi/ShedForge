@@ -1848,6 +1848,12 @@ class EvolutionaryScheduler:
             if not improved_this_pass:
                 break
 
+        room_repaired = self._repair_room_conflicts(
+            repaired,
+            max_iterations=6 if block_count >= 180 else 3,
+        )
+        if self._is_better_eval(self._evaluate(room_repaired), self._evaluate(repaired)):
+            return room_repaired
         return repaired
 
     def _intensive_conflict_repair(
@@ -2202,6 +2208,116 @@ class EvolutionaryScheduler:
                 break
 
             if not improved:
+                break
+
+        return repaired
+
+    def _repair_room_conflicts(
+        self,
+        genes: list[int],
+        *,
+        max_iterations: int = 8,
+    ) -> list[int]:
+        repaired = list(genes)
+
+        for _ in range(max_iterations):
+            selected_options: dict[int, PlacementOption] = {
+                req_index: self.block_requests[req_index].options[repaired[req_index]]
+                for req_index in range(len(self.block_requests))
+            }
+            room_occ: dict[tuple[str, int, str], list[int]] = defaultdict(list)
+            for req_index, option in selected_options.items():
+                req = self.block_requests[req_index]
+                for offset in range(req.block_size):
+                    slot_idx = option.start_index + offset
+                    room_occ[(option.day, slot_idx, option.room_id)].append(req_index)
+
+            conflicted: set[int] = set()
+            for values in room_occ.values():
+                if len(values) <= 1:
+                    continue
+                for left_index, left_req_idx in enumerate(values):
+                    for right_req_idx in values[left_index + 1 :]:
+                        left_req = self.block_requests[left_req_idx]
+                        right_req = self.block_requests[right_req_idx]
+                        if self._is_allowed_shared_overlap(
+                            left_req,
+                            right_req,
+                            selected_options[left_req_idx],
+                            selected_options[right_req_idx],
+                        ):
+                            continue
+                        conflicted.add(left_req_idx)
+                        conflicted.add(right_req_idx)
+
+            if not conflicted:
+                break
+
+            changed = False
+            for req_index in sorted(
+                conflicted,
+                key=lambda idx: (
+                    len(self.block_requests[idx].options),
+                    -self.block_requests[idx].block_size,
+                    self.block_requests[idx].course_code,
+                    self.block_requests[idx].section,
+                ),
+            ):
+                req = self.block_requests[req_index]
+                if req.request_id in self.fixed_genes:
+                    continue
+
+                current_option_index = repaired[req_index]
+                current_option = req.options[current_option_index]
+
+                candidate_indices = [
+                    option_index
+                    for option_index, option in enumerate(req.options)
+                    if option_index != current_option_index
+                    and option.day == current_option.day
+                    and option.start_index == current_option.start_index
+                    and option.faculty_id == current_option.faculty_id
+                    and option.room_id != current_option.room_id
+                ]
+                if not candidate_indices:
+                    continue
+
+                candidate_indices.sort(
+                    key=lambda option_index: (
+                        self.rooms[req.options[option_index].room_id].capacity < req.student_count,
+                        abs(self.rooms[req.options[option_index].room_id].capacity - req.student_count),
+                        req.options[option_index].room_id,
+                    )
+                )
+
+                for option_index in candidate_indices:
+                    candidate_option = req.options[option_index]
+                    room_conflict = False
+                    for offset in range(req.block_size):
+                        slot_idx = candidate_option.start_index + offset
+                        room_key = (candidate_option.day, slot_idx, candidate_option.room_id)
+                        for other_req_idx in room_occ.get(room_key, []):
+                            if other_req_idx == req_index:
+                                continue
+                            other_req = self.block_requests[other_req_idx]
+                            if self._is_allowed_shared_overlap(
+                                req,
+                                other_req,
+                                candidate_option,
+                                selected_options[other_req_idx],
+                            ):
+                                continue
+                            room_conflict = True
+                            break
+                        if room_conflict:
+                            break
+                    if room_conflict:
+                        continue
+                    repaired[req_index] = option_index
+                    changed = True
+                    break
+
+            if not changed:
                 break
 
         return repaired
@@ -4894,6 +5010,16 @@ class EvolutionaryScheduler:
                 best_genes = overlap_repaired
                 best_eval = overlap_eval
 
+        if best_eval.hard_conflicts > 0:
+            room_repaired = self._repair_room_conflicts(
+                best_genes,
+                max_iterations=10 if block_count >= 180 else 6,
+            )
+            room_eval = self._evaluate(room_repaired)
+            if self._is_better_eval(room_eval, best_eval):
+                best_genes = room_repaired
+                best_eval = room_eval
+
         alternatives: list[GeneratedAlternative] = []
         
         def add_result(genes: list[int], evaluation: EvaluationResult) -> bool:
@@ -4918,6 +5044,10 @@ class EvolutionaryScheduler:
             # Diverse constructive starts
             candidate = self._constructive_individual(randomized=True, rcl_alpha=0.2)
             candidate = self._repair_individual(candidate, max_passes=1)
+            candidate = self._repair_room_conflicts(
+                candidate,
+                max_iterations=8 if block_count >= 180 else 5,
+            )
             eval_res = self._evaluate(candidate)
             
             if eval_res.hard_conflicts > 0:
