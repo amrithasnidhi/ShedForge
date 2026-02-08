@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+**/__pycache__
+**/.pytest_cache
+**/.next
+**/node_modules
+tmp_shedforge_otp.db
+tmp_shedforge_otp_verify.db
+database/backups

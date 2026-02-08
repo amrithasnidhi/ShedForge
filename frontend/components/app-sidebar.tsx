@@ -170,7 +170,7 @@ export function AppSidebar() {
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold text-sidebar-foreground">
-              ShedForge
+              UniSchedule
             </span>
             <span className="text-xs text-sidebar-foreground/70">
               {role === "student" ? "Student Portal" : role === "faculty" ? "Faculty Portal" : "Admin Console"}
