@@ -17,6 +17,9 @@ import {
   Sparkles,
   Clock,
   FileText,
+  Bell,
+  LifeBuoy,
+  MessageSquareWarning,
 } from "lucide-react";
 import { useAuth } from "@/components/auth-provider";
 import {
@@ -53,6 +56,11 @@ const academicDataItems = [
     icon: Users,
   },
   {
+    title: "Student List",
+    href: "/students",
+    icon: Users,
+  },
+  {
     title: "Courses",
     href: "/courses",
     icon: BookOpen,
@@ -85,6 +93,11 @@ const schedulingItems = [
     href: "/conflicts",
     icon: AlertTriangle,
   },
+  {
+    title: "Leave Mgmt",
+    href: "/leave-management",
+    icon: FileText,
+  },
 ];
 
 const analyticsItems = [
@@ -93,9 +106,34 @@ const analyticsItems = [
     href: "/analytics",
     icon: BarChart3,
   },
+  {
+    title: "Versions",
+    href: "/versions",
+    icon: Calendar,
+  },
 ];
 
 const bottomNavItems = [
+  {
+    title: "Notifications",
+    href: "/notifications",
+    icon: Bell,
+  },
+  {
+    title: "Feedback",
+    href: "/feedback",
+    icon: MessageSquareWarning,
+  },
+  {
+    title: "Issues",
+    href: "/issues",
+    icon: MessageSquareWarning,
+  },
+  {
+    title: "Help",
+    href: "/help",
+    icon: LifeBuoy,
+  },
   {
     title: "Settings",
     href: "/settings",
@@ -113,6 +151,26 @@ const studentNavItems = [
     title: "My Timetable",
     href: "/my-timetable",
     icon: Calendar,
+  },
+  {
+    title: "Issues",
+    href: "/issues",
+    icon: MessageSquareWarning,
+  },
+  {
+    title: "Feedback",
+    href: "/feedback",
+    icon: MessageSquareWarning,
+  },
+  {
+    title: "Notifications",
+    href: "/notifications",
+    icon: Bell,
+  },
+  {
+    title: "Help",
+    href: "/help",
+    icon: LifeBuoy,
   },
 ];
 
@@ -137,12 +195,32 @@ const facultyNavItems = [
     href: "/leaves",
     icon: FileText,
   },
+  {
+    title: "Issues",
+    href: "/issues",
+    icon: MessageSquareWarning,
+  },
+  {
+    title: "Feedback",
+    href: "/feedback",
+    icon: MessageSquareWarning,
+  },
+  {
+    title: "Notifications",
+    href: "/notifications",
+    icon: Bell,
+  },
+  {
+    title: "Help",
+    href: "/help",
+    icon: LifeBuoy,
+  },
 ];
 
 export function AppSidebar() {
   const pathname = usePathname();
-  const { user, logout } = useAuth();
-  const role = user?.role || "admin";
+  const { user, logout, isLoading } = useAuth();
+  const role = user?.role ?? null;
 
   const renderNavItems = (items: typeof mainNavItems) => {
     return items.map((item) => (
@@ -170,10 +248,16 @@ export function AppSidebar() {
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold text-sidebar-foreground">
-              UniSchedule
+              ShedForge
             </span>
             <span className="text-xs text-sidebar-foreground/70">
-              {role === "student" ? "Student Portal" : role === "faculty" ? "Faculty Portal" : "Admin Console"}
+              {role === "student"
+                ? "Student Portal"
+                : role === "faculty"
+                  ? "Faculty Portal"
+                  : role === "admin" || role === "scheduler"
+                    ? "Admin Console"
+                    : "Welcome"}
             </span>
           </div>
         </div>
@@ -242,14 +326,16 @@ export function AppSidebar() {
           </>
         )}
 
-        <SidebarGroup>
-          <SidebarGroupLabel className="text-sidebar-foreground/50 text-xs uppercase tracking-wider">
-            System
-          </SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>{renderNavItems(bottomNavItems)}</SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {role ? (
+          <SidebarGroup>
+            <SidebarGroupLabel className="text-sidebar-foreground/50 text-xs uppercase tracking-wider">
+              System
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>{renderNavItems(bottomNavItems)}</SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ) : null}
       </SidebarContent>
 
       <SidebarFooter className="border-t border-sidebar-border p-4">
@@ -269,7 +355,8 @@ export function AppSidebar() {
           </div>
           <button
             onClick={logout}
-            className="flex h-8 w-8 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
+            disabled={isLoading || !user}
+            className="flex h-8 w-8 items-center justify-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors disabled:opacity-50"
           >
             <LogOut className="h-4 w-4" />
             <span className="sr-only">Log out</span>

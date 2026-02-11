@@ -1,7 +1,9 @@
 import React from "react"
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-sidebar";
+import { AuthGuard } from "@/components/auth-guard";
 import { Separator } from "@/components/ui/separator";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 export default function DashboardLayout({
   children,
@@ -16,8 +18,11 @@ export default function DashboardLayout({
           <SidebarTrigger className="-ml-2" />
           <Separator orientation="vertical" className="h-6" />
           <div className="flex-1" />
+          <ThemeToggle />
         </header>
-        <main className="flex-1 p-6">{children}</main>
+        <main className="flex-1 p-6">
+          <AuthGuard allowedRoles={["admin", "scheduler"]}>{children}</AuthGuard>
+        </main>
       </SidebarInset>
     </SidebarProvider>
   );
