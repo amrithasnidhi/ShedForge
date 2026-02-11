@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Plus, Search, Edit, Trash2, Filter } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -18,30 +18,139 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { facultyData } from "@/lib/mock-data";
 
 import { useAuth } from "@/components/auth-provider";
+import {
+    createFaculty,
+    deleteFaculty,
+    listFaculty,
+    updateFaculty,
+    type Faculty,
+    type FacultyUpdate,
+} from "@/lib/academic-api";
 
 export default function FacultyPage() {
     const { user } = useAuth();
-    const isAdmin = user?.role === "admin";
+    const canManage = user?.role === "admin" || user?.role === "scheduler";
     const [searchQuery, setSearchQuery] = useState("");
     const [departmentFilter, setDepartmentFilter] = useState("all");
     const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
+    const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
+    const [faculty, setFaculty] = useState<Faculty[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [formValues, setFormValues] = useState({
+        name: "",
+        designation: "",
+        email: "",
+        department: "",
+        max_hours: 20,
+    });
+    const [editFaculty, setEditFaculty] = useState<Faculty | null>(null);
+    const [editFormValues, setEditFormValues] = useState<FacultyUpdate>({
+        name: "",
+        designation: "",
+        email: "",
+        department: "",
+        max_hours: 20,
+        workload_hours: 0,
+    });
 
-    const filteredFaculty = facultyData.filter((faculty) => {
+    useEffect(() => {
+        const loadFaculty = async () => {
+            try {
+                const data = await listFaculty();
+                setFaculty(data);
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Unable to load faculty";
+                setError(message);
+            } finally {
+                setIsLoading(false);
+            }
+        };
+        void loadFaculty();
+    }, []);
+
+    const handleAddFaculty = async () => {
+        setError(null);
+        try {
+            const created = await createFaculty({
+                name: formValues.name,
+                designation: formValues.designation || "Faculty",
+                email: formValues.email,
+                department: formValues.department,
+                max_hours: formValues.max_hours,
+            });
+            setFaculty((prev) => [...prev, created]);
+            setIsAddDialogOpen(false);
+            setFormValues({
+                name: "",
+                designation: "",
+                email: "",
+                department: "",
+                max_hours: 20,
+            });
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to create faculty";
+            setError(message);
+        }
+    };
+
+    const handleDeleteFaculty = async (facultyId: string) => {
+        if (!window.confirm("Delete this faculty member?")) {
+            return;
+        }
+        setError(null);
+        try {
+            await deleteFaculty(facultyId);
+            setFaculty((prev) => prev.filter((member) => member.id !== facultyId));
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to delete faculty";
+            setError(message);
+        }
+    };
+
+    const openEditFaculty = (member: Faculty) => {
+        setEditFaculty(member);
+        setEditFormValues({
+            name: member.name,
+            designation: member.designation,
+            email: member.email,
+            department: member.department,
+            max_hours: member.max_hours,
+            workload_hours: member.workload_hours,
+        });
+        setIsEditDialogOpen(true);
+    };
+
+    const handleUpdateFaculty = async () => {
+        if (!editFaculty) {
+            return;
+        }
+        setError(null);
+        try {
+            const updated = await updateFaculty(editFaculty.id, editFormValues);
+            setFaculty((prev) => prev.map((member) => (member.id === updated.id ? updated : member)));
+            setIsEditDialogOpen(false);
+            setEditFaculty(null);
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to update faculty";
+            setError(message);
+        }
+    };
+
+    const filteredFaculty = faculty.filter((member) => {
         const matchesSearch =
-            faculty.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            faculty.email.toLowerCase().includes(searchQuery.toLowerCase());
-        const matchesDepartment = departmentFilter === "all" || faculty.department === departmentFilter;
+            member.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+            member.email.toLowerCase().includes(searchQuery.toLowerCase());
+        const matchesDepartment = departmentFilter === "all" || member.department === departmentFilter;
         return matchesSearch && matchesDepartment;
     });
 
-    const departments = Array.from(new Set(facultyData.map((f) => f.department)));
+    const departments = useMemo(() => Array.from(new Set(faculty.map((f) => f.department))), [faculty]);
 
     return (
         <div className="space-y-6">
-            {/* Header */}
             <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                     <h1 className="text-2xl font-semibold text-foreground">Faculty Management</h1>
@@ -49,67 +158,189 @@ export default function FacultyPage() {
                         Manage faculty profiles, availability, and workload preferences
                     </p>
                 </div>
-                {!isAdmin && (
-                    <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
-                        <DialogTrigger asChild>
-                            <Button>
-                                <Plus className="h-4 w-4 mr-2" />
-                                Add Faculty
-                            </Button>
-                        </DialogTrigger>
-                        <DialogContent className="sm:max-w-[500px]">
-                            <DialogHeader>
-                                <DialogTitle>Add New Faculty</DialogTitle>
-                                <DialogDescription>
-                                    Enter faculty member details and availability preferences
-                                </DialogDescription>
-                            </DialogHeader>
-                            <div className="grid gap-4 py-4">
-                                <div className="grid gap-2">
-                                    <Label htmlFor="name">Full Name</Label>
-                                    <Input id="name" placeholder="Dr. John Smith" />
-                                </div>
-                                <div className="grid gap-2">
-                                    <Label htmlFor="email">Email</Label>
-                                    <Input id="email" type="email" placeholder="john.smith@university.edu" />
-                                </div>
-                                <div className="grid gap-2">
-                                    <Label htmlFor="department">Department</Label>
-                                    <Select>
-                                        <SelectTrigger id="department">
-                                            <SelectValue placeholder="Select department" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            {departments.map((dept) => (
-                                                <SelectItem key={dept} value={dept}>
-                                                    {dept}
-                                                </SelectItem>
-                                            ))}
-                                        </SelectContent>
-                                    </Select>
-                                </div>
-                                <div className="grid gap-2">
-                                    <Label htmlFor="maxHours">Maximum Weekly Hours</Label>
-                                    <Input id="maxHours" type="number" placeholder="20" defaultValue="20" />
-                                </div>
-                            </div>
-                            <DialogFooter>
-                                <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
-                                    Cancel
+                {canManage && (
+                    <>
+                        <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
+                            <DialogTrigger asChild>
+                                <Button>
+                                    <Plus className="h-4 w-4 mr-2" />
+                                    Add Faculty
                                 </Button>
-                                <Button onClick={() => setIsAddDialogOpen(false)}>Add Faculty</Button>
-                            </DialogFooter>
-                        </DialogContent>
-                    </Dialog>
+                            </DialogTrigger>
+                            <DialogContent className="sm:max-w-[500px]">
+                                <DialogHeader>
+                                    <DialogTitle>Add New Faculty</DialogTitle>
+                                    <DialogDescription>
+                                        Enter faculty member details and availability preferences
+                                    </DialogDescription>
+                                </DialogHeader>
+                                <div className="grid gap-4 py-4">
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="name">Full Name</Label>
+                                        <Input
+                                            id="name"
+                                           
+                                            value={formValues.name}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({ ...prev, name: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="email">Email</Label>
+                                        <Input
+                                            id="email"
+                                            type="email"
+                                           
+                                            value={formValues.email}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({ ...prev, email: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="designation">Designation</Label>
+                                        <Input
+                                            id="designation"
+                                           
+                                            value={formValues.designation}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({ ...prev, designation: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="department">Department</Label>
+                                        <Input
+                                            id="department"
+                                           
+                                            value={formValues.department}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({ ...prev, department: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="maxHours">Maximum Weekly Hours</Label>
+                                        <Input
+                                            id="maxHours"
+                                            type="number"
+                                           
+                                            value={formValues.max_hours}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({
+                                                    ...prev,
+                                                    max_hours: Number(event.target.value),
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                </div>
+                                <DialogFooter>
+                                    <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
+                                        Cancel
+                                    </Button>
+                                    <Button onClick={handleAddFaculty}>Add Faculty</Button>
+                                </DialogFooter>
+                            </DialogContent>
+                        </Dialog>
+
+                        <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
+                            <DialogContent className="sm:max-w-[500px]">
+                                <DialogHeader>
+                                    <DialogTitle>Edit Faculty</DialogTitle>
+                                    <DialogDescription>Update faculty member details</DialogDescription>
+                                </DialogHeader>
+                                <div className="grid gap-4 py-4">
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="edit-name">Full Name</Label>
+                                        <Input
+                                            id="edit-name"
+                                            value={editFormValues.name ?? ""}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({ ...prev, name: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="edit-email">Email</Label>
+                                        <Input
+                                            id="edit-email"
+                                            type="email"
+                                            value={editFormValues.email ?? ""}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({ ...prev, email: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="edit-designation">Designation</Label>
+                                        <Input
+                                            id="edit-designation"
+                                            value={editFormValues.designation ?? ""}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({ ...prev, designation: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="edit-department">Department</Label>
+                                        <Input
+                                            id="edit-department"
+                                            value={editFormValues.department ?? ""}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({ ...prev, department: event.target.value }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="edit-workload">Current Workload (hours)</Label>
+                                        <Input
+                                            id="edit-workload"
+                                            type="number"
+                                            value={editFormValues.workload_hours ?? 0}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({
+                                                    ...prev,
+                                                    workload_hours: Number(event.target.value),
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="edit-maxHours">Maximum Weekly Hours</Label>
+                                        <Input
+                                            id="edit-maxHours"
+                                            type="number"
+                                            value={editFormValues.max_hours ?? 0}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({
+                                                    ...prev,
+                                                    max_hours: Number(event.target.value),
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                </div>
+                                <DialogFooter>
+                                    <Button variant="outline" onClick={() => setIsEditDialogOpen(false)}>
+                                        Cancel
+                                    </Button>
+                                    <Button onClick={handleUpdateFaculty}>Save Changes</Button>
+                                </DialogFooter>
+                            </DialogContent>
+                        </Dialog>
+                    </>
                 )}
             </div>
 
-            {/* Stats Cards */}
+            {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <Card>
                     <CardHeader className="pb-3">
                         <CardDescription>Total Faculty</CardDescription>
-                        <CardTitle className="text-3xl">{facultyData.length}</CardTitle>
+                        <CardTitle className="text-3xl">{faculty.length}</CardTitle>
                     </CardHeader>
                 </Card>
                 <Card>
@@ -122,7 +353,13 @@ export default function FacultyPage() {
                     <CardHeader className="pb-3">
                         <CardDescription>Avg. Workload</CardDescription>
                         <CardTitle className="text-3xl">
-                            {(facultyData.reduce((sum, f) => sum + (f.currentWorkload || 0), 0) / facultyData.length).toFixed(1)}h
+                            {faculty.length
+                                ? (
+                                      faculty.reduce((sum, f) => sum + (f.workload_hours || 0), 0) /
+                                      faculty.length
+                                  ).toFixed(1)
+                                : "0.0"}
+                            h
                         </CardTitle>
                     </CardHeader>
                 </Card>
@@ -130,13 +367,12 @@ export default function FacultyPage() {
                     <CardHeader className="pb-3">
                         <CardDescription>Overloaded</CardDescription>
                         <CardTitle className="text-3xl text-destructive">
-                            {facultyData.filter((f) => (f.currentWorkload || 0) > (f.maxHours || 20)).length}
+                            {faculty.filter((f) => (f.workload_hours || 0) > (f.max_hours || 20)).length}
                         </CardTitle>
                     </CardHeader>
                 </Card>
             </div>
 
-            {/* Filters and Search */}
             <Card>
                 <CardHeader>
                     <CardTitle className="text-lg">Faculty Directory</CardTitle>
@@ -147,7 +383,7 @@ export default function FacultyPage() {
                         <div className="relative flex-1">
                             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                             <Input
-                                placeholder="Search by name or email..."
+                               
                                 className="pl-10"
                                 value={searchQuery}
                                 onChange={(e) => setSearchQuery(e.target.value)}
@@ -156,7 +392,7 @@ export default function FacultyPage() {
                         <Select value={departmentFilter} onValueChange={setDepartmentFilter}>
                             <SelectTrigger className="w-full sm:w-[200px]">
                                 <Filter className="h-4 w-4 mr-2" />
-                                <SelectValue placeholder="All Departments" />
+                                <SelectValue/>
                             </SelectTrigger>
                             <SelectContent>
                                 <SelectItem value="all">All Departments</SelectItem>
@@ -171,7 +407,6 @@ export default function FacultyPage() {
                 </CardContent>
             </Card>
 
-            {/* Faculty Table */}
             <Card>
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
@@ -179,51 +414,56 @@ export default function FacultyPage() {
                             <TableHeader>
                                 <TableRow>
                                     <TableHead>Name</TableHead>
-                                    <TableHead>Department</TableHead>
                                     <TableHead>Email</TableHead>
-                                    <TableHead className="text-right">Current Workload</TableHead>
-                                    <TableHead className="text-right">Max Hours</TableHead>
-                                    <TableHead className="text-center">Status</TableHead>
+                                    <TableHead>Designation</TableHead>
+                                    <TableHead>Department</TableHead>
+                                    <TableHead>Workload</TableHead>
+                                    <TableHead>Max Hours</TableHead>
                                     <TableHead className="text-right">Actions</TableHead>
                                 </TableRow>
                             </TableHeader>
                             <TableBody>
-                                {filteredFaculty.map((faculty) => {
-                                    const workload = faculty.currentWorkload || 0;
-                                    const maxHours = faculty.maxHours || 20;
-                                    const isOverloaded = workload > maxHours;
-                                    const utilizationPercent = (workload / maxHours) * 100;
-
-                                    return (
-                                        <TableRow key={faculty.id}>
-                                            <TableCell className="font-medium">{faculty.name}</TableCell>
-                                            <TableCell>{faculty.department}</TableCell>
-                                            <TableCell className="text-muted-foreground">{faculty.email}</TableCell>
-                                            <TableCell className="text-right tabular-nums">{workload}h</TableCell>
-                                            <TableCell className="text-right tabular-nums">{maxHours}h</TableCell>
-                                            <TableCell className="text-center">
-                                                {isOverloaded ? (
-                                                    <Badge variant="outline" className="text-destructive border-destructive">
-                                                        Overloaded
-                                                    </Badge>
-                                                ) : utilizationPercent > 80 ? (
-                                                    <Badge variant="outline" className="text-warning border-warning">
-                                                        High Load
-                                                    </Badge>
-                                                ) : (
-                                                    <Badge variant="outline" className="text-success border-success">
-                                                        Normal
-                                                    </Badge>
-                                                )}
+                                {isLoading ? (
+                                    <TableRow>
+                                        <TableCell colSpan={7} className="text-center text-sm text-muted-foreground">
+                                            Loading faculty...
+                                        </TableCell>
+                                    </TableRow>
+                                ) : filteredFaculty.length === 0 ? (
+                                    <TableRow>
+                                        <TableCell colSpan={7} className="text-center text-sm text-muted-foreground">
+                                            No faculty found.
+                                        </TableCell>
+                                    </TableRow>
+                                ) : (
+                                    filteredFaculty.map((member) => (
+                                        <TableRow key={member.id}>
+                                            <TableCell className="font-medium">{member.name}</TableCell>
+                                            <TableCell>{member.email}</TableCell>
+                                            <TableCell>{member.designation}</TableCell>
+                                            <TableCell>{member.department}</TableCell>
+                                            <TableCell>
+                                                <Badge variant="secondary">{member.workload_hours}h</Badge>
                                             </TableCell>
+                                            <TableCell>{member.max_hours}h</TableCell>
                                             <TableCell className="text-right">
-                                                {!isAdmin && (
+                                                {canManage && (
                                                     <div className="flex items-center justify-end gap-2">
-                                                        <Button variant="ghost" size="icon" className="h-8 w-8">
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="icon"
+                                                            className="h-8 w-8"
+                                                            onClick={() => openEditFaculty(member)}
+                                                        >
                                                             <Edit className="h-4 w-4" />
                                                             <span className="sr-only">Edit</span>
                                                         </Button>
-                                                        <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive">
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="icon"
+                                                            className="h-8 w-8 text-destructive"
+                                                            onClick={() => handleDeleteFaculty(member.id)}
+                                                        >
                                                             <Trash2 className="h-4 w-4" />
                                                             <span className="sr-only">Delete</span>
                                                         </Button>
@@ -231,8 +471,8 @@ export default function FacultyPage() {
                                                 )}
                                             </TableCell>
                                         </TableRow>
-                                    );
-                                })}
+                                    ))
+                                )}
                             </TableBody>
                         </Table>
                     </div>

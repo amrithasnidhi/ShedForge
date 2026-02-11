@@ -1,369 +1,322 @@
 "use client";
 
-import { useState } from "react";
-import { Plus, Trash2, AlertCircle, CheckCircle2, Info } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Plus, Save, Trash2 } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Separator } from "@/components/ui/separator";
-
-type ConstraintType = "hard" | "soft";
-type ConstraintCategory = "faculty" | "room" | "time" | "workload" | "custom";
-
-interface Constraint {
-    id: string;
-    type: ConstraintType;
-    category: ConstraintCategory;
-    description: string;
-    priority: number;
-    enabled: boolean;
-}
-
-const defaultConstraints: Constraint[] = [
-    {
-        id: "1",
-        type: "hard",
-        category: "faculty",
-        description: "No faculty member can teach in two rooms simultaneously",
-        priority: 10,
-        enabled: true,
-    },
-    {
-        id: "2",
-        type: "hard",
-        category: "room",
-        description: "No room can host two classes at the same time",
-        priority: 10,
-        enabled: true,
-    },
-    {
-        id: "3",
-        type: "hard",
-        category: "time",
-        description: "Lab sessions must be scheduled in consecutive time slots",
-        priority: 9,
-        enabled: true,
-    },
-    {
-        id: "4",
-        type: "soft",
-        category: "workload",
-        description: "Faculty workload should not exceed 20 hours per week",
-        priority: 8,
-        enabled: true,
-    },
-    {
-        id: "5",
-        type: "soft",
-        category: "time",
-        description: "Avoid scheduling classes before 9:00 AM",
-        priority: 5,
-        enabled: true,
-    },
-    {
-        id: "6",
-        type: "soft",
-        category: "faculty",
-        description: "Minimize gaps between consecutive classes for faculty",
-        priority: 7,
-        enabled: true,
-    },
-];
-
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import {
+  deleteSemesterConstraint,
+  listSemesterConstraints,
+  upsertSemesterConstraint,
+  type SemesterConstraint,
+} from "@/lib/constraints-api";
 import { useAuth } from "@/components/auth-provider";
 
-export default function ConstraintsPage() {
-    const { user } = useAuth();
-    const isAdmin = user?.role === "admin";
-    const [constraints, setConstraints] = useState<Constraint[]>(defaultConstraints);
-    const [newConstraint, setNewConstraint] = useState({
-        type: "hard" as ConstraintType,
-        category: "faculty" as ConstraintCategory,
-        description: "",
-        priority: 5,
-    });
-
-    const handleAddConstraint = () => {
-        if (!newConstraint.description.trim()) return;
-
-        const constraint: Constraint = {
-            id: Date.now().toString(),
-            ...newConstraint,
-            enabled: true,
-        };
-
-        setConstraints([...constraints, constraint]);
-        setNewConstraint({
-            type: "hard",
-            category: "faculty",
-            description: "",
-            priority: 5,
-        });
-    };
-
-    const handleDeleteConstraint = (id: string) => {
-        setConstraints(constraints.filter((c) => c.id !== id));
-    };
-
-    const handleToggleConstraint = (id: string) => {
-        setConstraints(
-            constraints.map((c) => (c.id === id ? { ...c, enabled: !c.enabled } : c))
-        );
-    };
-
-    const hardConstraints = constraints.filter((c) => c.type === "hard");
-    const softConstraints = constraints.filter((c) => c.type === "soft");
-
-    return (
-        <div className="space-y-6">
-            {/* Header */}
-            <div>
-                <h1 className="text-2xl font-semibold text-foreground">Constraint Configuration</h1>
-                <p className="text-sm text-muted-foreground mt-1">
-                    Define scheduling rules and optimization priorities
-                </p>
-            </div>
-
-            {/* Info Alert */}
-            <Alert>
-                <Info className="h-4 w-4" />
-                <AlertTitle>Constraint Types</AlertTitle>
-                <AlertDescription>
-                    <strong>Hard constraints</strong> must be satisfied (e.g., no double-booking).{" "}
-                    <strong>Soft constraints</strong> are preferences that the optimizer will try to satisfy
-                    when possible (e.g., minimize commute time).
-                </AlertDescription>
-            </Alert>
-
-            {/* Stats Cards */}
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <Card>
-                    <CardHeader className="pb-3">
-                        <CardDescription>Total Constraints</CardDescription>
-                        <CardTitle className="text-3xl">{constraints.length}</CardTitle>
-                    </CardHeader>
-                </Card>
-                <Card>
-                    <CardHeader className="pb-3">
-                        <CardDescription>Hard Constraints</CardDescription>
-                        <CardTitle className="text-3xl text-destructive">{hardConstraints.length}</CardTitle>
-                    </CardHeader>
-                </Card>
-                <Card>
-                    <CardHeader className="pb-3">
-                        <CardDescription>Soft Constraints</CardDescription>
-                        <CardTitle className="text-3xl text-warning">{softConstraints.length}</CardTitle>
-                    </CardHeader>
-                </Card>
-                <Card>
-                    <CardHeader className="pb-3">
-                        <CardDescription>Active</CardDescription>
-                        <CardTitle className="text-3xl text-success">
-                            {constraints.filter((c) => c.enabled).length}
-                        </CardTitle>
-                    </CardHeader>
-                </Card>
-            </div>
-
-            {/* Add New Constraint */}
-            {!isAdmin && (
-                <Card>
-                    <CardHeader>
-                        <CardTitle className="text-lg">Add New Constraint</CardTitle>
-                        <CardDescription>Define a custom scheduling rule</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                        <div className="grid gap-4">
-                            <div className="grid gap-4 sm:grid-cols-2">
-                                <div className="grid gap-2">
-                                    <Label htmlFor="type">Constraint Type</Label>
-                                    <Select
-                                        value={newConstraint.type}
-                                        onValueChange={(value) =>
-                                            setNewConstraint({ ...newConstraint, type: value as ConstraintType })
-                                        }
-                                    >
-                                        <SelectTrigger id="type">
-                                            <SelectValue />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            <SelectItem value="hard">Hard (Must Satisfy)</SelectItem>
-                                            <SelectItem value="soft">Soft (Preference)</SelectItem>
-                                        </SelectContent>
-                                    </Select>
-                                </div>
-                                <div className="grid gap-2">
-                                    <Label htmlFor="category">Category</Label>
-                                    <Select
-                                        value={newConstraint.category}
-                                        onValueChange={(value) =>
-                                            setNewConstraint({ ...newConstraint, category: value as ConstraintCategory })
-                                        }
-                                    >
-                                        <SelectTrigger id="category">
-                                            <SelectValue />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            <SelectItem value="faculty">Faculty</SelectItem>
-                                            <SelectItem value="room">Room</SelectItem>
-                                            <SelectItem value="time">Time</SelectItem>
-                                            <SelectItem value="workload">Workload</SelectItem>
-                                            <SelectItem value="custom">Custom</SelectItem>
-                                        </SelectContent>
-                                    </Select>
-                                </div>
-                            </div>
-                            <div className="grid gap-2">
-                                <Label htmlFor="description">Description</Label>
-                                <Input
-                                    id="description"
-                                    placeholder="e.g., Professor X prefers afternoon classes"
-                                    value={newConstraint.description}
-                                    onChange={(e) =>
-                                        setNewConstraint({ ...newConstraint, description: e.target.value })
-                                    }
-                                />
-                            </div>
-                            <div className="grid gap-2">
-                                <Label htmlFor="priority">
-                                    Priority (1-10) {newConstraint.type === "hard" ? "(Higher = More Critical)" : "(Higher = More Preferred)"}
-                                </Label>
-                                <Input
-                                    id="priority"
-                                    type="number"
-                                    min="1"
-                                    max="10"
-                                    value={newConstraint.priority}
-                                    onChange={(e) =>
-                                        setNewConstraint({ ...newConstraint, priority: parseInt(e.target.value) || 5 })
-                                    }
-                                />
-                            </div>
-                            <Button onClick={handleAddConstraint} className="w-full sm:w-auto">
-                                <Plus className="h-4 w-4 mr-2" />
-                                Add Constraint
-                            </Button>
-                        </div>
-                    </CardContent>
-                </Card>
-            )}
-
-            {/* Constraints List */}
-            <Tabs defaultValue="all" className="space-y-4">
-                <TabsList>
-                    <TabsTrigger value="all">All ({constraints.length})</TabsTrigger>
-                    <TabsTrigger value="hard">Hard ({hardConstraints.length})</TabsTrigger>
-                    <TabsTrigger value="soft">Soft ({softConstraints.length})</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="all" className="space-y-4">
-                    {constraints.map((constraint) => (
-                        <ConstraintCard
-                            key={constraint.id}
-                            constraint={constraint}
-                            onToggle={handleToggleConstraint}
-                            onDelete={handleDeleteConstraint}
-                            isAdmin={isAdmin}
-                        />
-                    ))}
-                </TabsContent>
-
-                <TabsContent value="hard" className="space-y-4">
-                    {hardConstraints.map((constraint) => (
-                        <ConstraintCard
-                            key={constraint.id}
-                            constraint={constraint}
-                            onToggle={handleToggleConstraint}
-                            onDelete={handleDeleteConstraint}
-                            isAdmin={isAdmin}
-                        />
-                    ))}
-                </TabsContent>
-
-                <TabsContent value="soft" className="space-y-4">
-                    {softConstraints.map((constraint) => (
-                        <ConstraintCard
-                            key={constraint.id}
-                            constraint={constraint}
-                            onToggle={handleToggleConstraint}
-                            onDelete={handleDeleteConstraint}
-                            isAdmin={isAdmin}
-                        />
-                    ))}
-                </TabsContent>
-            </Tabs>
-        </div>
-    );
+interface ConstraintForm {
+  term_number: number;
+  earliest_start_time: string;
+  latest_end_time: string;
+  max_hours_per_day: number;
+  max_hours_per_week: number;
+  min_break_minutes: number;
+  max_consecutive_hours: number;
 }
 
-function ConstraintCard({
-    constraint,
-    onToggle,
-    onDelete,
-    isAdmin,
-}: {
-    constraint: Constraint;
-    onToggle: (id: string) => void;
-    onDelete: (id: string) => void;
-    isAdmin: boolean;
-}) {
-    return (
-        <Card className={!constraint.enabled ? "opacity-60" : ""}>
-            <CardContent className="flex items-start justify-between py-4">
-                <div className="flex items-start gap-4 flex-1">
-                    <div className="flex items-center gap-2 min-w-[100px]">
-                        {constraint.type === "hard" ? (
-                            <Badge variant="outline" className="text-destructive border-destructive">
-                                Hard
-                            </Badge>
-                        ) : (
-                            <Badge variant="outline" className="text-warning border-warning">
-                                Soft
-                            </Badge>
-                        )}
-                    </div>
-                    <div className="flex-1 space-y-1">
-                        <div className="flex items-center gap-2">
-                            {constraint.enabled ? (
-                                <CheckCircle2 className="h-4 w-4 text-success" />
-                            ) : (
-                                <AlertCircle className="h-4 w-4 text-muted-foreground" />
-                            )}
-                            <p className="font-medium">{constraint.description}</p>
-                        </div>
-                        <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                            <span>Category: {constraint.category}</span>
-                            <Separator orientation="vertical" className="h-4" />
-                            <span>Priority: {constraint.priority}/10</span>
-                        </div>
-                    </div>
+const DEFAULT_FORM: ConstraintForm = {
+  term_number: 1,
+  earliest_start_time: "08:50",
+  latest_end_time: "16:35",
+  max_hours_per_day: 6,
+  max_hours_per_week: 30,
+  min_break_minutes: 0,
+  max_consecutive_hours: 3,
+};
+
+export default function ConstraintsPage() {
+  const { user } = useAuth();
+  const canEdit = user?.role === "admin" || user?.role === "scheduler";
+
+  const [constraints, setConstraints] = useState<SemesterConstraint[]>([]);
+  const [form, setForm] = useState<ConstraintForm>(DEFAULT_FORM);
+  const [selectedTerm, setSelectedTerm] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const selectedConstraint = useMemo(
+    () => constraints.find((item) => item.term_number === selectedTerm) ?? null,
+    [constraints, selectedTerm],
+  );
+
+  const loadConstraints = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const data = await listSemesterConstraints();
+      const sorted = [...data].sort((a, b) => a.term_number - b.term_number);
+      setConstraints(sorted);
+      if (sorted.length && selectedTerm === null) {
+        const first = sorted[0];
+        setSelectedTerm(first.term_number);
+        setForm({ ...first });
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Unable to load constraints";
+      setError(detail);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadConstraints();
+  }, []);
+
+  const handleSelectTerm = (termNumber: number) => {
+    setSelectedTerm(termNumber);
+    const found = constraints.find((item) => item.term_number === termNumber);
+    if (found) {
+      setForm({ ...found });
+      setMessage(null);
+      setError(null);
+    }
+  };
+
+  const handleNew = () => {
+    const nextTerm = Math.max(0, ...constraints.map((item) => item.term_number)) + 1;
+    setSelectedTerm(null);
+    setForm({ ...DEFAULT_FORM, term_number: nextTerm });
+    setMessage(null);
+    setError(null);
+  };
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const payload = {
+        term_number: form.term_number,
+        earliest_start_time: form.earliest_start_time,
+        latest_end_time: form.latest_end_time,
+        max_hours_per_day: form.max_hours_per_day,
+        max_hours_per_week: form.max_hours_per_week,
+        min_break_minutes: form.min_break_minutes,
+        max_consecutive_hours: form.max_consecutive_hours,
+      };
+      const saved = await upsertSemesterConstraint(form.term_number, payload);
+      setConstraints((prev) => {
+        const withoutCurrent = prev.filter((item) => item.term_number !== saved.term_number);
+        return [...withoutCurrent, saved].sort((a, b) => a.term_number - b.term_number);
+      });
+      setSelectedTerm(saved.term_number);
+      setForm({ ...saved });
+      setMessage(`Saved constraints for Term ${saved.term_number}.`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Unable to save constraint";
+      setError(detail);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (selectedTerm === null) {
+      return;
+    }
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+    try {
+      await deleteSemesterConstraint(selectedTerm);
+      const updated = constraints.filter((item) => item.term_number !== selectedTerm);
+      setConstraints(updated);
+      if (updated.length) {
+        const first = updated[0];
+        setSelectedTerm(first.term_number);
+        setForm({ ...first });
+      } else {
+        setSelectedTerm(null);
+        setForm({ ...DEFAULT_FORM });
+      }
+      setMessage(`Deleted constraints for Term ${selectedTerm}.`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Unable to delete constraint";
+      setError(detail);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold text-foreground">Semester Constraints</h1>
+        <p className="text-sm text-muted-foreground mt-1">
+          Configure rule envelopes per term used by timetable validation and generation.
+        </p>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[300px_1fr]">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg">Configured Terms</CardTitle>
+            <CardDescription>Select a term to edit its constraints</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {isLoading ? <p className="text-sm text-muted-foreground">Loading...</p> : null}
+            {!isLoading && constraints.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No term constraints configured yet.</p>
+            ) : null}
+            {constraints.map((constraint) => (
+              <button
+                key={constraint.id}
+                type="button"
+                onClick={() => handleSelectTerm(constraint.term_number)}
+                className={`w-full rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                  selectedTerm === constraint.term_number
+                    ? "border-primary bg-primary/5"
+                    : "border-border hover:bg-muted/50"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-medium">Term {constraint.term_number}</span>
+                  <Badge variant="outline">{constraint.earliest_start_time} - {constraint.latest_end_time}</Badge>
                 </div>
-                {!isAdmin && (
-                    <div className="flex items-center gap-2">
-                        <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => onToggle(constraint.id)}
-                        >
-                            {constraint.enabled ? "Disable" : "Enable"}
-                        </Button>
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-destructive"
-                            onClick={() => onDelete(constraint.id)}
-                        >
-                            <Trash2 className="h-4 w-4" />
-                            <span className="sr-only">Delete</span>
-                        </Button>
-                    </div>
-                )}
-            </CardContent>
+              </button>
+            ))}
+            {canEdit ? (
+              <Button variant="outline" className="w-full mt-3" onClick={handleNew}>
+                <Plus className="h-4 w-4 mr-2" />
+                New Term Constraint
+              </Button>
+            ) : null}
+          </CardContent>
         </Card>
-    );
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg">Constraint Details</CardTitle>
+            <CardDescription>
+              {selectedConstraint ? `Editing Term ${selectedConstraint.term_number}` : "Create a new term constraint"}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="grid gap-2">
+                <Label htmlFor="term-number">Term Number</Label>
+                <Input
+                  id="term-number"
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={form.term_number}
+                  onChange={(e) => setForm((prev) => ({ ...prev, term_number: Number(e.target.value) || 1 }))}
+                  disabled={!canEdit || Boolean(selectedConstraint)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="min-break">Minimum Break (minutes)</Label>
+                <Input
+                  id="min-break"
+                  type="number"
+                  min={0}
+                  max={120}
+                  value={form.min_break_minutes}
+                  onChange={(e) => setForm((prev) => ({ ...prev, min_break_minutes: Number(e.target.value) || 0 }))}
+                  disabled={!canEdit}
+                />
+              </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="grid gap-2">
+                <Label htmlFor="earliest">Earliest Start</Label>
+                <Input
+                  id="earliest"
+                  type="time"
+                  value={form.earliest_start_time}
+                  onChange={(e) => setForm((prev) => ({ ...prev, earliest_start_time: e.target.value }))}
+                  disabled={!canEdit}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="latest">Latest End</Label>
+                <Input
+                  id="latest"
+                  type="time"
+                  value={form.latest_end_time}
+                  onChange={(e) => setForm((prev) => ({ ...prev, latest_end_time: e.target.value }))}
+                  disabled={!canEdit}
+                />
+              </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-3">
+              <div className="grid gap-2">
+                <Label htmlFor="max-day">Max Hours / Day</Label>
+                <Input
+                  id="max-day"
+                  type="number"
+                  min={1}
+                  max={12}
+                  value={form.max_hours_per_day}
+                  onChange={(e) => setForm((prev) => ({ ...prev, max_hours_per_day: Number(e.target.value) || 1 }))}
+                  disabled={!canEdit}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="max-week">Max Hours / Week</Label>
+                <Input
+                  id="max-week"
+                  type="number"
+                  min={1}
+                  max={80}
+                  value={form.max_hours_per_week}
+                  onChange={(e) => setForm((prev) => ({ ...prev, max_hours_per_week: Number(e.target.value) || 1 }))}
+                  disabled={!canEdit}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="max-consecutive">Max Consecutive Hours</Label>
+                <Input
+                  id="max-consecutive"
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={form.max_consecutive_hours}
+                  onChange={(e) => setForm((prev) => ({ ...prev, max_consecutive_hours: Number(e.target.value) || 1 }))}
+                  disabled={!canEdit}
+                />
+              </div>
+            </div>
+
+            {error ? <p className="text-sm text-destructive">{error}</p> : null}
+            {message ? <p className="text-sm text-success">{message}</p> : null}
+
+            {canEdit ? (
+              <div className="flex flex-wrap gap-2 pt-2">
+                <Button onClick={() => void handleSave()} disabled={isSaving}>
+                  <Save className="h-4 w-4 mr-2" />
+                  Save Constraint
+                </Button>
+                {selectedConstraint ? (
+                  <Button variant="outline" className="text-destructive" onClick={() => void handleDelete()} disabled={isSaving}>
+                    <Trash2 className="h-4 w-4 mr-2" />
+                    Delete
+                  </Button>
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">You have read-only access to constraint configuration.</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
 }
