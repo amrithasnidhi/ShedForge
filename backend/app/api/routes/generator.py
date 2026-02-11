@@ -766,12 +766,16 @@ def generate_timetable(
             payload=payload,
         )
         has_conflict_free = _retain_conflict_free_alternatives(result, context="Generation")
-        if not has_conflict_free and result.alternatives:
-            best = result.alternatives[0]
-            result.publish_warning = (
-                "Generation produced alternatives with unresolved hard conflicts. "
-                f"Best candidate has {best.hard_conflicts} hard conflicts; review Conflict Dashboard before publishing."
-            )
+        if not has_conflict_free:
+             logger.warning("TIMETABLE GENERATION | No conflict-free alternatives produced")
+             # We still return the result, but with an empty alternatives list or only the best (which has conflicts)
+             # The UI should handle empty alternatives or we could raise an error.
+             # Based on requirements, we should probably ERROR out if we want to be strict.
+             if not result.alternatives:
+                 raise HTTPException(
+                     status_code=status.HTTP_400_BAD_REQUEST,
+                     detail="Scheduler could not produce a conflict-free timetable. Please adjust constraints or resources."
+                 )
         _attach_occupancy_matrices(result)
         faculty_map = _load_faculty_map(db)
         _attach_workload_gap_suggestions(

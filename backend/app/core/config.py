@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     smtp_rate_limit_cooldown_seconds: int = 1800
     smtp_timeout_seconds: int = 15
 
+    sendgrid_api_key: str | None = None
+
     max_request_size_bytes: int = 2_500_000
     security_enable_hsts: bool = False
     security_hsts_max_age_seconds: int = 31536000
@@ -71,6 +73,7 @@ class Settings(BaseSettings):
         "http://localhost:4173",
         "http://127.0.0.1:4173",
     ]
+    cors_origin_regex: str | None = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
     @field_validator("cors_origins", mode="before")
     @classmethod

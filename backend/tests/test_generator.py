@@ -582,7 +582,7 @@ def test_generate_returns_ranked_candidates_with_warning_when_conflicts_remain(c
             "program_id": "program-test",
             "term_number": 1,
             "alternative_count": 1,
-            "persist_official": False,
+            "persist_official": True,
         },
         headers={"Authorization": f"Bearer {admin_token}"},
     )

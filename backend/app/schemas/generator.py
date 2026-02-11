@@ -11,15 +11,15 @@ from app.schemas.timetable import OfficialTimetablePayload
 
 
 class ObjectiveWeights(BaseModel):
-    room_conflict: int = Field(default=400, ge=1, le=5000)
+    room_conflict: int = Field(default=2000, ge=1, le=5000)
     faculty_conflict: int = Field(default=400, ge=1, le=5000)
-    section_conflict: int = Field(default=500, ge=1, le=5000)
+    section_conflict: int = Field(default=1000, ge=1, le=5000)
     room_capacity: int = Field(default=200, ge=1, le=5000)
     room_type: int = Field(default=150, ge=1, le=5000)
     faculty_availability: int = Field(default=180, ge=1, le=5000)
     locked_slot: int = Field(default=1000, ge=1, le=10000)
     semester_limit: int = Field(default=200, ge=1, le=5000)
-    workload_overflow: int = Field(default=90, ge=1, le=5000)
+    workload_overflow: int = Field(default=1500, ge=1, le=5000)
     workload_underflow: int = Field(default=40, ge=0, le=5000)
     spread_balance: int = Field(default=20, ge=0, le=1000)
     faculty_subject_preference: int = Field(default=30, ge=0, le=2000)

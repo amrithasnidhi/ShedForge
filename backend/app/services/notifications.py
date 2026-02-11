@@ -46,17 +46,22 @@ def publish_realtime_notification(notification: Notification, *, event: str = "n
         logger.debug("Unable to push realtime notification for user %s", notification.user_id, exc_info=True)
 
 
-def _send_notification_email(recipient: User, *, title: str, message: str) -> None:
+def _send_notification_email(recipient: User, *, title: str, message: str) -> bool:
     if not recipient.email:
-        return
+        return True
     try:
         send_email(
             to_email=recipient.email,
             subject=f"ShedForge Notification: {title}",
             text_content=f"{title}\n\n{message}",
         )
-    except EmailDeliveryError:  # pragma: no cover - transport behavior
+        return True
+    except EmailDeliveryError as exc:  # pragma: no cover - transport behavior
         logger.warning("Notification email delivery failed for %s", recipient.email, exc_info=True)
+        # If the error is a rate limit, return False to signal "stop trying"
+        if "rate-limited" in str(exc).lower():
+            return False
+        return True
 
 
 def create_notification(
@@ -69,7 +74,7 @@ def create_notification(
     recipient: User | None = None,
     deliver_email: bool = False,
     deliver_realtime: bool = True,
-) -> Notification:
+) -> tuple[Notification, bool]:
     record = Notification(
         user_id=user_id,
         title=title,
@@ -79,11 +84,12 @@ def create_notification(
     db.add(record)
     db.flush()
 
+    email_success = True
     if deliver_email and recipient is not None:
-        _send_notification_email(recipient, title=title, message=message)
+        email_success = _send_notification_email(recipient, title=title, message=message)
     if deliver_realtime:
         publish_realtime_notification(record, event="notification.created")
-    return record
+    return record, email_success
 
 
 def notify_users(
@@ -110,17 +116,16 @@ def notify_users(
     )
     results: list[Notification] = []
     for recipient in recipients:
-        results.append(
-            create_notification(
-                db,
-                user_id=recipient.id,
-                title=title,
-                message=message,
-                notification_type=notification_type,
-                recipient=recipient,
-                deliver_email=deliver_email,
-            )
+        record, _ = create_notification(
+            db,
+            user_id=recipient.id,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            recipient=recipient,
+            deliver_email=deliver_email,
         )
+        results.append(record)
     return results
 
 
@@ -148,17 +153,16 @@ def notify_roles(
     for recipient in recipients:
         if exclude_user_id and recipient.id == exclude_user_id:
             continue
-        results.append(
-            create_notification(
-                db,
-                user_id=recipient.id,
-                title=title,
-                message=message,
-                notification_type=notification_type,
-                recipient=recipient,
-                deliver_email=deliver_email,
-            )
+        record, _ = create_notification(
+            db,
+            user_id=recipient.id,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            recipient=recipient,
+            deliver_email=deliver_email,
         )
+        results.append(record)
     return results
 
 
@@ -176,17 +180,16 @@ def notify_all_users(
     for recipient in recipients:
         if exclude_user_id and recipient.id == exclude_user_id:
             continue
-        results.append(
-            create_notification(
-                db,
-                user_id=recipient.id,
-                title=title,
-                message=message,
-                notification_type=notification_type,
-                recipient=recipient,
-                deliver_email=deliver_email,
-            )
+        record, _ = create_notification(
+            db,
+            user_id=recipient.id,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            recipient=recipient,
+            deliver_email=deliver_email,
         )
+        results.append(record)
     return results
 
 

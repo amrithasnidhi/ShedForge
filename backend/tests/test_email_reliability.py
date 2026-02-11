@@ -33,6 +33,7 @@ def _settings(**overrides):
         smtp_retry_backoff_seconds=0.0,
         smtp_rate_limit_cooldown_seconds=600,
         smtp_timeout_seconds=5,
+        sendgrid_api_key=None,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

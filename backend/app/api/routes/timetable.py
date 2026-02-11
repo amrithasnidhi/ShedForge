@@ -2935,11 +2935,12 @@ def upsert_official_timetable(
             message=change_message,
             notification_type=NotificationType.timetable,
             exclude_user_id=current_user.id,
-            deliver_email=True,
+            deliver_email=True,  # Re-enabled as per user request
         )
         db.commit()
     except Exception:
-        db.rollback()
+        # We DO NOT rollback here because the timetable itself was already committed at line 2903.
+        # We only lose the notification records if this fails, but it's better than losing the publish.
         logger.exception(
             "TIMETABLE PUBLISH NOTIFICATION FAILED | user_id=%s | program_id=%s | term=%s | version=%s",
             current_user.id,

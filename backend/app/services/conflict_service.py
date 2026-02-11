@@ -26,6 +26,7 @@ class ConflictService:
             slots_by_day[slot.day].append(slot)
 
         for day, day_slots in slots_by_day.items():
+
             # Check pairwise in day
             n = len(day_slots)
             for i in range(n):
@@ -47,9 +48,17 @@ class ConflictService:
                         ))
                     if s1.sessionType == "lab" and room.get("type") != "lab":
                          conflicts.append(ConflictDetail(
-                            id=f"type-{s1.id}",
+                            id=f"type-lab-{s1.id}",
                             conflict_type="room_type",
                             description=f"Lab session in non-lab room {room.get('name')}",
+                            severity="hard",
+                            affected_slots=[s1.id]
+                        ))
+                    elif s1.sessionType == "theory" and room.get("type") == "lab":
+                         conflicts.append(ConflictDetail(
+                            id=f"type-theory-{s1.id}",
+                            conflict_type="room_type",
+                            description=f"Theory session in lab room {room.get('name')}",
                             severity="hard",
                             affected_slots=[s1.id]
                         ))

@@ -9,3 +9,5 @@ pydantic-settings
 email-validator
 pytest
 httpx
+certifi
+sendgrid

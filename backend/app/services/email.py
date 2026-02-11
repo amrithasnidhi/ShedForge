@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from email.message import EmailMessage
+import certifi
 import smtplib
 import ssl
 import time
@@ -159,6 +160,8 @@ def _resolve_endpoints(settings, *, delivery_profile: str) -> list[_SmtpEndpoint
     ]
     if active:
         return active
+
+    # Relaxed: If all are in cooldown, try them anyway as requested by user.
     return endpoints
 
 
@@ -190,8 +193,41 @@ def _is_connection_issue(exc: Exception) -> bool:
     )
 
 
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail
+except ImportError:
+    SendGridAPIClient = None
+    Mail = None
+
+
+import logging
+logger = logging.getLogger(__name__)
+
 def send_email(*, to_email: str, subject: str, text_content: str, html_content: str | None = None) -> None:
     settings = get_settings()
+
+    # PRIORitize SendGrid SDK if API key is present
+    if settings.sendgrid_api_key and SendGridAPIClient:
+        try:
+            sg = SendGridAPIClient(api_key=settings.sendgrid_api_key)
+            from_email = settings.smtp_from_email or "notifications@shedforge.com"
+            from_name = settings.smtp_from_name or "ShedForge"
+
+            message = Mail(
+                from_email=(from_email, from_name),
+                to_emails=to_email,
+                subject=subject,
+                plain_text_content=text_content,
+                html_content=html_content,
+            )
+            response = sg.send(message)
+            if 200 <= response.status_code < 300:
+                return
+        except Exception:
+            # Fallback to SMTP if SendGrid fails
+            pass
+
     delivery_profile = _infer_delivery_profile(subject)
     endpoints = _resolve_endpoints(settings, delivery_profile=delivery_profile)
     timeout = max(1, settings.smtp_timeout_seconds)
@@ -201,6 +237,9 @@ def send_email(*, to_email: str, subject: str, text_content: str, html_content: 
 
     last_error: Exception | None = None
     last_error_message = "Unable to deliver email"
+
+    # Use certifi for SSL context to fix macOS certificate issues
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     for endpoint in endpoints:
         endpoint_fatal = False
@@ -216,7 +255,7 @@ def send_email(*, to_email: str, subject: str, text_content: str, html_content: 
                         html_content=html_content,
                     )
                     if use_ssl:
-                        with smtplib.SMTP_SSL(endpoint.host, port, timeout=timeout) as smtp:
+                        with smtplib.SMTP_SSL(endpoint.host, port, timeout=timeout, context=ssl_context) as smtp:
                             if endpoint.username:
                                 smtp.login(endpoint.username, endpoint.password)
                             smtp.send_message(message)
@@ -224,34 +263,34 @@ def send_email(*, to_email: str, subject: str, text_content: str, html_content: 
 
                     with smtplib.SMTP(endpoint.host, port, timeout=timeout) as smtp:
                         if use_tls:
-                            smtp.starttls(context=ssl.create_default_context())
+                            smtp.starttls(context=ssl_context)
                         if endpoint.username:
                             smtp.login(endpoint.username, endpoint.password)
                         smtp.send_message(message)
                     return
-                except smtplib.SMTPAuthenticationError as exc:  # pragma: no cover - transport-specific behavior
+                except smtplib.SMTPAuthenticationError as exc:  # pragma: no cover
                     last_error = exc
                     last_error_message = "SMTP authentication failed"
                     endpoint_fatal = True
                     break
-                except smtplib.SMTPDataError as exc:  # pragma: no cover - transport-specific behavior
+                except smtplib.SMTPDataError as exc:  # pragma: no cover
                     last_error = exc
                     last_error_message = _classify_smtp_data_error(exc)
                     if last_error_message == "SMTP sender rate limited":
                         _mark_endpoint_rate_limited(endpoint, cooldown_seconds)
                     endpoint_fatal = True
                     break
-                except smtplib.SMTPRecipientsRefused as exc:  # pragma: no cover - transport-specific behavior
+                except smtplib.SMTPRecipientsRefused as exc:  # pragma: no cover
                     last_error = exc
                     last_error_message = "SMTP recipient rejected"
                     endpoint_fatal = True
                     break
-                except smtplib.SMTPSenderRefused as exc:  # pragma: no cover - transport-specific behavior
+                except smtplib.SMTPSenderRefused as exc:  # pragma: no cover
                     last_error = exc
                     last_error_message = "SMTP sender rejected"
                     endpoint_fatal = True
                     break
-                except Exception as exc:  # pragma: no cover - transport-specific behavior
+                except Exception as exc:  # pragma: no cover
                     last_error = exc
                     if _is_connection_issue(exc):
                         last_error_message = "SMTP connection failed"
