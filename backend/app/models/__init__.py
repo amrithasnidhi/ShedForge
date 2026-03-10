@@ -19,6 +19,7 @@ from app.models.leave_substitute_assignment import LeaveSubstituteAssignment  # 
 from app.models.notification import Notification, NotificationType  # noqa: F401
 from app.models.password_reset import PasswordResetToken  # noqa: F401
 from app.models.program import Program, ProgramDegree  # noqa: F401
+from app.models.program_constraint import ProgramConstraint  # noqa: F401
 from app.models.program_structure import (  # noqa: F401
     ElectiveConflictPolicy,
     ProgramCourse,
@@ -41,7 +42,16 @@ from app.models.timetable_conflict_decision import (  # noqa: F401
     ConflictDecision,
     TimetableConflictDecision,
 )
-from app.models.timetable_issue import IssueCategory, IssueStatus, TimetableIssue  # noqa: F401
+from app.models.timetable_issue import (  # noqa: F401
+    IssueCategory,
+    IssueMessage,
+    IssueStatus,
+    TimetableIssue,
+)
 from app.models.timetable import OfficialTimetable  # noqa: F401
+from app.models.timetable_change_request import (  # noqa: F401
+    TimetableChangeRequest,
+    TimetableChangeRequestStatus,
+)
 from app.models.timetable_version import TimetableVersion  # noqa: F401
 from app.models.user import User, UserRole  # noqa: F401

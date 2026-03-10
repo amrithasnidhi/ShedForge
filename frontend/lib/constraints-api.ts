@@ -38,6 +38,47 @@ export interface SemesterConstraint {
 
 export type SemesterConstraintUpsert = Omit<SemesterConstraint, "id">;
 
+export type ConstraintSlotTag = "teaching" | "block" | "break" | "lunch";
+
+export interface ProgramDailyTimeSlot {
+  start_time: string;
+  end_time: string;
+  tag: ConstraintSlotTag;
+  label?: string | null;
+}
+
+export interface ProgramConstraint {
+  id: string;
+  program_id: string;
+  daily_time_slots: ProgramDailyTimeSlot[];
+  faculty_min_hours_per_week: number;
+  faculty_max_hours_per_week: number;
+  temporal_window_semesters: number;
+  auto_assign_research_slots: boolean;
+  enforce_student_credit_load: boolean;
+  enforce_ltp_split: boolean;
+  enforce_lab_contiguous_blocks: boolean;
+  updated_at?: string | null;
+}
+
+export type ProgramConstraintUpsert = Omit<ProgramConstraint, "id" | "updated_at">;
+
+export interface ConstraintViolation {
+  code: string;
+  severity: "hard" | "warn";
+  message: string;
+  term_number?: number | null;
+  course_id?: string | null;
+  faculty_id?: string | null;
+}
+
+export interface ProgramConstraintReport {
+  program_id: string;
+  generated_at: string;
+  violation_count: number;
+  violations: ConstraintViolation[];
+}
+
 export async function listSemesterConstraints(): Promise<SemesterConstraint[]> {
   const response = await fetch(`${API_BASE_URL}/api/constraints/semesters`, {
     headers: getAuthHeaders(),
@@ -72,4 +113,41 @@ export async function deleteSemesterConstraint(termNumber: number): Promise<void
   if (!response.ok) {
     throw new Error("Unable to delete semester constraint");
   }
+}
+
+export async function listProgramConstraints(): Promise<ProgramConstraint[]> {
+  const response = await fetch(`${API_BASE_URL}/api/constraints/programs`, {
+    headers: getAuthHeaders(),
+  });
+  return handleResponse<ProgramConstraint[]>(response, "Unable to load program constraints");
+}
+
+export async function getProgramConstraint(programId: string): Promise<ProgramConstraint> {
+  const response = await fetch(`${API_BASE_URL}/api/constraints/programs/${programId}`, {
+    headers: getAuthHeaders(),
+  });
+  return handleResponse<ProgramConstraint>(response, "Unable to load program constraints");
+}
+
+export async function upsertProgramConstraint(
+  programId: string,
+  payload: ProgramConstraintUpsert,
+): Promise<ProgramConstraint> {
+  const response = await fetch(`${API_BASE_URL}/api/constraints/programs/${programId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<ProgramConstraint>(response, "Unable to update program constraints");
+}
+
+export async function getProgramConstraintReport(
+  programId: string,
+  termNumber?: number,
+): Promise<ProgramConstraintReport> {
+  const query = typeof termNumber === "number" ? `?termNumber=${termNumber}` : "";
+  const response = await fetch(`${API_BASE_URL}/api/constraints/programs/${programId}/report${query}`, {
+    headers: getAuthHeaders(),
+  });
+  return handleResponse<ProgramConstraintReport>(response, "Unable to load constraint report");
 }

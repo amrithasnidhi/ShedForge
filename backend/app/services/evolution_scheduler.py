@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import hashlib
+import json
 import logging
 import math
+from pathlib import Path
 import random
+import threading
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
@@ -17,6 +20,7 @@ from app.core.exceptions import SchedulerError
 from app.models.course import Course, CourseType
 from app.models.faculty import Faculty
 from app.models.institution_settings import InstitutionSettings
+from app.models.program_constraint import ProgramConstraint
 from app.models.program_structure import (
     ElectiveConflictPolicy,
     ProgramCourse,
@@ -52,6 +56,23 @@ DAY_SHORT_MAP = {
 }
 
 logger = logging.getLogger(__name__)
+HYPERPARAMETER_CACHE_FILE = Path(__file__).resolve().parents[2] / ".ga_hyperparameter_cache.json"
+THREE_SLOT_PRACTICAL_COURSE_CODES = {"23MEE115", "23ECE285"}
+THREE_SLOT_PRACTICAL_NAME_MARKERS = {
+    "manufacturing practice",
+    "digital electronics laboratory",
+}
+VIRTUAL_RESOURCE_HASH_SIZE = 12
+CANONICAL_LUNCH_START_MINUTES = parse_time_to_minutes("13:15")
+CANONICAL_LUNCH_END_MINUTES = parse_time_to_minutes("14:05")
+REMOVED_LEGACY_SLOT_RANGES: set[tuple[int, int]] = {
+    (parse_time_to_minutes("10:45"), parse_time_to_minutes("11:20")),
+    (parse_time_to_minutes("11:20"), parse_time_to_minutes("12:10")),
+    (parse_time_to_minutes("12:10"), parse_time_to_minutes("13:00")),
+    (parse_time_to_minutes("14:40"), parse_time_to_minutes("15:30")),
+    (parse_time_to_minutes("15:30"), parse_time_to_minutes("16:20")),
+    (parse_time_to_minutes("16:20"), parse_time_to_minutes("16:35")),
+}
 
 
 def minutes_to_time(value: int) -> str:
@@ -62,6 +83,18 @@ def minutes_to_time(value: int) -> str:
 
 def normalize_day(value: str) -> str:
     return DAY_SHORT_MAP.get(value, value)
+
+
+def _is_removed_legacy_slot_range(start: int, end: int) -> bool:
+    return (start, end) in REMOVED_LEGACY_SLOT_RANGES
+
+
+def _is_canonical_lunch_range(start: int, end: int) -> bool:
+    return start == CANONICAL_LUNCH_START_MINUTES and end == CANONICAL_LUNCH_END_MINUTES
+
+
+def _overlaps_canonical_lunch(start: int, end: int) -> bool:
+    return start < CANONICAL_LUNCH_END_MINUTES and end > CANONICAL_LUNCH_START_MINUTES
 
 
 @dataclass(frozen=True)
@@ -94,6 +127,8 @@ class BlockRequest:
     allow_parallel_batches: bool
     room_candidate_ids: tuple[str, ...]
     options: tuple[PlacementOption, ...]
+    requires_faculty: bool = True
+    requires_room: bool = True
 
 
 @dataclass
@@ -101,23 +136,36 @@ class EvaluationResult:
     fitness: float
     hard_conflicts: int
     soft_penalty: float
+    workload_balance_penalty: float = 0.0
+    objectives: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+@dataclass
+class SearchHyperParameters:
+    population_size: int
+    generations: int
+    mutation_rate: float
+    crossover_rate: float
+    elite_count: int
+    tournament_size: int
+    stagnation_limit: int
+    annealing_iterations: int
+    annealing_initial_temperature: float
+    annealing_cooling_rate: float
 
 
 class EvolutionaryScheduler:
     """
-    Implements a Genetic Algorithm (GA) to generate optimized academic timetables.
-    
-    The algorithm evolves a population of timetables over multiple generations to minimize
-    conflicts and optimize for soft constraints like faculty workload balance and preferred slots.
-    
-    Key Steps:
-    1.  **Initialization**: Creates a random population of valid timetables.
-    2.  **Fitness Evaluation**: Scores each timetable based on hard constraints (validity) and soft constraints (quality).
-    3.  **Selection**: Selects the best timetables to be parents for the next generation.
-    4.  **Crossover**: Combines genes (slot assignments) from two parents to create offspring.
-    5.  **Mutation**: Randomly alters genes to introduce diversity and avoid local optima.
-    6.  **Elitism**: Preserves the best solutions unchanged across generations.
+    Fully automatic timetable optimizer:
+    1. GA-based hyperparameter tuning (meta-optimization).
+    2. MOEA search for exploration (Pareto-driven population evolution).
+    3. Simulated Annealing for exploitation (local intensification on promising solutions).
     """
+
+    _hyperparameter_cache_lock = threading.Lock()
+    _hyperparameter_cache_loaded = False
+    _hyperparameter_cache_by_scenario: dict[str, SearchHyperParameters] = {}
+    program_constraint: ProgramConstraint | None = None
 
     def __init__(
         self,
@@ -127,6 +175,8 @@ class EvolutionaryScheduler:
         term_number: int,
         settings: GenerationSettingsBase,
         reserved_resource_slots: list[dict] | None = None,
+        progress_reporter: Callable[[dict[str, Any]], None] | None = None,
+        hyperparameter_cache_scope: str = "single",
     ) -> None:
         """
         Initializes the scheduler with necessary context and loads all required resources.
@@ -143,7 +193,10 @@ class EvolutionaryScheduler:
         self.term_number = term_number
         self.settings = settings
         self.random = random.Random(settings.random_seed)
+        self.progress_reporter = progress_reporter
+        self.hyperparameter_cache_scope = hyperparameter_cache_scope
 
+        self.program_constraint = self._load_program_constraint()
         self.working_hours, self.schedule_policy = self._load_time_settings()
         self.day_slots = self._build_day_slots()
         if not self.day_slots:
@@ -161,16 +214,24 @@ class EvolutionaryScheduler:
         self._validate_section_time_capacity()
         self.elective_overlap_pairs = self._load_elective_overlap_pairs()
         self.shared_lecture_sections_by_course = self._load_shared_lecture_sections_by_course()
-        self.rooms = {room.id: room for room in self.db.execute(select(Room)).scalars().all()}
+        self.rooms = {
+            room.id: room
+            for room in self.db.execute(select(Room).where(Room.program_id == self.program_id)).scalars().all()
+        }
         if not self.rooms:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No rooms available for generation")
+        self._virtual_room_ids: set[str] = set()
 
         room_type_counts = Counter(r.type for r in self.rooms.values())
         logger.info("Rooms loaded: total=%d, counts=%s", len(self.rooms), dict(room_type_counts))
 
-        self.faculty = {item.id: item for item in self.db.execute(select(Faculty)).scalars().all()}
+        self.faculty = {
+            item.id: item
+            for item in self.db.execute(select(Faculty).where(Faculty.program_id == self.program_id)).scalars().all()
+        }
         if not self.faculty:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No faculty available for generation")
+        self._virtual_faculty_ids: set[str] = set()
         self.faculty_windows = {item.id: self._normalize_windows(item.availability_windows) for item in self.faculty.values()}
         self.room_windows = {item.id: self._normalize_windows(item.availability_windows) for item in self.rooms.values()}
         self.faculty_preferred_subject_codes = {
@@ -182,6 +243,8 @@ class EvolutionaryScheduler:
             .scalars()
             .first()
         )
+        self.three_term_horizon_terms = self._resolve_three_term_horizon_terms()
+        self.faculty_three_term_baseline_minutes = self._load_three_term_baseline_minutes()
 
         self.block_requests = self._build_block_requests()
         self.request_indices_by_course = self._build_request_indices_by_course()
@@ -223,6 +286,190 @@ class EvolutionaryScheduler:
         preferred.update(code.strip().upper() for code in term_specific if code and code.strip())
         return preferred
 
+    @staticmethod
+    def _normalize_project_phase_text(value: str | None) -> str:
+        raw = (value or "").lower().replace("-", " ").replace("_", " ")
+        return " ".join(raw.split())
+
+    def _is_project_phase_course(self, course: Course | None) -> bool:
+        if course is None:
+            return False
+        name = self._normalize_project_phase_text(getattr(course, "name", ""))
+        code = self._normalize_project_phase_text(getattr(course, "code", ""))
+        return "project phase" in name or "project phase" in code
+
+    def _is_project_phase_request(self, req: BlockRequest) -> bool:
+        return self._is_project_phase_course(self.courses.get(req.course_id))
+
+    @staticmethod
+    def _normalize_course_identity_text(value: str | None) -> str:
+        return " ".join((value or "").strip().lower().replace("-", " ").replace("_", " ").split())
+
+    def _is_three_slot_practical_course(self, course: Course | None) -> bool:
+        if course is None:
+            return False
+        code = str(getattr(course, "code", "") or "").strip().upper()
+        if code in THREE_SLOT_PRACTICAL_COURSE_CODES:
+            return True
+        name = self._normalize_course_identity_text(getattr(course, "name", ""))
+        return any(marker in name for marker in THREE_SLOT_PRACTICAL_NAME_MARKERS)
+
+    def _practical_block_slot_size_for_course(self, course: Course | None) -> int:
+        if self.program_constraint is not None and not self.program_constraint.enforce_lab_contiguous_blocks:
+            return 1
+        if course is None:
+            return max(1, int(self.schedule_policy.lab_contiguous_slots or 2))
+        configured = getattr(course, "practical_contiguous_slots", None)
+        if configured is not None:
+            block_size = max(1, int(configured))
+        elif self._is_three_slot_practical_course(course):
+            block_size = 3
+        else:
+            # Fallback to institution-level default when course-level value is not provided.
+            block_size = max(1, int(self.schedule_policy.lab_contiguous_slots or 2))
+        practical_hours = max(0, int(course.lab_hours or 0))
+        if practical_hours > 0:
+            block_size = min(block_size, practical_hours)
+        return max(1, block_size)
+
+    @staticmethod
+    def _computed_course_credits(course: Course) -> float:
+        """
+        Compute academic credits from LTP split:
+        Credits = L + T + (P / 2)
+        where:
+          L = theory hours, T = tutorial hours, P = lab/practical hours.
+        """
+        theory = max(0, int(course.theory_hours or 0))
+        tutorial = max(0, int(course.tutorial_hours or 0))
+        practical = max(0, int(course.lab_hours or 0))
+        return float(theory + tutorial + (practical / 2.0))
+
+    def _weekly_period_units_for_course(self, course: Course) -> int:
+        split_units = (
+            max(0, int(course.theory_hours or 0))
+            + max(0, int(course.tutorial_hours or 0))
+            + max(0, int(course.lab_hours or 0))
+        )
+        if split_units > 0:
+            return split_units
+        return max(0, int(course.hours_per_week or 0))
+
+    def _resolve_three_term_horizon_terms(self) -> list[int]:
+        window_size = 3
+        if self.program_constraint is not None:
+            window_size = max(1, int(self.program_constraint.temporal_window_semesters or 3))
+        terms: list[int] = []
+        next_term = self.term_number
+        while next_term <= 20 and len(terms) < window_size:
+            terms.append(next_term)
+            next_term += 2
+
+        prev_term = self.term_number - 2
+        while prev_term >= 1 and len(terms) < window_size:
+            terms.append(prev_term)
+            prev_term -= 2
+
+        return sorted(set(terms))
+
+    def _load_three_term_baseline_minutes(self) -> dict[str, int]:
+        baseline_minutes: dict[str, int] = {faculty_id: 0 for faculty_id in self.faculty.keys()}
+        prior_terms = [term for term in self.three_term_horizon_terms if term != self.term_number]
+        if not prior_terms:
+            return baseline_minutes
+
+        section_counts_by_term: dict[int, int] = defaultdict(int)
+        for term_number, section_count in (
+            self.db.execute(
+                select(ProgramSection.term_number, ProgramSection.id)
+                .where(
+                    ProgramSection.program_id == self.program_id,
+                    ProgramSection.term_number.in_(prior_terms),
+                )
+            )
+            .all()
+        ):
+            if section_count:
+                section_counts_by_term[term_number] += 1
+
+        rows = (
+            self.db.execute(
+                select(ProgramCourse).where(
+                    ProgramCourse.program_id == self.program_id,
+                    ProgramCourse.term_number.in_(prior_terms),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return baseline_minutes
+
+        rows_by_term: dict[int, list[ProgramCourse]] = defaultdict(list)
+        for row in rows:
+            rows_by_term[row.term_number].append(row)
+
+        active_rows: list[ProgramCourse] = []
+        for term_rows in rows_by_term.values():
+            required = [item for item in term_rows if item.is_required]
+            active_rows.extend(required if required else term_rows)
+
+        if not active_rows:
+            return baseline_minutes
+
+        prior_course_ids = sorted({row.course_id for row in active_rows})
+        prior_courses = {
+            item.id: item
+            for item in self.db.execute(select(Course).where(Course.id.in_(prior_course_ids))).scalars().all()
+        }
+        if not prior_courses:
+            return baseline_minutes
+
+        period_minutes = max(1, self.schedule_policy.period_minutes)
+        for row in active_rows:
+            course = prior_courses.get(row.course_id)
+            if course is None or not course.faculty_id:
+                continue
+            if course.faculty_id not in baseline_minutes:
+                continue
+            weekly_units = self._weekly_period_units_for_course(course)
+            if weekly_units <= 0:
+                continue
+            section_multiplier = max(1, section_counts_by_term.get(row.term_number, 0))
+            practical_units = max(0, int(course.lab_hours or 0))
+            lecture_units = max(0, weekly_units - practical_units)
+            practical_multiplier = max(1, row.lab_batch_count) if practical_units > 0 else 1
+            effective_units = lecture_units + (practical_units * practical_multiplier)
+            baseline_minutes[course.faculty_id] += effective_units * section_multiplier * period_minutes
+
+        return baseline_minutes
+
+    def _three_term_workload_balance_penalty(self, current_minutes: dict[str, int]) -> float:
+        baseline_minutes = getattr(self, "faculty_three_term_baseline_minutes", {}) or {}
+        active_faculty_ids = [
+            faculty_id
+            for faculty_id, faculty in self.faculty.items()
+            if self._effective_faculty_max_hours(faculty) > 0
+        ]
+        if len(active_faculty_ids) <= 1:
+            return 0.0
+
+        combined_minutes: list[float] = []
+        for faculty_id in active_faculty_ids:
+            combined_minutes.append(
+                float(baseline_minutes.get(faculty_id, 0) + current_minutes.get(faculty_id, 0))
+            )
+        if not combined_minutes:
+            return 0.0
+
+        average = sum(combined_minutes) / len(combined_minutes)
+        if average <= 0:
+            return 0.0
+
+        mad = sum(abs(value - average) for value in combined_minutes) / len(combined_minutes)
+        period = max(1.0, float(self.schedule_policy.period_minutes))
+        return mad / period
+
     def _option_bounds(self, option: PlacementOption, block_size: int) -> tuple[int, int]:
         day_slots = self.day_slots[option.day]
         if not day_slots:
@@ -246,7 +493,9 @@ class EvolutionaryScheduler:
     def _parallel_lab_group_key(self, req: BlockRequest) -> tuple[str, str, str, int] | None:
         if not req.is_lab or not req.allow_parallel_batches or not req.batch:
             return None
-        return (req.course_id, req.section, req.session_type, req.block_size)
+        # Project phases are synchronized across sections as one combined event.
+        sync_scope = "__project_phase__" if self._is_project_phase_request(req) else req.section
+        return (req.course_id, sync_scope, req.session_type, req.block_size)
 
     @staticmethod
     def _parallel_lab_signature(option: PlacementOption) -> tuple[str, int]:
@@ -340,6 +589,8 @@ class EvolutionaryScheduler:
         end_min: int,
         room_id: str,
         faculty_id: str,
+        check_room: bool = True,
+        check_faculty: bool = True,
     ) -> tuple[bool, bool]:
         room_conflict = False
         faculty_conflict = False
@@ -347,9 +598,9 @@ class EvolutionaryScheduler:
             overlaps = start_min < reserved_end and reserved_start < end_min
             if not overlaps:
                 continue
-            if reserved_room_id and reserved_room_id == room_id:
+            if check_room and reserved_room_id and reserved_room_id == room_id:
                 room_conflict = True
-            if reserved_faculty_id and reserved_faculty_id == faculty_id:
+            if check_faculty and reserved_faculty_id and reserved_faculty_id == faculty_id:
                 faculty_conflict = True
             if room_conflict or faculty_conflict:
                 break
@@ -363,6 +614,8 @@ class EvolutionaryScheduler:
         end_min: int,
         room_id: str,
         faculty_id: str,
+        check_room: bool = True,
+        check_faculty: bool = True,
     ) -> bool:
         room_conflict, faculty_conflict = self._reserved_conflict_flags(
             day=day,
@@ -370,6 +623,8 @@ class EvolutionaryScheduler:
             end_min=end_min,
             room_id=room_id,
             faculty_id=faculty_id,
+            check_room=check_room,
+            check_faculty=check_faculty,
         )
         return room_conflict or faculty_conflict
 
@@ -386,7 +641,88 @@ class EvolutionaryScheduler:
         )
         return working_hours, schedule_policy
 
+    def _load_program_constraint(self) -> ProgramConstraint | None:
+        return (
+            self.db.execute(select(ProgramConstraint).where(ProgramConstraint.program_id == self.program_id))
+            .scalars()
+            .first()
+        )
+
+    def _effective_faculty_max_hours(self, faculty: Faculty) -> int:
+        configured_cap = 0
+        program_constraint = getattr(self, "program_constraint", None)
+        if program_constraint is not None:
+            configured_cap = max(0, int(program_constraint.faculty_max_hours_per_week or 0))
+        faculty_cap = max(0, int(faculty.max_hours or 0))
+        if configured_cap and faculty_cap:
+            return min(configured_cap, faculty_cap)
+        return configured_cap or faculty_cap
+
+    def _faculty_min_target_hours(self, faculty: Faculty) -> int:
+        configured_min = 0
+        program_constraint = getattr(self, "program_constraint", None)
+        if program_constraint is not None:
+            configured_min = max(0, int(program_constraint.faculty_min_hours_per_week or 0))
+        faculty_target = max(0, int(faculty.workload_hours or 0))
+        return max(configured_min, faculty_target)
+
+    def _overlaps_non_teaching_window(self, *, day: str, start_min: int, end_min: int) -> bool:
+        windows = getattr(self, "non_teaching_windows_by_day", {}).get(day, [])
+        return any(start_min < window_end and end_min > window_start for window_start, window_end in windows)
+
     def _build_day_slots(self) -> dict[str, list[SlotSegment]]:
+        self.non_teaching_windows_by_day: dict[str, list[tuple[int, int]]] = {}
+        configured_daily_slots = []
+        if self.program_constraint is not None:
+            configured_daily_slots = list(self.program_constraint.daily_time_slots or [])
+
+        if configured_daily_slots:
+            normalized_slots: list[tuple[int, int, str]] = []
+            for item in configured_daily_slots:
+                try:
+                    start_raw = str(item.get("start_time", "")).strip()
+                    end_raw = str(item.get("end_time", "")).strip()
+                    tag_raw = str(item.get("tag", "teaching")).strip().lower() or "teaching"
+                    if tag_raw not in {"teaching", "block", "break", "lunch"}:
+                        tag_raw = "teaching"
+                    start = parse_time_to_minutes(start_raw)
+                    end = parse_time_to_minutes(end_raw)
+                except Exception:
+                    continue
+                if end <= start:
+                    continue
+                if _is_removed_legacy_slot_range(start, end):
+                    continue
+                if _overlaps_canonical_lunch(start, end) and not _is_canonical_lunch_range(start, end):
+                    continue
+                if _is_canonical_lunch_range(start, end):
+                    tag_raw = "lunch"
+                elif tag_raw == "lunch":
+                    continue
+                normalized_slots.append((start, end, tag_raw))
+
+            if not any(_is_canonical_lunch_range(start, end) for start, end, _tag in normalized_slots):
+                normalized_slots.append((CANONICAL_LUNCH_START_MINUTES, CANONICAL_LUNCH_END_MINUTES, "lunch"))
+
+            normalized_slots.sort(key=lambda item: item[0])
+            day_slots: dict[str, list[SlotSegment]] = {}
+            enabled_days = [entry.day for entry in self.working_hours if entry.enabled]
+            for day in enabled_days:
+                teaching: list[SlotSegment] = []
+                blocked: list[tuple[int, int]] = []
+                for start, end, tag in normalized_slots:
+                    if tag == "teaching":
+                        teaching.append(SlotSegment(start=start, end=end))
+                    else:
+                        blocked.append((start, end))
+                if teaching:
+                    day_slots[day] = teaching
+                if blocked:
+                    self.non_teaching_windows_by_day[day] = blocked
+
+            if day_slots:
+                return day_slots
+
         def first_overlapping_break(
             start: int,
             end: int,
@@ -420,6 +756,10 @@ class EvolutionaryScheduler:
                 cursor = end
             if slots:
                 day_slots[entry.day] = slots
+                self.non_teaching_windows_by_day[entry.day] = [
+                    (parse_time_to_minutes(item.start_time), parse_time_to_minutes(item.end_time))
+                    for item in self.schedule_policy.breaks
+                ]
         return day_slots
 
     def _load_courses(self) -> dict[str, Course]:
@@ -489,7 +829,7 @@ class EvolutionaryScheduler:
         return rows
 
     def _resolve_expected_section_minutes(self) -> int:
-        configured_hours = 0
+        configured_period_units = 0
         for program_course in self.program_courses:
             course = self.courses.get(program_course.course_id)
             if course is None:
@@ -497,9 +837,9 @@ class EvolutionaryScheduler:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Course mapping missing for course id {program_course.course_id}",
                 )
-            configured_hours += max(0, course.hours_per_week)
+            configured_period_units += self._weekly_period_units_for_course(course)
 
-        if configured_hours <= 0:
+        if configured_period_units <= 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Program term requires at least one positive weekly-hour course",
@@ -515,29 +855,34 @@ class EvolutionaryScheduler:
             .scalars()
             .first()
         )
-        if term is not None and term.credits_required > 0:
-            total_credits = 0
+        enforce_student_credit_load = True
+        if self.program_constraint is not None:
+            enforce_student_credit_load = bool(self.program_constraint.enforce_student_credit_load)
+        if enforce_student_credit_load and term is not None and term.credits_required > 0:
+            total_credits = 0.0
             for program_course in self.program_courses:
                 course = self.courses.get(program_course.course_id)
                 if course:
-                    total_credits += course.credits
-            
-            if total_credits != term.credits_required:
+                    total_credits += self._computed_course_credits(course)
+
+            if not math.isclose(total_credits, float(term.credits_required), abs_tol=0.01):
                 logger.warning(
-                    "Curriculum credit mismatch in term %s: Courses sum to %s credits but term requires %s",
+                    "Curriculum credit mismatch in term %s: Computed LTP credits %.2f "
+                    "(L+T+P/2) but term requires %.2f",
                     self.term_number,
                     total_credits,
-                    term.credits_required
+                    float(term.credits_required),
                 )
-                # Note: We keep this as a warning for now, but configured_hours (contact hours) 
-                # remains the absolute target for scheduling.
-        
-        # TARGET HOURS: Sum of contact hours (HPW) is what needs to be scheduled.
-        target_hours = configured_hours
+
+        # TARGET HOURS: Sum of effective weekly period units is what must be scheduled.
+        target_hours = configured_period_units
 
         return target_hours * self.schedule_policy.period_minutes
 
     def _validate_course_credit_alignment(self) -> None:
+        enforce_ltp_split = True
+        if self.program_constraint is not None:
+            enforce_ltp_split = bool(self.program_constraint.enforce_ltp_split)
         for pc in self.program_courses:
             course = self.courses.get(pc.course_id)
             if course is None:
@@ -552,7 +897,7 @@ class EvolutionaryScheduler:
 
             # RELAXED: Credits and HPW don't have to be 1:1 if there are weightings (e.g. 2 Lab hours = 1 Credit).
             # However, the split MUST sum up to the total contact hours (HPW) for scheduling.
-            if total_split != course.hours_per_week:
+            if enforce_ltp_split and total_split != course.hours_per_week:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
@@ -562,11 +907,30 @@ class EvolutionaryScheduler:
                     ),
                 )
 
+            computed_credits = self._computed_course_credits(course)
+            if computed_credits <= 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Course {course.code} has invalid LTP split for credit computation "
+                        "(L+T+P/2 must be > 0)."
+                    ),
+                )
+
     def _validate_total_faculty_capacity(self) -> None:
+        virtual_faculty_ids = getattr(self, "_virtual_faculty_ids", set())
         total_required_minutes = sum(
-            req.block_size * self.schedule_policy.period_minutes for req in self.block_requests
+            req.block_size * self.schedule_policy.period_minutes
+            for req in self.block_requests
+            if self._request_requires_faculty(req)
         )
-        total_capacity_minutes = sum(max(0, item.max_hours) * 60 for item in self.faculty.values())
+        total_capacity_minutes = sum(
+            self._effective_faculty_max_hours(item) * 60
+            for faculty_id, item in self.faculty.items()
+            if faculty_id not in virtual_faculty_ids
+        )
+        if total_required_minutes <= 0:
+            return
         if total_capacity_minutes <= 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -585,12 +949,12 @@ class EvolutionaryScheduler:
     def _validate_section_time_capacity(self) -> None:
         # Check if course hours alignment with credit load
         configured_hours = 0
-        total_credits = 0
+        total_credits = 0.0
         for pc in self.program_courses:
             course = self.courses.get(pc.course_id)
             if course:
-                configured_hours += course.hours_per_week
-                total_credits += course.credits
+                configured_hours += self._weekly_period_units_for_course(course)
+                total_credits += self._computed_course_credits(course)
         
         target_hours = self.expected_section_minutes // self.schedule_policy.period_minutes
         if configured_hours != target_hours:
@@ -613,11 +977,21 @@ class EvolutionaryScheduler:
             .scalars()
             .first()
         )
-        if term and term.credits_required > 0 and total_credits != term.credits_required:
-             logger.warning(
-                "Credit load mismatch for term %s: Total course credits (%sc) "
-                "does not match required term credits (%sc).",
-                self.term_number, total_credits, term.credits_required
+        enforce_student_credit_load = True
+        if self.program_constraint is not None:
+            enforce_student_credit_load = bool(self.program_constraint.enforce_student_credit_load)
+        if (
+            enforce_student_credit_load
+            and term
+            and term.credits_required > 0
+            and not math.isclose(total_credits, float(term.credits_required), abs_tol=0.01)
+        ):
+            logger.warning(
+                "Credit load mismatch for term %s: Computed LTP credits total %.2f "
+                "(L+T+P/2), but term requires %.2f",
+                self.term_number,
+                total_credits,
+                float(term.credits_required),
             )
 
         total_available_slots = sum(len(slots) for slots in self.day_slots.values())
@@ -792,8 +1166,14 @@ class EvolutionaryScheduler:
         course = self.courses.get(req.course_id)
         return bool(course is not None and course.type == CourseType.elective and not req.is_lab)
 
-    def _room_candidates_for(self, course: Course) -> list[Room]:
-        if course.type == CourseType.lab:
+    def _room_candidates_for(
+        self,
+        course: Course,
+        *,
+        session_type: Literal["theory", "tutorial", "lab"] | None = None,
+    ) -> list[Room]:
+        practical_session = session_type == "lab"
+        if practical_session:
             candidates = [room for room in self.rooms.values() if room.type == RoomType.lab]
         else:
             candidates = [room for room in self.rooms.values() if room.type in {RoomType.lecture, RoomType.seminar}]
@@ -875,6 +1255,328 @@ class EvolutionaryScheduler:
         normalized = {normalize_day(item) for item in faculty.availability}
         return day in normalized
 
+    @staticmethod
+    def _intervals_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
+        return start_a < end_b and start_b < end_a
+
+    def _faculty_windows_allow_block(self, faculty_id: str, day: str, start_min: int, end_min: int) -> bool:
+        windows_by_day = self.faculty_windows.get(faculty_id, {})
+        day_windows = windows_by_day.get(day, [])
+        if day_windows:
+            return any(window_start <= start_min and end_min <= window_end for window_start, window_end in day_windows)
+        faculty = self.faculty.get(faculty_id)
+        return not bool(faculty and faculty.availability_windows)
+
+    def _faculty_has_schedule_overlap(
+        self,
+        *,
+        faculty_id: str,
+        day: str,
+        start_min: int,
+        end_min: int,
+        faculty_schedule: dict[str, list[tuple[str, int, int]]],
+    ) -> bool:
+        for scheduled_day, scheduled_start, scheduled_end in faculty_schedule.get(faculty_id, []):
+            if scheduled_day != day:
+                continue
+            if self._intervals_overlap(start_min, end_min, scheduled_start, scheduled_end):
+                return True
+        return False
+
+    def _assistant_candidates_for_course(self, course: Course | None, *, primary_faculty_id: str) -> list[str]:
+        ordered: list[str] = []
+        if course is not None:
+            for faculty_id in self._faculty_candidates_for_course(course):
+                if faculty_id == primary_faculty_id or faculty_id in ordered:
+                    continue
+                ordered.append(faculty_id)
+
+        fallback = sorted(
+            [faculty_id for faculty_id in self.faculty.keys() if faculty_id != primary_faculty_id and faculty_id not in ordered],
+            key=lambda faculty_id: (
+                self.faculty[faculty_id].workload_hours,
+                -self.faculty[faculty_id].max_hours,
+                self.faculty[faculty_id].name,
+                faculty_id,
+            ),
+        )
+        ordered.extend(fallback)
+        return ordered
+
+    def _select_assisting_faculty_ids(
+        self,
+        *,
+        course: Course | None,
+        primary_faculty_id: str,
+        day: str,
+        start_min: int,
+        end_min: int,
+        faculty_schedule: dict[str, list[tuple[str, int, int]]],
+        required_count: int = 2,
+        allow_relaxed_fallback: bool = False,
+    ) -> tuple[str, ...]:
+        if required_count <= 0:
+            return tuple()
+
+        ordered_candidates = self._assistant_candidates_for_course(course, primary_faculty_id=primary_faculty_id)
+        if not ordered_candidates:
+            return tuple()
+
+        chosen: list[str] = []
+
+        def try_fill(*, enforce_overlap_free: bool, enforce_day_windows: bool) -> None:
+            for candidate_id in ordered_candidates:
+                if len(chosen) >= required_count:
+                    return
+                if candidate_id in chosen:
+                    continue
+
+                faculty = self.faculty[candidate_id]
+                if enforce_day_windows:
+                    if not self._faculty_allows_day(faculty, day):
+                        continue
+                    if not self._faculty_windows_allow_block(candidate_id, day, start_min, end_min):
+                        continue
+                if enforce_overlap_free and self._faculty_has_schedule_overlap(
+                    faculty_id=candidate_id,
+                    day=day,
+                    start_min=start_min,
+                    end_min=end_min,
+                    faculty_schedule=faculty_schedule,
+                ):
+                    continue
+                chosen.append(candidate_id)
+
+        # 1) Strict: available day/window and no schedule overlap.
+        try_fill(enforce_overlap_free=True, enforce_day_windows=True)
+        # Optional fallbacks are disabled by default so assistants obey
+        # the same overlap/availability expectations as primary faculty.
+        if allow_relaxed_fallback:
+            if len(chosen) < required_count:
+                try_fill(enforce_overlap_free=False, enforce_day_windows=True)
+            if len(chosen) < required_count:
+                try_fill(enforce_overlap_free=False, enforce_day_windows=False)
+
+        if len(chosen) < required_count:
+            logger.warning(
+                "Insufficient assisting faculty for practical block | program_id=%s term=%s course=%s day=%s start=%s end=%s required=%s selected=%s",
+                self.program_id,
+                self.term_number,
+                course.code if course is not None else "unknown",
+                day,
+                start_min,
+                end_min,
+                required_count,
+                len(chosen),
+            )
+
+        return tuple(chosen[:required_count])
+
+    def _assign_assisting_faculty(
+        self,
+        *,
+        selected_assignments: list[tuple[int, BlockRequest, PlacementOption]],
+        faculty_schedule: dict[str, list[tuple[str, int, int]]],
+        required_count: int = 2,
+        allow_relaxed_fallback: bool = False,
+    ) -> tuple[dict[int, tuple[str, ...]], int]:
+        assisting_faculty_by_request: dict[int, tuple[str, ...]] = {}
+        missing_assistant_slots = 0
+
+        for req_index, req, option in selected_assignments:
+            if (
+                req.session_type != "lab"
+                or req.block_size != 2
+                or not self._request_requires_faculty(req)
+            ):
+                continue
+
+            course = self.courses.get(req.course_id)
+            block_start, block_end = self._option_bounds(option, req.block_size)
+            assisting_faculty_ids = self._select_assisting_faculty_ids(
+                course=course,
+                primary_faculty_id=option.faculty_id,
+                day=option.day,
+                start_min=block_start,
+                end_min=block_end,
+                faculty_schedule=faculty_schedule,
+                required_count=required_count,
+                allow_relaxed_fallback=allow_relaxed_fallback,
+            )
+            if assisting_faculty_ids:
+                assisting_faculty_by_request[req_index] = assisting_faculty_ids
+                for assistant_faculty_id in assisting_faculty_ids:
+                    faculty_schedule[assistant_faculty_id].append((option.day, block_start, block_end))
+
+            if len(assisting_faculty_ids) < required_count:
+                missing_assistant_slots += required_count - len(assisting_faculty_ids)
+
+        return assisting_faculty_by_request, missing_assistant_slots
+
+    @staticmethod
+    def _faculty_minutes_from_schedule(
+        faculty_schedule: dict[str, list[tuple[str, int, int]]],
+    ) -> dict[str, int]:
+        minutes: dict[str, int] = defaultdict(int)
+        for faculty_id, entries in faculty_schedule.items():
+            total = 0
+            for _day, start_min, end_min in entries:
+                if end_min > start_min:
+                    total += end_min - start_min
+            minutes[faculty_id] = total
+        return minutes
+
+    def _build_research_slot_payloads(
+        self,
+        *,
+        faculty_schedule: dict[str, list[tuple[str, int, int]]],
+        faculty_minutes: dict[str, int],
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        program_constraint = self.program_constraint
+        if program_constraint is None or not bool(program_constraint.auto_assign_research_slots):
+            return [], [], []
+
+        period_minutes = max(1, int(self.schedule_policy.period_minutes))
+        virtual_faculty_ids = getattr(self, "_virtual_faculty_ids", set())
+
+        research_slots: list[dict] = []
+        research_courses: list[dict] = []
+        research_rooms: list[dict] = []
+
+        for faculty in sorted(self.faculty.values(), key=lambda item: (item.name.lower(), item.id)):
+            if faculty.id in virtual_faculty_ids:
+                continue
+
+            max_hours = self._effective_faculty_max_hours(faculty)
+            target_hours = self._faculty_min_target_hours(faculty)
+            if max_hours <= 0 or target_hours <= 0:
+                continue
+
+            desired_minutes = min(max_hours, target_hours) * 60
+            current_minutes = faculty_minutes.get(faculty.id, 0)
+            if current_minutes >= desired_minutes:
+                continue
+
+            needed_periods = math.ceil((desired_minutes - current_minutes) / period_minutes)
+            if needed_periods <= 0:
+                continue
+
+            assigned_segments: list[tuple[str, int, int]] = []
+            for day, segments in self.day_slots.items():
+                for segment in segments:
+                    start_min, end_min = segment.start, segment.end
+                    if not self._faculty_allows_day(faculty, day):
+                        continue
+                    if not self._faculty_windows_allow_block(faculty.id, day, start_min, end_min):
+                        continue
+                    if self._faculty_has_schedule_overlap(
+                        faculty_id=faculty.id,
+                        day=day,
+                        start_min=start_min,
+                        end_min=end_min,
+                        faculty_schedule=faculty_schedule,
+                    ):
+                        continue
+
+                    _room_reserved, faculty_reserved = self._reserved_conflict_flags(
+                        day=day,
+                        start_min=start_min,
+                        end_min=end_min,
+                        room_id="",
+                        faculty_id=faculty.id,
+                        check_room=False,
+                        check_faculty=True,
+                    )
+                    if faculty_reserved:
+                        continue
+
+                    assigned_segments.append((day, start_min, end_min))
+                    faculty_schedule[faculty.id].append((day, start_min, end_min))
+                    faculty_minutes[faculty.id] = faculty_minutes.get(faculty.id, 0) + (end_min - start_min)
+
+                    if len(assigned_segments) >= needed_periods:
+                        break
+                if len(assigned_segments) >= needed_periods:
+                    break
+
+            if not assigned_segments:
+                continue
+            if len(assigned_segments) < needed_periods:
+                logger.info(
+                    "Research slot backfill is partial for faculty %s: needed=%s assigned=%s",
+                    faculty.id,
+                    needed_periods,
+                    len(assigned_segments),
+                )
+
+            digest = hashlib.blake2b(
+                f"research|{self.program_id}|{self.term_number}|{faculty.id}".encode("utf-8"),
+                digest_size=8,
+            ).hexdigest()
+            course_id = f"res-c-{digest}"[:36]
+            room_id = f"res-r-{digest}"[:36]
+            section_name = f"RS-{faculty.id[:6]}".upper()
+            weekly_periods = len(assigned_segments)
+
+            research_rooms.append(
+                {
+                    "id": room_id,
+                    "name": f"Research Desk ({faculty.name})"[:100],
+                    "capacity": 1,
+                    "type": "seminar",
+                    "building": "Research",
+                    "hasLabEquipment": False,
+                    "hasProjector": False,
+                }
+            )
+            research_courses.append(
+                {
+                    "id": course_id,
+                    "code": f"RS-{digest[:6].upper()}",
+                    "name": f"Research Slot - {faculty.name}"[:200],
+                    "type": "theory",
+                    "credits": float(weekly_periods),
+                    "facultyId": faculty.id,
+                    "duration": 1,
+                    "hoursPerWeek": weekly_periods,
+                    "semesterNumber": self.term_number,
+                    "batchYear": 1,
+                    "theoryHours": weekly_periods,
+                    "labHours": 0,
+                    "tutorialHours": 0,
+                    "batchSegregation": False,
+                    "practicalContiguousSlots": 1,
+                    "assignFaculty": True,
+                    "assignClassroom": False,
+                    "defaultRoomId": room_id,
+                    "electiveCategory": "Research",
+                }
+            )
+
+            for index, (day, start_min, end_min) in enumerate(assigned_segments):
+                slot_digest = hashlib.blake2b(
+                    f"{course_id}|{day}|{start_min}|{end_min}|{index}".encode("utf-8"),
+                    digest_size=6,
+                ).hexdigest()
+                research_slots.append(
+                    {
+                        "id": f"res-{slot_digest}"[:36],
+                        "day": day,
+                        "startTime": minutes_to_time(start_min),
+                        "endTime": minutes_to_time(end_min),
+                        "courseId": course_id,
+                        "roomId": room_id,
+                        "facultyId": faculty.id,
+                        "section": section_name,
+                        "batch": None,
+                        "studentCount": 1,
+                        "sessionType": "theory",
+                        "assistantFacultyIds": [],
+                    }
+                )
+
+        return research_slots, research_courses, research_rooms
+
     def _within_semester_time_window(self, start_min: int, end_min: int) -> bool:
         if self.semester_constraint is None:
             return True
@@ -888,15 +1590,82 @@ class EvolutionaryScheduler:
         preference_map = getattr(self, "faculty_preferred_subject_codes", {})
         return course_code.upper() in preference_map.get(faculty_id, set())
 
+    @staticmethod
+    def _request_requires_faculty(req: BlockRequest) -> bool:
+        return bool(getattr(req, "requires_faculty", True))
+
+    @staticmethod
+    def _request_requires_room(req: BlockRequest) -> bool:
+        return bool(getattr(req, "requires_room", True))
+
+    def _virtual_resource_id(self, *, kind: Literal["faculty", "room"], key: str) -> str:
+        digest = hashlib.blake2b(
+            f"{kind}|{self.program_id}|{self.term_number}|{key}".encode("utf-8"),
+            digest_size=VIRTUAL_RESOURCE_HASH_SIZE,
+        ).hexdigest()
+        prefix = "nr-f" if kind == "faculty" else "nr-r"
+        return f"{prefix}-{digest}"
+
+    def _ensure_virtual_faculty(self, faculty_id: str) -> str:
+        if faculty_id in self.faculty:
+            return faculty_id
+        virtual = Faculty(
+            id=faculty_id,
+            program_id=self.program_id,
+            name="No Faculty Required",
+            email=f"{faculty_id}@shedforge.app",
+            department="N/A",
+            workload_hours=0,
+            max_hours=0,
+            availability=[],
+            availability_windows=[],
+            preferred_subject_codes=[],
+            semester_preferences={},
+        )
+        self.faculty[faculty_id] = virtual
+        self._virtual_faculty_ids.add(faculty_id)
+        self.faculty_windows[faculty_id] = {}
+        self.faculty_preferred_subject_codes[faculty_id] = set()
+        return faculty_id
+
+    def _ensure_virtual_room(self, room_id: str, *, session_type: Literal["theory", "tutorial", "lab"]) -> str:
+        if room_id in self.rooms:
+            return room_id
+        room_type = RoomType.lab if session_type == "lab" else RoomType.lecture
+        virtual = Room(
+            id=room_id,
+            program_id=self.program_id,
+            name="No Classroom Required",
+            building="N/A",
+            capacity=1000,
+            type=room_type,
+            has_lab_equipment=session_type == "lab",
+            has_projector=False,
+            availability_windows=[],
+        )
+        self.rooms[room_id] = virtual
+        self._virtual_room_ids.add(room_id)
+        self.room_windows[room_id] = {}
+        return room_id
+
     def _faculty_candidates_for_course(self, course: Course) -> list[str]:
+        virtual_faculty_ids = getattr(self, "_virtual_faculty_ids", set())
+        candidate_pool_ids = [
+            faculty_id for faculty_id in self.faculty.keys() if faculty_id not in virtual_faculty_ids
+        ]
         ordered_ids: list[str] = []
-        if course.faculty_id and course.faculty_id in self.faculty:
+        if (
+            course.faculty_id
+            and course.faculty_id in self.faculty
+            and course.faculty_id not in virtual_faculty_ids
+        ):
             ordered_ids.append(course.faculty_id)
 
         preferred_ids = sorted(
             [
                 item.id
                 for item in self.faculty.values()
+                if item.id in candidate_pool_ids
                 if self._faculty_prefers_subject(item.id, course.code)
             ],
             key=lambda item_id: (
@@ -911,7 +1680,7 @@ class EvolutionaryScheduler:
                 ordered_ids.append(item_id)
 
         fallback_ids = sorted(
-            [item_id for item_id in self.faculty.keys() if item_id not in ordered_ids],
+            [item_id for item_id in candidate_pool_ids if item_id not in ordered_ids],
             key=lambda item_id: (
                 self.faculty[item_id].workload_hours,
                 -self.faculty[item_id].max_hours,
@@ -927,19 +1696,15 @@ class EvolutionaryScheduler:
                 detail=f"No candidate faculty found for course {course.code}",
             )
 
-        if course.faculty_id and course.faculty_id in self.faculty:
-            candidate_cap = max(16, min(len(ordered_ids), len(preferred_ids) + 16))
-        elif preferred_ids:
-            candidate_cap = max(18, min(len(ordered_ids), len(preferred_ids) + 18))
-        else:
-            candidate_cap = max(18, min(len(ordered_ids), math.ceil(len(self.faculty) * 0.65)))
-
+        # Preferences are guidance only; keep a wide candidate pool so workload balancing can reassign when needed.
+        if len(ordered_ids) <= 32:
+            return ordered_ids
+        candidate_cap = max(32, math.ceil(len(ordered_ids) * 0.90))
         return ordered_ids[: min(len(ordered_ids), candidate_cap)]
 
     def _build_block_requests(self) -> list[BlockRequest]:
         requests: list[BlockRequest] = []
         request_id = 0
-        period_minutes = self.schedule_policy.period_minutes
 
         for program_course in self.program_courses:
             course = self.courses.get(program_course.course_id)
@@ -948,87 +1713,108 @@ class EvolutionaryScheduler:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Course mapping missing for course id {program_course.course_id}",
                 )
-            if course.faculty_id and course.faculty_id not in self.faculty:
+            if bool(getattr(course, "assign_faculty", True)) and course.faculty_id and course.faculty_id not in self.faculty:
                 logger.warning(
                     "Course %s has stale faculty assignment %s; falling back to candidate faculty pool",
                     course.code,
                     course.faculty_id,
                 )
-            faculty_candidate_ids = self._faculty_candidates_for_course(course)
-            primary_faculty_id = (
-                course.faculty_id if course.faculty_id and course.faculty_id in self.faculty else faculty_candidate_ids[0]
-            )
-            preferred_faculty_ids = tuple(
-                item_id for item_id in faculty_candidate_ids if self._faculty_prefers_subject(item_id, course.code)
-            )
+            requires_faculty = bool(getattr(course, "assign_faculty", True))
+            requires_room = bool(getattr(course, "assign_classroom", True))
+            if requires_faculty:
+                faculty_candidate_ids = self._faculty_candidates_for_course(course)
+                primary_faculty_id = (
+                    course.faculty_id if course.faculty_id and course.faculty_id in self.faculty else faculty_candidate_ids[0]
+                )
+                preferred_faculty_ids = tuple(
+                    item_id for item_id in faculty_candidate_ids if self._faculty_prefers_subject(item_id, course.code)
+                )
+            else:
+                faculty_candidate_ids = []
+                primary_faculty_id = ""
+                preferred_faculty_ids = tuple()
 
             max_daily_slots = max((len(slots) for slots in self.day_slots.values()), default=0)
-            total_credit_hours = course.theory_hours + course.lab_hours + course.tutorial_hours
-            # Note: alignment already validated in _validate_course_credit_alignment
-
             request_templates: list[tuple[Literal["theory", "tutorial", "lab"], int, int]] = []
-            
-            # STRICT LOGIC: Lab courses are ONLY labs. Theory courses are ONLY theory/tutorial.
-            if course.type == CourseType.lab:
-                if course.theory_hours > 0 or course.tutorial_hours > 0:
-                     raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Lab course {course.code} cannot have theory or tutorial hours.",
+            is_project_phase = self._is_project_phase_course(course)
+            if course.theory_hours > 0:
+                request_templates.append(("theory", 1, int(course.theory_hours)))
+            if course.tutorial_hours > 0:
+                request_templates.append(("tutorial", 1, int(course.tutorial_hours)))
+
+            practical_hours = max(0, int(course.lab_hours or 0))
+            if practical_hours > 0:
+                preferred_practical_block = self._practical_block_slot_size_for_course(course)
+                full_blocks, remainder = divmod(practical_hours, preferred_practical_block)
+                if full_blocks > 0:
+                    request_templates.append(("lab", preferred_practical_block, full_blocks))
+                if remainder > 0:
+                    # Preserve exact weekly load even when practical hours are not a multiple of the preferred block size.
+                    request_templates.append(("lab", remainder, 1))
+                    logger.warning(
+                        "Practical block remainder for course %s: %s practical hour(s) mapped as one contiguous block",
+                        course.code,
+                        remainder,
                     )
-                lab_block_size = self.schedule_policy.lab_contiguous_slots
-                # Hard constraint: Labs must be divisible by block size (usually 2)
-                if course.lab_hours % lab_block_size != 0:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=(
-                            f"Course {course.code} weekly lab hours ({course.lab_hours}) must be divisible by "
-                            f"required lab block size ({lab_block_size})"
-                        ),
-                    )
-                request_templates.append(("lab", lab_block_size, course.lab_hours // lab_block_size))
-            else:
-                if course.lab_hours > 0:
-                     raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Theory course {course.code} cannot have lab hours.",
-                    )
-                if course.theory_hours > 0:
-                    request_templates.append(("theory", 1, course.theory_hours))
-                if course.tutorial_hours > 0:
-                    request_templates.append(("tutorial", 1, course.tutorial_hours))
-                
+
             if not request_templates:
-                 raise HTTPException(
+                raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Course {course.code} has no valid hours to schedule.",
                 )
 
-            room_candidates = self._room_candidates_for(course)
-            batch_count = program_course.lab_batch_count if course.type == CourseType.lab else 1
-
             for section in self.sections:
-                if course.type == CourseType.lab:
-                    student_per_batch = max(1, math.ceil(section.capacity / max(1, batch_count)))
-                    batch_labels = [f"B{index + 1}" for index in range(batch_count)]
-                else:
-                    student_per_batch = max(1, section.capacity)
-                    batch_labels = [None]
-                request_room_candidates = self._select_room_candidates_for_request(
-                    room_candidates=room_candidates,
-                    student_count=student_per_batch,
-                    is_lab=course.type == CourseType.lab,
-                    seed=f"{course.code}|{section}", # Added section to seed for dispersion
-                )
+                for session_type, block_size, blocks_needed in request_templates:
+                    session_is_lab = session_type == "lab"
+                    batch_segregation_enabled = bool(getattr(course, "batch_segregation", True))
+                    if session_is_lab:
+                        if batch_segregation_enabled:
+                            batch_count = max(1, int(program_course.lab_batch_count or 1))
+                            student_per_batch = max(1, math.ceil(section.capacity / batch_count))
+                            batch_labels = [f"B{index + 1}" for index in range(batch_count)]
+                        else:
+                            student_per_batch = max(1, section.capacity)
+                            batch_labels = [None]
+                    else:
+                        student_per_batch = max(1, section.capacity)
+                        batch_labels = [None]
 
-                for batch in batch_labels:
-                    for session_type, block_size, blocks_needed in request_templates:
+                    if requires_room:
+                        room_candidates = self._room_candidates_for(course, session_type=session_type)
+                        request_room_candidates = self._select_room_candidates_for_request(
+                            room_candidates=room_candidates,
+                            student_count=student_per_batch,
+                            is_lab=session_is_lab,
+                            seed=f"{course.code}|{section.name}|{session_type}",
+                        )
+                    else:
+                        room_candidates = []
+                        request_room_candidates = []
+
+                    for batch in batch_labels:
+                        if not requires_faculty:
+                            faculty_resource_key = f"{course.id}|{section.name}|{session_type}|{batch or 'all'}"
+                            faculty_placeholder_id = self._ensure_virtual_faculty(
+                                self._virtual_resource_id(kind="faculty", key=faculty_resource_key)
+                            )
+                            faculty_candidate_ids = [faculty_placeholder_id]
+                            primary_faculty_id = faculty_placeholder_id
+                            preferred_faculty_ids = tuple()
+                        if not requires_room:
+                            room_resource_key = f"{course.id}|{section.name}|{session_type}|{batch or 'all'}"
+                            room_placeholder_id = self._ensure_virtual_room(
+                                self._virtual_resource_id(kind="room", key=room_resource_key),
+                                session_type=session_type,
+                            )
+                            request_room_candidates = [self.rooms[room_placeholder_id]]
+
                         if block_size > max_daily_slots:
                             raise HTTPException(
                                 status_code=status.HTTP_400_BAD_REQUEST,
                                 detail=(
                                     f"No feasible placement options for course {course.code}: required contiguous block size "
                                     f"({block_size}) exceeds available daily slots ({max_daily_slots}). "
-                                    "Adjust lab contiguous-slot policy or working hours."
+                                    "Adjust working-hour windows."
                                 ),
                             )
                         faculty_option_order = tuple(faculty_candidate_ids)
@@ -1063,22 +1849,21 @@ class EvolutionaryScheduler:
                                             continue
                                         # Iterate room first so per-start caps retain multiple faculty choices.
                                         for room in request_room_candidates:
-                                            if enforce_room_windows and not self._room_is_available(room, day, block_start, block_end):
+                                            if requires_room and enforce_room_windows and not self._room_is_available(room, day, block_start, block_end):
                                                 continue
                                             for faculty_id in faculty_option_order:
-                                                faculty = self.faculty[faculty_id]
-                                                if enforce_faculty_day and not self._faculty_allows_day(faculty, day):
-                                                    continue
-                                                if enforce_faculty_windows:
-                                                    faculty_windows = self.faculty_windows.get(faculty_id, {})
-                                                    if faculty_windows.get(day):
-                                                        if not any(
-                                                            start <= block_start and block_end <= end
-                                                            for start, end in faculty_windows[day]
-                                                        ):
-                                                            continue
-                                                if enforce_room_windows and not self._room_is_available(room, day, block_start, block_end):
-                                                    continue
+                                                if requires_faculty:
+                                                    faculty = self.faculty[faculty_id]
+                                                    if enforce_faculty_day and not self._faculty_allows_day(faculty, day):
+                                                        continue
+                                                    if enforce_faculty_windows:
+                                                        faculty_windows = self.faculty_windows.get(faculty_id, {})
+                                                        if faculty_windows.get(day):
+                                                            if not any(
+                                                                start <= block_start and block_end <= end
+                                                                for start, end in faculty_windows[day]
+                                                            ):
+                                                                continue
                                                 if day_option_counts[day] >= per_day_limit and len(generated) < option_limit:
                                                     continue
                                                 if day_start_option_counts[(day, start_index)] >= per_start_limit and len(generated) < option_limit:
@@ -1089,6 +1874,8 @@ class EvolutionaryScheduler:
                                                     end_min=block_end,
                                                     room_id=room.id,
                                                     faculty_id=faculty_id,
+                                                    check_room=requires_room,
+                                                    check_faculty=requires_faculty,
                                                 ):
                                                     continue
                                                 generated.append(
@@ -1178,11 +1965,17 @@ class EvolutionaryScheduler:
                                     primary_faculty_id=primary_faculty_id,
                                     preferred_faculty_ids=preferred_faculty_ids,
                                     block_size=block_size,
-                                    is_lab=course.type == CourseType.lab,
+                                    is_lab=session_type == "lab",
                                     session_type=session_type,
-                                    allow_parallel_batches=program_course.allow_parallel_batches,
+                                    allow_parallel_batches=(
+                                        session_type == "lab"
+                                        and batch_segregation_enabled
+                                        and (program_course.allow_parallel_batches or is_project_phase)
+                                    ),
                                     room_candidate_ids=tuple(room.id for room in request_room_candidates),
                                     options=tuple(options),
+                                    requires_faculty=requires_faculty,
+                                    requires_room=requires_room,
                                 )
                             )
                             request_id += 1
@@ -1246,12 +2039,15 @@ class EvolutionaryScheduler:
                 continue
 
             course = self.courses.get(course_id)
+            if course is not None and not bool(getattr(course, "assign_faculty", True)):
+                requirements[course_id] = False
+                continue
             if course is None or not course.faculty_id or course.faculty_id not in self.faculty:
                 requirements[course_id] = False
                 continue
 
             dedicated_faculty = self.faculty[course.faculty_id]
-            dedicated_capacity_minutes = max(0, dedicated_faculty.max_hours) * 60
+            dedicated_capacity_minutes = self._effective_faculty_max_hours(dedicated_faculty) * 60
             if dedicated_capacity_minutes <= 0:
                 requirements[course_id] = False
                 logger.warning(
@@ -1285,6 +2081,8 @@ class EvolutionaryScheduler:
         # Unit tests that construct scheduler instances manually may skip __init__.
         course = self.courses.get(course_id) if hasattr(self, "courses") else None
         if course is None:
+            return False
+        if not bool(getattr(course, "assign_faculty", True)):
             return False
         return bool(getattr(course, "faculty_id", None))
 
@@ -1388,7 +2186,7 @@ class EvolutionaryScheduler:
 
         for req_index, option_index in self.fixed_genes.items():
             req = self.block_requests[req_index]
-            if req.is_lab or not self._single_faculty_required(req.course_id):
+            if req.is_lab or not self._request_requires_faculty(req) or not self._single_faculty_required(req.course_id):
                 continue
             faculty_id = req.options[option_index].faculty_id
             existing = locked_faculty_by_course.get(req.course_id)
@@ -1407,7 +2205,7 @@ class EvolutionaryScheduler:
         for course_id, locked_faculty_id in locked_faculty_by_course.items():
             for req_index in self.request_indices_by_course.get(course_id, []):
                 req = self.block_requests[req_index]
-                if req.is_lab or req.request_id in self.fixed_genes:
+                if req.is_lab or not self._request_requires_faculty(req) or req.request_id in self.fixed_genes:
                     continue
                 if all(option.faculty_id != locked_faculty_id for option in req.options):
                     course = self.courses.get(course_id)
@@ -1428,13 +2226,13 @@ class EvolutionaryScheduler:
             if req.request_id in self.fixed_genes:
                 fixed_option_index = self.fixed_genes[req.request_id]
                 genes.append(fixed_option_index)
-                if not req.is_lab:
+                if not req.is_lab and self._request_requires_faculty(req):
                     selected_faculty_id = req.options[fixed_option_index].faculty_id
                     chosen_faculty_by_course_section[(req.course_id, req.section)] = selected_faculty_id
                     if self._single_faculty_required(req.course_id):
                         chosen_faculty_by_course.setdefault(req.course_id, selected_faculty_id)
             else:
-                if not req.is_lab:
+                if not req.is_lab and self._request_requires_faculty(req):
                     selected_faculty_id = chosen_faculty_by_course_section.get((req.course_id, req.section))
                     if selected_faculty_id is None and self._single_faculty_required(req.course_id):
                         selected_faculty_id = chosen_faculty_by_course.get(req.course_id)
@@ -1447,7 +2245,11 @@ class EvolutionaryScheduler:
                         if section_common_faculty_ids:
                             selected_faculty_id = self.random.choice(list(section_common_faculty_ids))
                     if selected_faculty_id is None:
-                        common_faculty_ids = self.common_faculty_candidates_by_course.get(req.course_id, ())
+                        common_faculty_ids = getattr(
+                            self,
+                            "common_faculty_candidates_by_course",
+                            {},
+                        ).get(req.course_id, ())
                         if common_faculty_ids:
                             selected_faculty_id = self.random.choice(list(common_faculty_ids))
                     if selected_faculty_id is not None:
@@ -1591,8 +2393,10 @@ class EvolutionaryScheduler:
         for req_index, req in enumerate(self.block_requests):
             option = req.options[genes[req_index]]
             selected_options[req_index] = option
-            room = self.rooms[option.room_id]
-            faculty = self.faculty[option.faculty_id]
+            requires_room = self._request_requires_room(req)
+            requires_faculty = self._request_requires_faculty(req)
+            room = self.rooms[option.room_id] if requires_room else None
+            faculty = self.faculty[option.faculty_id] if requires_faculty else None
 
             block_start, block_end = self._option_bounds(option, req.block_size)
 
@@ -1605,27 +2409,30 @@ class EvolutionaryScheduler:
                 end_min=block_end,
                 room_id=option.room_id,
                 faculty_id=option.faculty_id,
+                check_room=requires_room,
+                check_faculty=requires_faculty,
             ):
                 conflicted.add(req_index)
 
-            if room.capacity < req.student_count:
-                conflicted.add(req_index)
-            if req.is_lab and room.type != RoomType.lab:
-                conflicted.add(req_index)
-            if not req.is_lab and room.type == RoomType.lab:
+            if requires_room and room is not None:
+                if room.capacity < req.student_count:
+                    conflicted.add(req_index)
+                if req.is_lab and room.type != RoomType.lab:
+                    conflicted.add(req_index)
+                if not req.is_lab and room.type == RoomType.lab:
+                    conflicted.add(req_index)
+
+            if requires_faculty and faculty is not None and not self._faculty_allows_day(faculty, option.day):
                 conflicted.add(req_index)
 
-            if not self._faculty_allows_day(faculty, option.day):
-                conflicted.add(req_index)
-
-            if self.faculty_windows.get(option.faculty_id, {}).get(option.day):
+            if requires_faculty and self.faculty_windows.get(option.faculty_id, {}).get(option.day):
                 if not any(
                     start <= block_start and block_end <= end
                     for start, end in self.faculty_windows[option.faculty_id][option.day]
                 ):
                     conflicted.add(req_index)
 
-            if self.room_windows.get(option.room_id, {}).get(option.day):
+            if requires_room and self.room_windows.get(option.room_id, {}).get(option.day):
                 if not any(
                     start <= block_start and block_end <= end
                     for start, end in self.room_windows[option.room_id][option.day]
@@ -1634,8 +2441,9 @@ class EvolutionaryScheduler:
 
             section_day_req_ids.setdefault((req.section, option.day), set()).add(req_index)
             section_req_ids.setdefault(req.section, set()).add(req_index)
-            faculty_req_ids.setdefault(option.faculty_id, set()).add(req_index)
-            faculty_day_req_indices.setdefault((option.faculty_id, option.day), []).append(req_index)
+            if requires_faculty:
+                faculty_req_ids.setdefault(option.faculty_id, set()).add(req_index)
+                faculty_day_req_indices.setdefault((option.faculty_id, option.day), []).append(req_index)
             if self._is_elective_request(req):
                 elective_signatures_by_section[req.section].append(
                     (option.day, option.start_index, req.block_size, req.session_type)
@@ -1647,14 +2455,17 @@ class EvolutionaryScheduler:
                 room_key = (option.day, slot_idx, option.room_id)
                 faculty_key = (option.day, slot_idx, option.faculty_id)
                 section_key = (option.day, slot_idx, req.section)
-                room_occ.setdefault(room_key, []).append(req_index)
-                faculty_occ.setdefault(faculty_key, []).append(req_index)
+                if requires_room:
+                    room_occ.setdefault(room_key, []).append(req_index)
+                if requires_faculty:
+                    faculty_occ.setdefault(faculty_key, []).append(req_index)
                 section_occ.setdefault(section_key, []).append(req_index)
                 elective_occ.setdefault((option.day, slot_idx), []).append(req_index)
                 section_day_slots.setdefault((req.section, option.day), set()).add(slot_idx)
-                faculty_minutes[option.faculty_id] = (
-                    faculty_minutes.get(option.faculty_id, 0) + self.schedule_policy.period_minutes
-                )
+                if requires_faculty:
+                    faculty_minutes[option.faculty_id] = (
+                        faculty_minutes.get(option.faculty_id, 0) + self.schedule_policy.period_minutes
+                    )
 
         for values in room_occ.values():
             if len(values) <= 1:
@@ -1663,6 +2474,8 @@ class EvolutionaryScheduler:
                 for right_req_idx in values[left_index + 1 :]:
                     left_req = self.block_requests[left_req_idx]
                     right_req = self.block_requests[right_req_idx]
+                    if not (self._request_requires_room(left_req) and self._request_requires_room(right_req)):
+                        continue
                     if self._is_allowed_shared_overlap(
                         left_req,
                         right_req,
@@ -1680,6 +2493,8 @@ class EvolutionaryScheduler:
                 for right_req_idx in values[left_index + 1 :]:
                     left_req = self.block_requests[left_req_idx]
                     right_req = self.block_requests[right_req_idx]
+                    if not (self._request_requires_faculty(left_req) and self._request_requires_faculty(right_req)):
+                        continue
                     if self._is_allowed_shared_overlap(
                         left_req,
                         right_req,
@@ -1762,15 +2577,17 @@ class EvolutionaryScheduler:
                                 conflicted.update(requests_by_course_section.get((course_id, bad_section), []))
                             break
 
-        parallel_lab_signatures: dict[tuple[str, str], dict[str, list[tuple[str, int, int]]]] = defaultdict(
+        parallel_lab_signatures: dict[tuple[str, str, str, int], dict[str, list[tuple[str, int, int]]]] = defaultdict(
             lambda: defaultdict(list)
         )
-        parallel_lab_req_ids: dict[tuple[str, str], dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        parallel_lab_req_ids: dict[tuple[str, str, str, int], dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
         for req_index, req in enumerate(self.block_requests):
             if not req.is_lab or not req.allow_parallel_batches or not req.batch:
                 continue
             option = selected_options[req_index]
-            group_key = (req.course_id, req.section)
+            group_key = self._parallel_lab_group_key(req)
+            if group_key is None:
+                continue
             signature = (option.day, option.start_index, req.block_size)
             parallel_lab_signatures[group_key][req.batch].append(signature)
             parallel_lab_req_ids[group_key][req.batch].append(req_index)
@@ -1793,7 +2610,9 @@ class EvolutionaryScheduler:
                     conflicted.update(parallel_lab_req_ids[group_key].get(batch_name, []))
 
         for (_course_id, _section_name), req_indices in self._request_indices_by_course_section().items():
-            lecture_req_indices = req_indices
+            lecture_req_indices = [
+                idx for idx in req_indices if self._request_requires_faculty(self.block_requests[idx])
+            ]
             if len(lecture_req_indices) <= 1:
                 continue
             assigned_faculty_ids = {selected_options[idx].faculty_id for idx in lecture_req_indices}
@@ -1803,7 +2622,11 @@ class EvolutionaryScheduler:
         for course_id, req_indices in self.request_indices_by_course.items():
             if not self._single_faculty_required(course_id):
                 continue
-            lecture_req_indices = [idx for idx in req_indices if not self.block_requests[idx].is_lab]
+            lecture_req_indices = [
+                idx
+                for idx in req_indices
+                if not self.block_requests[idx].is_lab and self._request_requires_faculty(self.block_requests[idx])
+            ]
             if len(lecture_req_indices) <= 1:
                 continue
             assigned_faculty_ids = {selected_options[idx].faculty_id for idx in lecture_req_indices}
@@ -1850,18 +2673,24 @@ class EvolutionaryScheduler:
                 if minutes > week_limit:
                     conflicted.update(section_req_ids.get(section, set()))
 
-            if self.expected_section_minutes > 0:
+            enforce_student_credit_load = True
+            if self.program_constraint is not None:
+                enforce_student_credit_load = bool(self.program_constraint.enforce_student_credit_load)
+            if enforce_student_credit_load and self.expected_section_minutes > 0:
                 for section, request_ids in section_req_ids.items():
                     minutes = weekly_minutes_by_section.get(section, 0)
                     if minutes != self.expected_section_minutes:
                         conflicted.update(request_ids)
 
         # Workload caps are hard constraints for publishable schedules.
+        virtual_faculty_ids = getattr(self, "_virtual_faculty_ids", set())
         for faculty_id, minutes in faculty_minutes.items():
+            if faculty_id in virtual_faculty_ids:
+                continue
             faculty = self.faculty.get(faculty_id)
             if faculty is None:
                 continue
-            max_minutes = max(0, faculty.max_hours) * 60
+            max_minutes = self._effective_faculty_max_hours(faculty) * 60
             if max_minutes and minutes > max_minutes:
                 conflicted.update(faculty_req_ids.get(faculty_id, set()))
 
@@ -1881,8 +2710,10 @@ class EvolutionaryScheduler:
             req = self.block_requests[req_index]
             for offset in range(req.block_size):
                 slot_idx = option.start_index + offset
-                room_occ[(option.day, slot_idx, option.room_id)].append(req_index)
-                faculty_occ[(option.day, slot_idx, option.faculty_id)].append(req_index)
+                if self._request_requires_room(req):
+                    room_occ[(option.day, slot_idx, option.room_id)].append(req_index)
+                if self._request_requires_faculty(req):
+                    faculty_occ[(option.day, slot_idx, option.faculty_id)].append(req_index)
                 section_occ[(option.day, slot_idx, req.section)].append(req_index)
 
         for values in room_occ.values():
@@ -1892,6 +2723,8 @@ class EvolutionaryScheduler:
                 for right_req_idx in values[left_index + 1 :]:
                     left_req = self.block_requests[left_req_idx]
                     right_req = self.block_requests[right_req_idx]
+                    if not (self._request_requires_room(left_req) and self._request_requires_room(right_req)):
+                        continue
                     if self._is_allowed_shared_overlap(
                         left_req,
                         right_req,
@@ -1909,6 +2742,8 @@ class EvolutionaryScheduler:
                 for right_req_idx in values[left_index + 1 :]:
                     left_req = self.block_requests[left_req_idx]
                     right_req = self.block_requests[right_req_idx]
+                    if not (self._request_requires_faculty(left_req) and self._request_requires_faculty(right_req)):
+                        continue
                     if self._is_allowed_shared_overlap(
                         left_req,
                         right_req,
@@ -2144,7 +2979,7 @@ class EvolutionaryScheduler:
                     max_candidates=min(option_cap, len(req.options)),
                     allow_random_tail=True,
                 )
-                if not req.is_lab:
+                if not req.is_lab and self._request_requires_faculty(req):
                     anchor_faculty_id: str | None = None
                     for other_idx in self._request_indices_by_course_section().get((req.course_id, req.section), []):
                         if other_idx == req_index:
@@ -2243,24 +3078,30 @@ class EvolutionaryScheduler:
 
         def register(req_index: int, option: PlacementOption) -> None:
             req = self.block_requests[req_index]
+            requires_room = self._request_requires_room(req)
+            requires_faculty = self._request_requires_faculty(req)
             for offset in range(req.block_size):
                 slot_idx = option.start_index + offset
-                room_occ[(option.day, slot_idx, option.room_id)].append(req_index)
-                faculty_occ[(option.day, slot_idx, option.faculty_id)].append(req_index)
+                if requires_room:
+                    room_occ[(option.day, slot_idx, option.room_id)].append(req_index)
+                if requires_faculty:
+                    faculty_occ[(option.day, slot_idx, option.faculty_id)].append(req_index)
                 section_occ[(option.day, slot_idx, req.section)].append(req_index)
 
         def unregister(req_index: int, option: PlacementOption) -> None:
             req = self.block_requests[req_index]
+            requires_room = self._request_requires_room(req)
+            requires_faculty = self._request_requires_faculty(req)
             for offset in range(req.block_size):
                 slot_idx = option.start_index + offset
                 room_key = (option.day, slot_idx, option.room_id)
                 faculty_key = (option.day, slot_idx, option.faculty_id)
                 section_key = (option.day, slot_idx, req.section)
-                if req_index in room_occ.get(room_key, []):
+                if requires_room and req_index in room_occ.get(room_key, []):
                     room_occ[room_key].remove(req_index)
                     if not room_occ[room_key]:
                         room_occ.pop(room_key, None)
-                if req_index in faculty_occ.get(faculty_key, []):
+                if requires_faculty and req_index in faculty_occ.get(faculty_key, []):
                     faculty_occ[faculty_key].remove(req_index)
                     if not faculty_occ[faculty_key]:
                         faculty_occ.pop(faculty_key, None)
@@ -2275,6 +3116,8 @@ class EvolutionaryScheduler:
         def overlap_score(req_index: int, option_index: int) -> tuple[int, int, int, int]:
             req = self.block_requests[req_index]
             option = req.options[option_index]
+            requires_room = self._request_requires_room(req)
+            requires_faculty = self._request_requires_faculty(req)
             room_hits = 0
             faculty_hits = 0
             section_hits = 0
@@ -2283,20 +3126,26 @@ class EvolutionaryScheduler:
                 room_key = (option.day, slot_idx, option.room_id)
                 faculty_key = (option.day, slot_idx, option.faculty_id)
                 section_key = (option.day, slot_idx, req.section)
-                for other_idx in room_occ.get(room_key, []):
-                    if other_idx == req_index:
-                        continue
-                    other_req = self.block_requests[other_idx]
-                    if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
-                        continue
-                    room_hits += 1
-                for other_idx in faculty_occ.get(faculty_key, []):
-                    if other_idx == req_index:
-                        continue
-                    other_req = self.block_requests[other_idx]
-                    if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
-                        continue
-                    faculty_hits += 1
+                if requires_room:
+                    for other_idx in room_occ.get(room_key, []):
+                        if other_idx == req_index:
+                            continue
+                        other_req = self.block_requests[other_idx]
+                        if not self._request_requires_room(other_req):
+                            continue
+                        if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
+                            continue
+                        room_hits += 1
+                if requires_faculty:
+                    for other_idx in faculty_occ.get(faculty_key, []):
+                        if other_idx == req_index:
+                            continue
+                        other_req = self.block_requests[other_idx]
+                        if not self._request_requires_faculty(other_req):
+                            continue
+                        if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
+                            continue
+                        faculty_hits += 1
                 for other_idx in section_occ.get(section_key, []):
                     if other_idx == req_index:
                         continue
@@ -2317,6 +3166,8 @@ class EvolutionaryScheduler:
                     for right_req_idx in values[left_index + 1 :]:
                         left_req = self.block_requests[left_req_idx]
                         right_req = self.block_requests[right_req_idx]
+                        if not (self._request_requires_room(left_req) and self._request_requires_room(right_req)):
+                            continue
                         if self._is_allowed_shared_overlap(
                             left_req,
                             right_req,
@@ -2334,6 +3185,8 @@ class EvolutionaryScheduler:
                     for right_req_idx in values[left_index + 1 :]:
                         left_req = self.block_requests[left_req_idx]
                         right_req = self.block_requests[right_req_idx]
+                        if not (self._request_requires_faculty(left_req) and self._request_requires_faculty(right_req)):
+                            continue
                         if self._is_allowed_shared_overlap(
                             left_req,
                             right_req,
@@ -2380,7 +3233,7 @@ class EvolutionaryScheduler:
                 )
                 if current_option_index not in option_indices:
                     option_indices.append(current_option_index)
-                if not req.is_lab:
+                if not req.is_lab and self._request_requires_faculty(req):
                     anchor_faculty_id: str | None = None
                     for other_idx in self._request_indices_by_course_section().get((req.course_id, req.section), []):
                         if other_idx == req_index:
@@ -2561,6 +3414,8 @@ class EvolutionaryScheduler:
             room_occ: dict[tuple[str, int, str], list[int]] = defaultdict(list)
             for req_index, option in selected_options.items():
                 req = self.block_requests[req_index]
+                if not self._request_requires_room(req):
+                    continue
                 for offset in range(req.block_size):
                     slot_idx = option.start_index + offset
                     room_occ[(option.day, slot_idx, option.room_id)].append(req_index)
@@ -2597,6 +3452,8 @@ class EvolutionaryScheduler:
                 ),
             ):
                 req = self.block_requests[req_index]
+                if not self._request_requires_room(req):
+                    continue
                 if req.request_id in self.fixed_genes:
                     continue
 
@@ -2690,16 +3547,25 @@ class EvolutionaryScheduler:
         section_day_slots: dict[tuple[str, str], set[int]] = {}
         faculty_minutes: dict[str, int] = {}
         selected_options: dict[int, PlacementOption] = {}
+        selected_assignments: list[tuple[int, BlockRequest, PlacementOption]] = []
+        faculty_schedule: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
 
         for req_index, req in enumerate(self.block_requests):
             option = req.options[genes[req_index]]
             selected_options[req_index] = option
-            room = self.rooms[option.room_id]
-            faculty = self.faculty[option.faculty_id]
+            selected_assignments.append((req_index, req, option))
+            requires_room = self._request_requires_room(req)
+            requires_faculty = self._request_requires_faculty(req)
+            room = self.rooms[option.room_id] if requires_room else None
+            faculty = self.faculty[option.faculty_id] if requires_faculty else None
             block_start, block_end = self._option_bounds(option, req.block_size)
+            if requires_faculty:
+                faculty_schedule[option.faculty_id].append((option.day, block_start, block_end))
 
             if not self._within_semester_time_window(block_start, block_end):
                 hard += weights.semester_limit
+            if self._overlaps_non_teaching_window(day=option.day, start_min=block_start, end_min=block_end):
+                hard += weights.semester_limit * 4
 
             reserved_room_conflict, reserved_faculty_conflict = self._reserved_conflict_flags(
                 day=option.day,
@@ -2707,59 +3573,114 @@ class EvolutionaryScheduler:
                 end_min=block_end,
                 room_id=option.room_id,
                 faculty_id=option.faculty_id,
+                check_room=requires_room,
+                check_faculty=requires_faculty,
             )
-            if reserved_room_conflict:
+            if requires_room and reserved_room_conflict:
                 hard += weights.room_conflict
-            if reserved_faculty_conflict:
+            if requires_faculty and reserved_faculty_conflict:
                 hard += weights.faculty_conflict
 
-            if room.capacity < req.student_count:
-                hard += weights.room_capacity
-            if req.is_lab and room.type != RoomType.lab:
-                hard += weights.room_type * 20 # Increased penalty
-            if not req.is_lab and room.type == RoomType.lab:
-                hard += weights.room_type * 20 # Increased penalty
+            if requires_room and room is not None:
+                if room.capacity < req.student_count:
+                    hard += weights.room_capacity
+                if req.is_lab and room.type != RoomType.lab:
+                    hard += weights.room_type * 20 # Increased penalty
+                if not req.is_lab and room.type == RoomType.lab:
+                    hard += weights.room_type * 20 # Increased penalty
 
             for offset in range(req.block_size):
                 slot_idx = option.start_index + offset
                 room_key = (option.day, slot_idx, option.room_id)
                 faculty_key = (option.day, slot_idx, option.faculty_id)
                 section_key = (option.day, slot_idx, req.section)
-                room_occ.setdefault(room_key, []).append(req_index)
-                faculty_occ.setdefault(faculty_key, []).append(req_index)
+                if requires_room:
+                    room_occ.setdefault(room_key, []).append(req_index)
+                if requires_faculty:
+                    faculty_occ.setdefault(faculty_key, []).append(req_index)
                 section_occ.setdefault(section_key, []).append(req_index)
                 elective_occ.setdefault((option.day, slot_idx), []).append(req_index)
                 section_day_slots.setdefault((req.section, option.day), set()).add(slot_idx)
-                faculty_minutes[option.faculty_id] = (
-                    faculty_minutes.get(option.faculty_id, 0) + self.schedule_policy.period_minutes
-                )
-            faculty_day_req_indices.setdefault((option.faculty_id, option.day), []).append(req_index)
+                if requires_faculty:
+                    faculty_minutes[option.faculty_id] = (
+                        faculty_minutes.get(option.faculty_id, 0) + self.schedule_policy.period_minutes
+                    )
+            if requires_faculty:
+                faculty_day_req_indices.setdefault((option.faculty_id, option.day), []).append(req_index)
             if self._is_elective_request(req):
                 elective_signatures_by_section[req.section].append(
                     (option.day, option.start_index, req.block_size, req.session_type)
                 )
 
-            if not self._faculty_allows_day(faculty, option.day):
+            if requires_faculty and faculty is not None and not self._faculty_allows_day(faculty, option.day):
                 hard += weights.faculty_availability
 
-            if self.faculty_windows.get(option.faculty_id, {}).get(option.day):
+            if requires_faculty and self.faculty_windows.get(option.faculty_id, {}).get(option.day):
                 if not any(
                     start <= block_start and block_end <= end
                     for start, end in self.faculty_windows[option.faculty_id][option.day]
                 ):
                     hard += weights.faculty_availability
 
-            if self.room_windows.get(option.room_id, {}).get(option.day):
+            if requires_room and self.room_windows.get(option.room_id, {}).get(option.day):
                 if not any(
                     start <= block_start and block_end <= end
                     for start, end in self.room_windows[option.room_id][option.day]
                 ):
                     hard += weights.room_type
 
-            if req.preferred_faculty_ids and option.faculty_id not in req.preferred_faculty_ids:
-                soft += weights.faculty_subject_preference * req.block_size
-            if option.faculty_id != req.primary_faculty_id:
-                soft += (weights.faculty_subject_preference * 0.5) * req.block_size
+            if requires_faculty:
+                if req.preferred_faculty_ids and option.faculty_id not in req.preferred_faculty_ids:
+                    soft += (weights.faculty_subject_preference * 0.20) * req.block_size
+                if req.primary_faculty_id and option.faculty_id != req.primary_faculty_id:
+                    soft += (weights.faculty_subject_preference * 0.08) * req.block_size
+
+        assisting_faculty_by_request, missing_assistant_slots = self._assign_assisting_faculty(
+            selected_assignments=selected_assignments,
+            faculty_schedule=faculty_schedule,
+            required_count=2,
+            allow_relaxed_fallback=False,
+        )
+        if missing_assistant_slots > 0:
+            hard += weights.faculty_conflict * missing_assistant_slots
+
+        for req_index, req, option in selected_assignments:
+            assistant_faculty_ids = assisting_faculty_by_request.get(req_index, tuple())
+            if not assistant_faculty_ids:
+                continue
+
+            block_start, block_end = self._option_bounds(option, req.block_size)
+            for assistant_faculty_id in assistant_faculty_ids:
+                assistant = self.faculty.get(assistant_faculty_id)
+                if assistant is not None and not self._faculty_allows_day(assistant, option.day):
+                    hard += weights.faculty_availability
+                if self.faculty_windows.get(assistant_faculty_id, {}).get(option.day):
+                    if not any(
+                        start <= block_start and block_end <= end
+                        for start, end in self.faculty_windows[assistant_faculty_id][option.day]
+                    ):
+                        hard += weights.faculty_availability
+
+                _room_reserved, assistant_reserved = self._reserved_conflict_flags(
+                    day=option.day,
+                    start_min=block_start,
+                    end_min=block_end,
+                    room_id=option.room_id,
+                    faculty_id=assistant_faculty_id,
+                    check_room=False,
+                    check_faculty=True,
+                )
+                if assistant_reserved:
+                    hard += weights.faculty_conflict
+
+                faculty_day_req_indices.setdefault((assistant_faculty_id, option.day), []).append(req_index)
+                for offset in range(req.block_size):
+                    slot_idx = option.start_index + offset
+                    faculty_key = (option.day, slot_idx, assistant_faculty_id)
+                    faculty_occ.setdefault(faculty_key, []).append(req_index)
+                    faculty_minutes[assistant_faculty_id] = (
+                        faculty_minutes.get(assistant_faculty_id, 0) + self.schedule_policy.period_minutes
+                    )
 
         for values in room_occ.values():
             if len(values) <= 1:
@@ -2768,6 +3689,8 @@ class EvolutionaryScheduler:
                 for right_req_idx in values[left_index + 1 :]:
                     left_req = self.block_requests[left_req_idx]
                     right_req = self.block_requests[right_req_idx]
+                    if not (self._request_requires_room(left_req) and self._request_requires_room(right_req)):
+                        continue
                     if self._is_allowed_shared_overlap(
                         left_req,
                         right_req,
@@ -2784,6 +3707,8 @@ class EvolutionaryScheduler:
                 for right_req_idx in values[left_index + 1 :]:
                     left_req = self.block_requests[left_req_idx]
                     right_req = self.block_requests[right_req_idx]
+                    if not (self._request_requires_faculty(left_req) and self._request_requires_faculty(right_req)):
+                        continue
                     if self._is_allowed_shared_overlap(
                         left_req,
                         right_req,
@@ -2873,14 +3798,16 @@ class EvolutionaryScheduler:
                             mismatch_size = max(1, len(baseline_set.symmetric_difference(signature_set)))
                             hard += weights.section_conflict * mismatch_size
 
-        parallel_lab_signatures: dict[tuple[str, str], dict[str, list[tuple[str, int, int]]]] = defaultdict(
+        parallel_lab_signatures: dict[tuple[str, str, str, int], dict[str, list[tuple[str, int, int]]]] = defaultdict(
             lambda: defaultdict(list)
         )
         for req_index, req in enumerate(self.block_requests):
             if not req.is_lab or not req.allow_parallel_batches or not req.batch:
                 continue
             option = selected_options[req_index]
-            group_key = (req.course_id, req.section)
+            group_key = self._parallel_lab_group_key(req)
+            if group_key is None:
+                continue
             signature = (option.day, option.start_index, req.block_size)
             parallel_lab_signatures[group_key][req.batch].append(signature)
 
@@ -2902,7 +3829,12 @@ class EvolutionaryScheduler:
         for (_course_id, _section_name), lecture_req_indices in self._request_indices_by_course_section().items():
             if len(lecture_req_indices) <= 1:
                 continue
-            assigned_faculty_ids = [selected_options[idx].faculty_id for idx in lecture_req_indices]
+            applicable_req_indices = [
+                idx for idx in lecture_req_indices if self._request_requires_faculty(self.block_requests[idx])
+            ]
+            if len(applicable_req_indices) <= 1:
+                continue
+            assigned_faculty_ids = [selected_options[idx].faculty_id for idx in applicable_req_indices]
             unique_faculty_ids = set(assigned_faculty_ids)
             if len(unique_faculty_ids) <= 1:
                 continue
@@ -2917,7 +3849,11 @@ class EvolutionaryScheduler:
         for course_id, req_indices in self.request_indices_by_course.items():
             if not self._single_faculty_required(course_id):
                 continue
-            lecture_req_indices = [idx for idx in req_indices if not self.block_requests[idx].is_lab]
+            lecture_req_indices = [
+                idx
+                for idx in req_indices
+                if not self.block_requests[idx].is_lab and self._request_requires_faculty(self.block_requests[idx])
+            ]
             if len(lecture_req_indices) <= 1:
                 continue
             assigned_faculty_ids = [selected_options[idx].faculty_id for idx in lecture_req_indices]
@@ -2972,7 +3908,10 @@ class EvolutionaryScheduler:
                 if minutes > week_limit:
                     hard += weights.semester_limit * max(1, (minutes - week_limit) // self.schedule_policy.period_minutes)
 
-            if self.expected_section_minutes > 0:
+            enforce_student_credit_load = True
+            if self.program_constraint is not None:
+                enforce_student_credit_load = bool(self.program_constraint.enforce_student_credit_load)
+            if enforce_student_credit_load and self.expected_section_minutes > 0:
                 period_minutes = max(1, self.schedule_policy.period_minutes)
                 all_sections = {req.section for req in self.block_requests}
                 for section in all_sections:
@@ -2982,16 +3921,34 @@ class EvolutionaryScheduler:
                     delta = abs(minutes - self.expected_section_minutes)
                     hard += weights.semester_limit * max(1, math.ceil(delta / period_minutes))
 
+        virtual_faculty_ids = getattr(self, "_virtual_faculty_ids", set())
         for faculty_id, faculty in self.faculty.items():
+            if faculty_id in virtual_faculty_ids:
+                continue
             minutes = faculty_minutes.get(faculty_id, 0)
-            max_minutes = faculty.max_hours * 60
+            max_minutes = self._effective_faculty_max_hours(faculty) * 60
             if minutes > max_minutes:
                 overflow_periods = max(1, (minutes - max_minutes) // max(1, self.schedule_policy.period_minutes))
-                # RELAXED: Treat workload overflow as a high soft penalty, not a hard conflict.
-                soft += weights.workload_overflow * overflow_periods * 10
-            target_minutes = max(0, faculty.workload_hours) * 60
-            if target_minutes > 0 and minutes < target_minutes:
-                soft += (target_minutes - minutes) * weights.workload_underflow
+                hard += weights.workload_overflow * overflow_periods
+            target_hours = self._faculty_min_target_hours(faculty)
+            if target_hours > 0:
+                baseline_minutes = self.faculty_three_term_baseline_minutes.get(faculty_id, 0)
+                horizon_terms = max(1, len(self.three_term_horizon_terms))
+                target_minutes = target_hours * 60 * horizon_terms
+                combined_minutes = baseline_minutes + minutes
+                if combined_minutes < target_minutes:
+                    deficit_periods = max(
+                        1,
+                        math.ceil((target_minutes - combined_minutes) / max(1, self.schedule_policy.period_minutes)),
+                    )
+                    underflow_multiplier = 1.0
+                    if self.program_constraint is not None and self.program_constraint.auto_assign_research_slots:
+                        # Research-hour backfilling relaxes the penalty while still preferring balanced teaching load.
+                        underflow_multiplier = 0.35
+                    soft += (weights.workload_underflow * deficit_periods) * underflow_multiplier
+
+        workload_balance_penalty = self._three_term_workload_balance_penalty(faculty_minutes)
+        soft += workload_balance_penalty * max(1.0, weights.spread_balance)
 
         sections = {req.section for req in self.block_requests}
         for section in sections:
@@ -2999,8 +3956,20 @@ class EvolutionaryScheduler:
             if day_counts:
                 soft += (max(day_counts) - min(day_counts)) * weights.spread_balance
 
-        fitness = -((hard * 1000.0) + soft)
-        result = EvaluationResult(fitness=fitness, hard_conflicts=hard, soft_penalty=soft)
+        objectives = (
+            float(hard),
+            float(soft),
+            float(workload_balance_penalty),
+        )
+        # Display-only scalar for API/UI compatibility; MOEA decisions use objective vectors.
+        fitness = -(objectives[0] + objectives[1] + objectives[2])
+        result = EvaluationResult(
+            fitness=fitness,
+            hard_conflicts=hard,
+            soft_penalty=soft,
+            workload_balance_penalty=workload_balance_penalty,
+            objectives=objectives,
+        )
         self.eval_cache[key] = result
         return result
 
@@ -3043,7 +4012,11 @@ class EvolutionaryScheduler:
                 key=lambda faculty_id: (
                     -assigned_counts.get(faculty_id, 0),
                     0 if self._faculty_prefers_subject(faculty_id, course_code) else 1,
-                    -(max(0.0, self.faculty.get(faculty_id).max_hours) if faculty_id in self.faculty else 0.0),
+                    (
+                        -float(self._effective_faculty_max_hours(self.faculty.get(faculty_id)))
+                        if faculty_id in self.faculty
+                        else 0.0
+                    ),
                     self.faculty.get(faculty_id).name if faculty_id in self.faculty else faculty_id,
                 ),
             )
@@ -3089,12 +4062,17 @@ class EvolutionaryScheduler:
                 harmonized[req_index] = prioritized[0]
 
         for (course_id, section_name), req_indices in by_course_section.items():
-            if len(req_indices) <= 1:
+            applicable_indices = [
+                req_index
+                for req_index in req_indices
+                if self._request_requires_faculty(self.block_requests[req_index])
+            ]
+            if len(applicable_indices) <= 1:
                 continue
 
             fixed_faculty_id: str | None = None
             conflicting_fixed = False
-            for req_index in req_indices:
+            for req_index in applicable_indices:
                 req = self.block_requests[req_index]
                 if req.request_id not in self.fixed_genes:
                     continue
@@ -3109,18 +4087,18 @@ class EvolutionaryScheduler:
 
             candidate_ids = set(common_by_section.get((course_id, section_name), ()))
             if not candidate_ids:
-                candidate_ids = {option.faculty_id for option in self.block_requests[req_indices[0]].options}
-                for req_index in req_indices[1:]:
+                candidate_ids = {option.faculty_id for option in self.block_requests[applicable_indices[0]].options}
+                for req_index in applicable_indices[1:]:
                     candidate_ids &= {option.faculty_id for option in self.block_requests[req_index].options}
             target_faculty_id = choose_target_faculty(
                 course_id=course_id,
-                req_indices=req_indices,
+                req_indices=applicable_indices,
                 candidate_ids=candidate_ids,
                 fixed_faculty_id=fixed_faculty_id,
             )
             if target_faculty_id is None:
                 continue
-            align_group(course_id, req_indices, target_faculty_id)
+            align_group(course_id, applicable_indices, target_faculty_id)
 
         for course_id, required in single_faculty_required.items():
             if not required:
@@ -3129,6 +4107,7 @@ class EvolutionaryScheduler:
                 req_index
                 for req_index in self.request_indices_by_course.get(course_id, [])
                 if not self.block_requests[req_index].is_lab
+                and self._request_requires_faculty(self.block_requests[req_index])
             ]
             if len(lecture_indices) <= 1:
                 continue
@@ -3232,13 +4211,37 @@ class EvolutionaryScheduler:
         used_room_ids = set()
         selected_faculty_by_course: dict[str, list[str]] = defaultdict(list)
         timetable_rows: list[dict] = []
+        selected_assignments: list[tuple[int, BlockRequest, PlacementOption]] = []
+        faculty_schedule: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
 
         for req_index, req in enumerate(self.block_requests):
             option = req.options[genes[req_index]]
+            selected_assignments.append((req_index, req, option))
             used_faculty_ids.add(option.faculty_id)
             used_course_ids.add(req.course_id)
             used_room_ids.add(option.room_id)
             selected_faculty_by_course[req.course_id].append(option.faculty_id)
+            block_start, block_end = self._option_bounds(option, req.block_size)
+            faculty_schedule[option.faculty_id].append((option.day, block_start, block_end))
+
+        assisting_faculty_by_request, _missing_assistant_slots = self._assign_assisting_faculty(
+            selected_assignments=selected_assignments,
+            faculty_schedule=faculty_schedule,
+            required_count=2,
+            allow_relaxed_fallback=False,
+        )
+        for assistant_ids in assisting_faculty_by_request.values():
+            for assistant_faculty_id in assistant_ids:
+                used_faculty_ids.add(assistant_faculty_id)
+
+        faculty_minutes = self._faculty_minutes_from_schedule(faculty_schedule)
+        research_rows, research_courses, research_rooms = self._build_research_slot_payloads(
+            faculty_schedule=faculty_schedule,
+            faculty_minutes=faculty_minutes,
+        )
+
+        for req_index, req, option in selected_assignments:
+            assistant_faculty_ids = list(assisting_faculty_by_request.get(req_index, tuple()))
             for offset in range(req.block_size):
                 slot = self.day_slots[option.day][option.start_index + offset]
                 timetable_rows.append(
@@ -3254,12 +4257,19 @@ class EvolutionaryScheduler:
                         "batch": req.batch,
                         "studentCount": req.student_count,
                         "sessionType": req.session_type,
+                        "assistantFacultyIds": assistant_faculty_ids,
                     }
                 )
+        for row in research_rows:
+            timetable_rows.append(row)
+            used_faculty_ids.add(row["facultyId"])
+            used_course_ids.add(row["courseId"])
+            used_room_ids.add(row["roomId"])
 
         faculty_data = []
+        virtual_faculty_ids = getattr(self, "_virtual_faculty_ids", set())
         for item in self.faculty.values():
-            if item.id not in used_faculty_ids:
+            if item.id not in used_faculty_ids and item.id in virtual_faculty_ids:
                 continue
             faculty_data.append(
                 {
@@ -3281,6 +4291,8 @@ class EvolutionaryScheduler:
             resolved_faculty_id = item.faculty_id
             if assigned_ids:
                 resolved_faculty_id = max(set(assigned_ids), key=assigned_ids.count)
+            if not item.assign_faculty:
+                resolved_faculty_id = next(iter(assigned_ids), "")
             if not resolved_faculty_id:
                 # This should be unreachable because generation requires a faculty assignment in each option.
                 resolved_faculty_id = next(iter(used_faculty_ids))
@@ -3299,8 +4311,15 @@ class EvolutionaryScheduler:
                     "theoryHours": item.theory_hours,
                     "labHours": item.lab_hours,
                     "tutorialHours": item.tutorial_hours,
+                    "batchSegregation": item.batch_segregation,
+                    "practicalContiguousSlots": item.practical_contiguous_slots,
+                    "assignFaculty": item.assign_faculty,
+                    "assignClassroom": item.assign_classroom,
+                    "defaultRoomId": item.default_room_id,
+                    "electiveCategory": item.elective_category,
                 }
             )
+        course_data.extend(research_courses)
 
         room_data = []
         for item in self.rooms.values():
@@ -3317,6 +4336,7 @@ class EvolutionaryScheduler:
                     "hasProjector": item.has_projector,
                 }
             )
+        room_data.extend(research_rooms)
 
         return OfficialTimetablePayload(
             programId=self.program_id,
@@ -3336,6 +4356,722 @@ class EvolutionaryScheduler:
         if stagnant_generations >= self.settings.stagnation_limit // 4:
             return min(0.25, max(base, base * 1.4))
         return base
+
+    def _report_progress(
+        self,
+        *,
+        stage: str,
+        message: str,
+        level: str = "info",
+        progress_percent: float | None = None,
+        metrics: dict[str, Any] | None = None,
+        best_genes: list[int] | None = None,
+        best_evaluation: EvaluationResult | None = None,
+    ) -> None:
+        reporter = getattr(self, "progress_reporter", None)
+        if reporter is None:
+            return
+        payload: dict[str, Any] = {
+            "stage": stage,
+            "level": level,
+            "message": message,
+        }
+        if progress_percent is not None:
+            payload["progress_percent"] = float(max(0.0, min(100.0, progress_percent)))
+        if metrics:
+            payload["metrics"] = metrics
+        if best_genes is not None and best_evaluation is not None:
+            preview_payload = self._decode_payload(best_genes)
+            payload["latest_generation"] = GenerateTimetableResponse(
+                alternatives=[
+                    GeneratedAlternative(
+                        rank=1,
+                        fitness=best_evaluation.fitness,
+                        hard_conflicts=best_evaluation.hard_conflicts,
+                        soft_penalty=best_evaluation.soft_penalty,
+                        payload=preview_payload,
+                    )
+                ],
+                settings_used=self.settings,
+                runtime_ms=0,
+            ).model_dump(by_alias=True)
+        try:
+            reporter(payload)
+        except Exception:
+            logger.exception("Failed to publish scheduler progress event")
+
+    def _scenario_fingerprint(self) -> str:
+        request_signature = [
+            (
+                req.course_id,
+                req.section,
+                req.batch or "",
+                req.student_count,
+                req.block_size,
+                req.is_lab,
+                req.session_type,
+                req.requires_faculty,
+                req.requires_room,
+                len(req.options),
+                len(req.room_candidate_ids),
+            )
+            for req in self.block_requests
+        ]
+        request_signature.sort()
+        canonical = {
+            "program_id": self.program_id,
+            "term_number": self.term_number,
+            "expected_section_minutes": self.expected_section_minutes,
+            "request_count": len(self.block_requests),
+            "requests": request_signature,
+            "slot_count_per_day": {day: len(slots) for day, slots in sorted(self.day_slots.items())},
+        }
+        digest = hashlib.blake2b(
+            json.dumps(canonical, sort_keys=True).encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        return digest
+
+    def _hyperparameter_profile_key(self) -> str:
+        scope = (getattr(self, "hyperparameter_cache_scope", "") or "single").strip().lower()
+        program_id = getattr(self, "program_id", "") or "global"
+        if scope in {"cycle", "term", "odd_even"}:
+            return f"profile:cycle:{program_id}"
+        if scope in {"single", "semester"}:
+            return f"profile:single:{program_id}"
+        return f"profile:{scope}:{program_id}"
+
+    def _hyperparameter_cache_lookup_keys(self) -> list[tuple[str, str]]:
+        """
+        Returns candidate keys in priority order.
+
+        Order:
+        1) Scenario profile key (`profile:cycle:*` or `profile:single:*`)
+        2) Same-program opposite profile as migration fallback
+        3) Legacy scenario fingerprint key (pre-profile cache format)
+        """
+        primary = self._hyperparameter_profile_key()
+        program_id = getattr(self, "program_id", "") or "global"
+
+        candidates: list[tuple[str, str]] = [(primary, "profile")]
+        if primary.startswith("profile:cycle:"):
+            candidates.append((f"profile:single:{program_id}", "profile_fallback_single"))
+        elif primary.startswith("profile:single:"):
+            candidates.append((f"profile:cycle:{program_id}", "profile_fallback_cycle"))
+
+        legacy = self._scenario_fingerprint()
+        candidates.append((legacy, "legacy_scenario"))
+
+        seen: set[str] = set()
+        deduped: list[tuple[str, str]] = []
+        for key, source in candidates:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append((key, source))
+        return deduped
+
+    @classmethod
+    def _ensure_hyperparameter_cache_loaded(cls) -> None:
+        if cls._hyperparameter_cache_loaded:
+            return
+        with cls._hyperparameter_cache_lock:
+            if cls._hyperparameter_cache_loaded:
+                return
+            cls._hyperparameter_cache_by_scenario = {}
+            if HYPERPARAMETER_CACHE_FILE.exists():
+                try:
+                    raw = json.loads(HYPERPARAMETER_CACHE_FILE.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        for scenario_key, values in raw.items():
+                            if not isinstance(values, dict):
+                                continue
+                            try:
+                                cls._hyperparameter_cache_by_scenario[scenario_key] = SearchHyperParameters(
+                                    population_size=int(values["population_size"]),
+                                    generations=int(values["generations"]),
+                                    mutation_rate=float(values["mutation_rate"]),
+                                    crossover_rate=float(values["crossover_rate"]),
+                                    elite_count=int(values["elite_count"]),
+                                    tournament_size=int(values["tournament_size"]),
+                                    stagnation_limit=int(values["stagnation_limit"]),
+                                    annealing_iterations=int(values["annealing_iterations"]),
+                                    annealing_initial_temperature=float(values["annealing_initial_temperature"]),
+                                    annealing_cooling_rate=float(values["annealing_cooling_rate"]),
+                                )
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                except Exception:
+                    logger.exception("Failed to load GA hyperparameter cache file")
+            cls._hyperparameter_cache_loaded = True
+
+    def _load_cached_hyperparameters_for_scenario(
+        self,
+    ) -> tuple[SearchHyperParameters | None, str | None, str | None]:
+        self._ensure_hyperparameter_cache_loaded()
+        with self._hyperparameter_cache_lock:
+            for scenario_key, source in self._hyperparameter_cache_lookup_keys():
+                cached = self._hyperparameter_cache_by_scenario.get(scenario_key)
+                if cached is None:
+                    continue
+                return SearchHyperParameters(**cached.__dict__), scenario_key, source
+        return None, None, None
+
+    def _persist_cached_hyperparameters_for_scenario(
+        self,
+        params: SearchHyperParameters,
+        *,
+        cache_key: str | None = None,
+    ) -> None:
+        self._ensure_hyperparameter_cache_loaded()
+        scenario_key = cache_key or self._hyperparameter_profile_key()
+        with self._hyperparameter_cache_lock:
+            self._hyperparameter_cache_by_scenario[scenario_key] = SearchHyperParameters(**params.__dict__)
+            serialized = {
+                key: value.__dict__
+                for key, value in self._hyperparameter_cache_by_scenario.items()
+            }
+            try:
+                HYPERPARAMETER_CACHE_FILE.write_text(
+                    json.dumps(serialized, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.exception("Failed to persist GA hyperparameter cache")
+
+    def _current_hyperparameters(self) -> SearchHyperParameters:
+        return SearchHyperParameters(
+            population_size=self.settings.population_size,
+            generations=self.settings.generations,
+            mutation_rate=self.settings.mutation_rate,
+            crossover_rate=self.settings.crossover_rate,
+            elite_count=self.settings.elite_count,
+            tournament_size=self.settings.tournament_size,
+            stagnation_limit=self.settings.stagnation_limit,
+            annealing_iterations=self.settings.annealing_iterations,
+            annealing_initial_temperature=self.settings.annealing_initial_temperature,
+            annealing_cooling_rate=self.settings.annealing_cooling_rate,
+        )
+
+    def _apply_hyperparameters(self, params: SearchHyperParameters) -> None:
+        self.settings.population_size = params.population_size
+        self.settings.generations = params.generations
+        self.settings.mutation_rate = params.mutation_rate
+        self.settings.crossover_rate = params.crossover_rate
+        self.settings.elite_count = params.elite_count
+        self.settings.tournament_size = params.tournament_size
+        self.settings.stagnation_limit = params.stagnation_limit
+        self.settings.annealing_iterations = params.annealing_iterations
+        self.settings.annealing_initial_temperature = params.annealing_initial_temperature
+        self.settings.annealing_cooling_rate = params.annealing_cooling_rate
+
+    def _hyperparameter_bounds(self, block_count: int) -> dict[str, tuple[float, float]]:
+        if block_count >= 220:
+            return {
+                "population_size": (36, 72),
+                "generations": (20, 50),
+                "annealing_iterations": (120, 260),
+            }
+        if block_count >= 160:
+            return {
+                "population_size": (44, 86),
+                "generations": (24, 64),
+                "annealing_iterations": (140, 320),
+            }
+        if block_count >= 120:
+            return {
+                "population_size": (52, 102),
+                "generations": (30, 82),
+                "annealing_iterations": (160, 380),
+            }
+        if block_count >= 80:
+            return {
+                "population_size": (58, 118),
+                "generations": (34, 96),
+                "annealing_iterations": (180, 460),
+            }
+        return {
+            "population_size": (66, 138),
+            "generations": (40, 126),
+            "annealing_iterations": (220, 620),
+        }
+
+    def _coerce_hyperparameters(
+        self,
+        params: SearchHyperParameters,
+        *,
+        block_count: int,
+    ) -> SearchHyperParameters:
+        bounds = self._hyperparameter_bounds(block_count)
+
+        def clamp_int(value: int, low: float, high: float) -> int:
+            return int(max(int(low), min(int(high), int(round(value)))))
+
+        def clamp_float(value: float, low: float, high: float) -> float:
+            return max(low, min(high, float(value)))
+
+        population_size = clamp_int(params.population_size, *bounds["population_size"])
+        generations = clamp_int(params.generations, *bounds["generations"])
+        mutation_rate = clamp_float(params.mutation_rate, 0.04, 0.35)
+        crossover_rate = clamp_float(params.crossover_rate, 0.55, 0.98)
+
+        elite_upper = max(2, min(18, population_size // 3))
+        elite_count = clamp_int(params.elite_count, 2, elite_upper)
+        tournament_upper = max(2, min(16, population_size // 2))
+        tournament_size = clamp_int(params.tournament_size, 2, tournament_upper)
+        stagnation_upper = max(12, generations)
+        stagnation_limit = clamp_int(params.stagnation_limit, 8, stagnation_upper)
+        annealing_iterations = clamp_int(params.annealing_iterations, *bounds["annealing_iterations"])
+        annealing_initial_temperature = clamp_float(params.annealing_initial_temperature, 2.0, 14.0)
+        annealing_cooling_rate = clamp_float(params.annealing_cooling_rate, 0.90, 0.9998)
+
+        if elite_count >= population_size:
+            elite_count = max(1, population_size - 1)
+        if tournament_size > population_size:
+            tournament_size = population_size
+
+        return SearchHyperParameters(
+            population_size=population_size,
+            generations=generations,
+            mutation_rate=mutation_rate,
+            crossover_rate=crossover_rate,
+            elite_count=elite_count,
+            tournament_size=tournament_size,
+            stagnation_limit=stagnation_limit,
+            annealing_iterations=annealing_iterations,
+            annealing_initial_temperature=annealing_initial_temperature,
+            annealing_cooling_rate=annealing_cooling_rate,
+        )
+
+    def _random_hyperparameters(self, *, block_count: int) -> SearchHyperParameters:
+        bounds = self._hyperparameter_bounds(block_count)
+        params = SearchHyperParameters(
+            population_size=self.random.randint(int(bounds["population_size"][0]), int(bounds["population_size"][1])),
+            generations=self.random.randint(int(bounds["generations"][0]), int(bounds["generations"][1])),
+            mutation_rate=self.random.uniform(0.05, 0.30),
+            crossover_rate=self.random.uniform(0.62, 0.95),
+            elite_count=self.random.randint(2, 12),
+            tournament_size=self.random.randint(2, 10),
+            stagnation_limit=self.random.randint(10, 70),
+            annealing_iterations=self.random.randint(
+                int(bounds["annealing_iterations"][0]),
+                int(bounds["annealing_iterations"][1]),
+            ),
+            annealing_initial_temperature=self.random.uniform(3.0, 10.0),
+            annealing_cooling_rate=self.random.uniform(0.93, 0.9995),
+        )
+        return self._coerce_hyperparameters(params, block_count=block_count)
+
+    def _crossover_hyperparameters(
+        self,
+        left: SearchHyperParameters,
+        right: SearchHyperParameters,
+        *,
+        block_count: int,
+    ) -> SearchHyperParameters:
+        alpha = self.random.uniform(0.25, 0.75)
+        child = SearchHyperParameters(
+            population_size=int(round((left.population_size * alpha) + (right.population_size * (1.0 - alpha)))),
+            generations=int(round((left.generations * alpha) + (right.generations * (1.0 - alpha)))),
+            mutation_rate=(left.mutation_rate * alpha) + (right.mutation_rate * (1.0 - alpha)),
+            crossover_rate=(left.crossover_rate * alpha) + (right.crossover_rate * (1.0 - alpha)),
+            elite_count=int(round((left.elite_count * alpha) + (right.elite_count * (1.0 - alpha)))),
+            tournament_size=int(round((left.tournament_size * alpha) + (right.tournament_size * (1.0 - alpha)))),
+            stagnation_limit=int(round((left.stagnation_limit * alpha) + (right.stagnation_limit * (1.0 - alpha)))),
+            annealing_iterations=int(
+                round((left.annealing_iterations * alpha) + (right.annealing_iterations * (1.0 - alpha)))
+            ),
+            annealing_initial_temperature=(left.annealing_initial_temperature * alpha)
+            + (right.annealing_initial_temperature * (1.0 - alpha)),
+            annealing_cooling_rate=(left.annealing_cooling_rate * alpha)
+            + (right.annealing_cooling_rate * (1.0 - alpha)),
+        )
+        return self._coerce_hyperparameters(child, block_count=block_count)
+
+    def _mutate_hyperparameters(
+        self,
+        params: SearchHyperParameters,
+        *,
+        block_count: int,
+        mutation_probability: float,
+    ) -> SearchHyperParameters:
+        candidate = SearchHyperParameters(**params.__dict__)
+        bounds = self._hyperparameter_bounds(block_count)
+
+        if self.random.random() < mutation_probability:
+            candidate.population_size += self.random.randint(-18, 18)
+        if self.random.random() < mutation_probability:
+            candidate.generations += self.random.randint(-16, 16)
+        if self.random.random() < mutation_probability:
+            candidate.mutation_rate += self.random.uniform(-0.05, 0.05)
+        if self.random.random() < mutation_probability:
+            candidate.crossover_rate += self.random.uniform(-0.07, 0.07)
+        if self.random.random() < mutation_probability:
+            candidate.elite_count += self.random.randint(-3, 3)
+        if self.random.random() < mutation_probability:
+            candidate.tournament_size += self.random.randint(-2, 2)
+        if self.random.random() < mutation_probability:
+            candidate.stagnation_limit += self.random.randint(-12, 12)
+        if self.random.random() < mutation_probability:
+            candidate.annealing_iterations += self.random.randint(-80, 80)
+        if self.random.random() < mutation_probability:
+            candidate.annealing_initial_temperature += self.random.uniform(-1.2, 1.2)
+        if self.random.random() < mutation_probability:
+            candidate.annealing_cooling_rate += self.random.uniform(-0.02, 0.02)
+
+        candidate.population_size = int(
+            max(bounds["population_size"][0], min(bounds["population_size"][1], candidate.population_size))
+        )
+        candidate.generations = int(max(bounds["generations"][0], min(bounds["generations"][1], candidate.generations)))
+        candidate.annealing_iterations = int(
+            max(bounds["annealing_iterations"][0], min(bounds["annealing_iterations"][1], candidate.annealing_iterations))
+        )
+        return self._coerce_hyperparameters(candidate, block_count=block_count)
+
+    @staticmethod
+    def _hyperparameter_signature(params: SearchHyperParameters) -> tuple:
+        return (
+            params.population_size,
+            params.generations,
+            round(params.mutation_rate, 5),
+            round(params.crossover_rate, 5),
+            params.elite_count,
+            params.tournament_size,
+            params.stagnation_limit,
+            params.annealing_iterations,
+            round(params.annealing_initial_temperature, 3),
+            round(params.annealing_cooling_rate, 5),
+        )
+
+    @staticmethod
+    def _eval_sort_key(evaluation: EvaluationResult) -> tuple[float, float, float]:
+        objective_1, objective_2, objective_3 = EvolutionaryScheduler._objective_values(evaluation)
+        return (objective_1, objective_2, objective_3)
+
+    def _probe_hyperparameters(self, request: GenerateTimetableRequest) -> EvaluationResult:
+        probe_population_size = max(16, min(42, self.settings.population_size // 2))
+        probe_generations = max(6, min(22, self.settings.generations // 3))
+        probe_sa_iterations = max(8, min(48, self.settings.annealing_iterations // 12))
+
+        population = self._build_initial_population()[:probe_population_size]
+        while len(population) < probe_population_size:
+            population.append(self._repair_individual(self._random_individual(), max_passes=1))
+
+        evaluations = [self._evaluate(genes) for genes in population]
+        best_eval = min(evaluations, key=self._eval_sort_key)
+        stagnant = 0
+
+        for generation in range(probe_generations):
+            fronts, rank_by_index = self._non_dominated_sort(evaluations)
+            crowding_by_index: dict[int, float] = {}
+            for front in fronts:
+                crowding_by_index.update(self._crowding_distances(front, evaluations))
+
+            ordered_indices = sorted(
+                range(len(population)),
+                key=lambda index: (
+                    rank_by_index.get(index, math.inf),
+                    -crowding_by_index.get(index, 0.0),
+                    *self._eval_sort_key(evaluations[index]),
+                ),
+            )
+            if not ordered_indices:
+                break
+
+            generation_best = evaluations[ordered_indices[0]]
+            if self._is_better_eval(generation_best, best_eval):
+                best_eval = generation_best
+                stagnant = 0
+            else:
+                stagnant += 1
+
+            mutation_rate = self._adaptive_mutation_rate(stagnant)
+            next_population: list[list[int]] = []
+            elite_keep = min(len(ordered_indices), max(2, self.settings.elite_count))
+            for index in ordered_indices[:elite_keep]:
+                next_population.append(list(population[index]))
+
+            top_index = ordered_indices[0]
+            refined_genes, refined_eval = self._simulated_annealing_refine(
+                population[top_index],
+                evaluations[top_index],
+                iterations=probe_sa_iterations,
+            )
+            if self._is_better_eval(refined_eval, best_eval):
+                best_eval = refined_eval
+            if len(next_population) < probe_population_size:
+                next_population.append(refined_genes)
+
+            while len(next_population) < probe_population_size:
+                parent_a = self._select_moea_parent(
+                    population,
+                    evaluations,
+                    rank_by_index,
+                    crowding_by_index,
+                )
+                parent_b = self._select_moea_parent(
+                    population,
+                    evaluations,
+                    rank_by_index,
+                    crowding_by_index,
+                )
+                if self.random.random() < self.settings.crossover_rate:
+                    child = self._crossover(parent_a, parent_b)
+                else:
+                    child = list(parent_a)
+
+                if self.random.random() < 0.90:
+                    child = self._mutate(child, mutation_rate=mutation_rate)
+
+                if self.random.random() < 0.20:
+                    child = self._repair_individual(child, max_passes=1)
+
+                next_population.append(child)
+
+            population = next_population
+            evaluations = [self._evaluate(genes) for genes in population]
+            candidate_best = min(evaluations, key=self._eval_sort_key)
+            if self._is_better_eval(candidate_best, best_eval):
+                best_eval = candidate_best
+
+            if best_eval.hard_conflicts == 0 and generation >= max(3, probe_generations // 3):
+                break
+
+        return best_eval
+
+    def _score_hyperparameters(self, request: GenerateTimetableRequest) -> tuple[float, float, float]:
+        probe = self._probe_hyperparameters(request)
+        runtime_budget = float(self.settings.population_size * self.settings.generations)
+        obj_hard, obj_soft, obj_workload = self._objective_values(probe)
+        return (
+            obj_hard,
+            obj_soft + obj_workload,
+            runtime_budget * 0.001,
+        )
+
+    def _tuning_wall_time_limit_seconds(self, block_count: int) -> int:
+        # Keep tuning bounded so unattended overnight runs always terminate.
+        if block_count >= 220:
+            return 1_500
+        if block_count >= 160:
+            return 1_800
+        if block_count >= 120:
+            return 2_100
+        if block_count >= 80:
+            return 2_400
+        return 2_700
+
+    def _search_wall_time_limit_seconds(self, block_count: int) -> int:
+        # Main MOEA-SA wall-time guard to avoid hanging jobs.
+        if block_count >= 220:
+            return 2_400
+        if block_count >= 160:
+            return 3_000
+        if block_count >= 120:
+            return 3_600
+        if block_count >= 80:
+            return 4_200
+        return 4_800
+
+    def _tune_hyperparameters_with_ga(self, request: GenerateTimetableRequest) -> SearchHyperParameters:
+        if not hasattr(self, "block_requests"):
+            return self._current_hyperparameters()
+
+        block_count = len(self.block_requests)
+        tuning_wall_time_limit_seconds = self._tuning_wall_time_limit_seconds(block_count)
+        tuning_started_at = perf_counter()
+        tuning_termination = "generation_budget_exhausted"
+        profile_key = self._hyperparameter_profile_key()
+        profile_scope = profile_key.split(":")[1] if ":" in profile_key else "single"
+        lookup_keys = self._hyperparameter_cache_lookup_keys()
+        self._report_progress(
+            stage="tuning",
+            progress_percent=5.0,
+            message=f"Checking saved hyperparameter profile: {profile_key}.",
+            metrics={
+                "profile_key": profile_key,
+                "profile_scope": profile_scope,
+                "lookup_keys": [item[0] for item in lookup_keys],
+            },
+        )
+        cached, cache_key, cache_source = self._load_cached_hyperparameters_for_scenario()
+        if cached is not None:
+            tuned_cached = self._coerce_hyperparameters(cached, block_count=block_count)
+            self._apply_hyperparameters(tuned_cached)
+            migrated = bool(cache_key and cache_key != profile_key)
+            if migrated:
+                self._persist_cached_hyperparameters_for_scenario(tuned_cached, cache_key=profile_key)
+            source_label = cache_source or "profile"
+            if migrated:
+                hit_message = (
+                    "Hyperparameter profile cache HIT via fallback key "
+                    f"{cache_key}. Migrated to {profile_key} and reused."
+                )
+            else:
+                hit_message = f"Hyperparameter profile cache HIT. Reusing saved parameters from {profile_key}."
+            self._report_progress(
+                stage="tuning",
+                level="success",
+                progress_percent=30.0,
+                message=hit_message,
+                metrics={
+                    "cache_status": "hit",
+                    "cache_source": source_label,
+                    "cache_key": cache_key or profile_key,
+                    "cache_migrated": migrated,
+                    "profile_key": profile_key,
+                    "profile_scope": profile_scope,
+                    **tuned_cached.__dict__,
+                },
+            )
+            return tuned_cached
+
+        baseline = self._coerce_hyperparameters(self._current_hyperparameters(), block_count=block_count)
+        settings_snapshot = self._current_hyperparameters()
+        objective_cache: dict[tuple, tuple[float, float, float]] = {}
+
+        meta_population_size = 10 if block_count >= 120 else 12
+        meta_generations = 5 if block_count >= 160 else 6
+        mutation_probability = 0.35
+        elite_keep = 2
+
+        self._report_progress(
+            stage="tuning",
+            progress_percent=5.0,
+            message=(
+                "Hyperparameter profile cache MISS. "
+                f"Creating and saving new profile via GA tuning ({profile_key}): "
+                f"population={meta_population_size}, generations={meta_generations}."
+            ),
+            metrics={
+                "cache_status": "miss",
+                "profile_key": profile_key,
+                "profile_scope": profile_scope,
+                "lookup_keys": [item[0] for item in lookup_keys],
+                "wall_time_limit_seconds": tuning_wall_time_limit_seconds,
+            },
+        )
+
+        population: list[SearchHyperParameters] = [baseline]
+        while len(population) < meta_population_size:
+            population.append(self._random_hyperparameters(block_count=block_count))
+
+        best_params = baseline
+        best_score = (float("inf"), float("inf"), float("inf"))
+
+        try:
+            for generation_index in range(meta_generations):
+                elapsed_tuning_seconds = perf_counter() - tuning_started_at
+                if elapsed_tuning_seconds >= tuning_wall_time_limit_seconds:
+                    tuning_termination = "wall_time_budget_exhausted"
+                    self._report_progress(
+                        stage="tuning",
+                        level="warn",
+                        progress_percent=29.0,
+                        message=(
+                            "GA tuning wall-time budget reached. "
+                            "Stopping early and reusing the best profile found so far."
+                        ),
+                        metrics={
+                            "profile_key": profile_key,
+                            "profile_scope": profile_scope,
+                            "elapsed_seconds": round(elapsed_tuning_seconds, 2),
+                            "wall_time_limit_seconds": tuning_wall_time_limit_seconds,
+                            "completed_generations": generation_index,
+                        },
+                    )
+                    break
+
+                scored_population: list[tuple[tuple[float, float, float], SearchHyperParameters]] = []
+                for params in population:
+                    key = self._hyperparameter_signature(params)
+                    if key not in objective_cache:
+                        self._apply_hyperparameters(params)
+                        objective_cache[key] = self._score_hyperparameters(request)
+                    score = objective_cache[key]
+                    scored_population.append((score, params))
+
+                scored_population.sort(key=lambda item: item[0])
+                if scored_population and scored_population[0][0] < best_score:
+                    best_score = scored_population[0][0]
+                    best_params = scored_population[0][1]
+
+                if scored_population:
+                    current_best = scored_population[0]
+                    self._report_progress(
+                        stage="tuning",
+                        progress_percent=5.0 + (((generation_index + 1) / max(1, meta_generations)) * 25.0),
+                        message=(
+                            f"GA tuning generation {generation_index + 1}/{meta_generations}: "
+                            f"best hard={int(current_best[0][0])}, combined_secondary={current_best[0][1]:.2f}."
+                        ),
+                        metrics={
+                            "generation_index": generation_index + 1,
+                            "best_hard_conflicts": int(current_best[0][0]),
+                            "best_combined_secondary_objective": round(current_best[0][1], 4),
+                            "best_runtime_penalty": round(current_best[0][2], 4),
+                            "candidate_population_size": current_best[1].population_size,
+                            "candidate_generations": current_best[1].generations,
+                            "candidate_mutation_rate": round(current_best[1].mutation_rate, 4),
+                            "candidate_crossover_rate": round(current_best[1].crossover_rate, 4),
+                        },
+                    )
+
+                next_population = [item[1] for item in scored_population[:elite_keep]]
+                while len(next_population) < meta_population_size:
+                    parent_a = scored_population[self.random.randrange(max(1, len(scored_population) // 2))][1]
+                    parent_b = scored_population[self.random.randrange(max(1, len(scored_population) // 2))][1]
+                    child = self._crossover_hyperparameters(parent_a, parent_b, block_count=block_count)
+                    child = self._mutate_hyperparameters(
+                        child,
+                        block_count=block_count,
+                        mutation_probability=mutation_probability,
+                    )
+                    next_population.append(child)
+
+                population = next_population
+        finally:
+            self._apply_hyperparameters(settings_snapshot)
+
+        tuned = self._coerce_hyperparameters(best_params, block_count=block_count)
+        self._apply_hyperparameters(tuned)
+        self._persist_cached_hyperparameters_for_scenario(tuned)
+        logger.info(
+            "GA hyperparameter tuning complete program_id=%s term=%s hard=%s combined_secondary=%.2f pop=%s gen=%s mut=%.3f cross=%.3f elite=%s tour=%s stag=%s anneal_iter=%s anneal_temp=%.2f cool=%.5f",
+            self.program_id,
+            self.term_number,
+            int(best_score[0]),
+            best_score[1],
+            tuned.population_size,
+            tuned.generations,
+            tuned.mutation_rate,
+            tuned.crossover_rate,
+            tuned.elite_count,
+            tuned.tournament_size,
+            tuned.stagnation_limit,
+            tuned.annealing_iterations,
+            tuned.annealing_initial_temperature,
+            tuned.annealing_cooling_rate,
+        )
+        self._report_progress(
+            stage="tuning",
+            level="success",
+            progress_percent=30.0,
+            message=f"GA hyperparameter tuning complete. Saved profile for reuse: {profile_key}.",
+            metrics={
+                "termination": tuning_termination,
+                "cache_status": "saved",
+                "profile_key": profile_key,
+                "profile_scope": profile_scope,
+                "best_hard_conflicts": int(best_score[0]),
+                "best_combined_secondary_objective": round(best_score[1], 4),
+                "best_runtime_penalty": round(best_score[2], 4),
+                "elapsed_seconds": round(perf_counter() - tuning_started_at, 2),
+                "wall_time_limit_seconds": tuning_wall_time_limit_seconds,
+                **tuned.__dict__,
+            },
+        )
+        return tuned
 
     def _build_initial_population(self) -> list[list[int]]:
         population: list[list[int]] = []
@@ -3377,202 +5113,9 @@ class EvolutionaryScheduler:
         return population[: self.settings.population_size]
 
     def _run_classic_ga(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
-        start = perf_counter()
-        population = self._build_initial_population()
-        best_fitness = float("-inf")
-        best_hard_conflicts = math.inf
-        stagnant = 0
-
-        block_count = len(self.block_requests)
-        generation_cap = self.settings.generations
-        if block_count >= 220:
-            generation_cap = min(generation_cap, 30)
-        elif block_count >= 160:
-            generation_cap = min(generation_cap, 50)
-        elif block_count >= 120:
-            generation_cap = min(generation_cap, 80)
-        elif block_count >= 80:
-            generation_cap = min(generation_cap, 120)
-        else:
-            generation_cap = min(generation_cap, 180)
-
-        for _generation in range(generation_cap):
-            evaluations = [self._evaluate(item) for item in population]
-            ranked_indices = sorted(range(len(population)), key=lambda idx: evaluations[idx].fitness, reverse=True)
-            ranked_population = [population[idx] for idx in ranked_indices]
-            ranked_evaluations = [evaluations[idx] for idx in ranked_indices]
-
-            generation_best_eval = ranked_evaluations[0]
-            generation_best_fitness = generation_best_eval.fitness
-            if (
-                generation_best_eval.hard_conflicts < best_hard_conflicts
-                or (
-                    generation_best_eval.hard_conflicts == best_hard_conflicts
-                    and generation_best_fitness > best_fitness
-                )
-            ):
-                best_hard_conflicts = generation_best_eval.hard_conflicts
-                best_fitness = generation_best_fitness
-                stagnant = 0
-            else:
-                stagnant += 1
-
-            if best_hard_conflicts == 0 and stagnant >= max(8, self.settings.stagnation_limit // 2):
-                break
-
-            mutation_rate = self._adaptive_mutation_rate(stagnant)
-            next_population = ranked_population[: self.settings.elite_count]
-            while len(next_population) < self.settings.population_size:
-                parent_a = self._select(ranked_population, ranked_evaluations)
-                parent_b = self._select(ranked_population, ranked_evaluations)
-                if self.random.random() < self.settings.crossover_rate:
-                    child = self._crossover(parent_a, parent_b)
-                else:
-                    child = list(parent_a)
-                child = self._mutate(child, mutation_rate=mutation_rate)
-                if self.random.random() < 0.03 or (
-                    stagnant >= self.settings.stagnation_limit // 2 and self.random.random() < 0.12
-                ):
-                    child = self._repair_individual(child, max_passes=1)
-                next_population.append(child)
-
-            if stagnant >= self.settings.stagnation_limit:
-                # Restart most of the population to escape local minima while preserving elites.
-                for index in range(self.settings.elite_count, len(next_population)):
-                    candidate = self._random_individual()
-                    if self.random.random() < 0.35:
-                        candidate = self._repair_individual(candidate, max_passes=1)
-                    next_population[index] = candidate
-                stagnant = 0
-
-            population = next_population
-
-        final_evaluations = [self._evaluate(item) for item in population]
-        ranked_indices = sorted(range(len(population)), key=lambda idx: final_evaluations[idx].fitness, reverse=True)
-        shortlisted_count = min(len(ranked_indices), max(20, request.alternative_count * 8))
-        shortlisted: list[tuple[EvaluationResult, list[int]]] = []
-        intensive_budget = (
-            max(2, request.alternative_count * 2)
-            if block_count >= 180
-            else max(4, request.alternative_count * 4)
-        )
-        intensive_step_cap = self._intensive_repair_step_cap()
-        for idx in ranked_indices[:shortlisted_count]:
-            genes = population[idx]
-            evaluation = final_evaluations[idx]
-            best_genes = genes
-            best_eval = evaluation
-            if evaluation.hard_conflicts > 0:
-                repaired = self._repair_individual(list(genes), max_passes=3)
-                repaired_eval = self._evaluate(repaired)
-                if (
-                    repaired_eval.hard_conflicts < evaluation.hard_conflicts
-                    or (
-                        repaired_eval.hard_conflicts == evaluation.hard_conflicts
-                        and repaired_eval.soft_penalty < evaluation.soft_penalty
-                    )
-                ):
-                    best_genes = repaired
-                    best_eval = repaired_eval
-            if best_eval.hard_conflicts > 0 and intensive_budget > 0:
-                intensive_budget -= 1
-                intensified_genes, intensified_eval = self._intensive_conflict_repair(
-                    list(best_genes),
-                    max_steps=intensive_step_cap,
-                )
-                if self._is_better_eval(intensified_eval, best_eval):
-                    best_genes = intensified_genes
-                    best_eval = intensified_eval
-            shortlisted.append((best_eval, best_genes))
-
-        shortlisted.sort(key=lambda item: (item[0].hard_conflicts, item[0].soft_penalty, -item[0].fitness))
-
-        alternatives: list[GeneratedAlternative] = []
-        seen_fingerprints: set[tuple[tuple[int, ...], ...]] = set()
-        for evaluation, genes in shortlisted:
-            payload = self._decode_payload(genes)
-            fingerprint = tuple(
-                sorted(
-                    (
-                        slot.day,
-                        slot.startTime,
-                        slot.endTime,
-                        slot.courseId,
-                        slot.roomId,
-                        slot.facultyId,
-                        slot.section,
-                        slot.batch or "",
-                        slot.sessionType or "",
-                    )
-                    for slot in payload.timetable_data
-                )
-            )
-            if fingerprint in seen_fingerprints:
-                continue
-            seen_fingerprints.add(fingerprint)
-            alternatives.append(
-                GeneratedAlternative(
-                    rank=len(alternatives) + 1,
-                    fitness=evaluation.fitness,
-                    hard_conflicts=evaluation.hard_conflicts,
-                    soft_penalty=evaluation.soft_penalty,
-                    payload=payload,
-                )
-            )
-            if len(alternatives) >= request.alternative_count:
-                break
-
-        attempts = 0
-        while len(alternatives) < request.alternative_count and attempts < request.alternative_count * 20:
-            attempts += 1
-            candidate_genes = self._repair_individual(self._random_individual(), max_passes=2)
-            candidate_eval = self._evaluate(candidate_genes)
-            if candidate_eval.hard_conflicts > 0 and intensive_budget > 0:
-                intensive_budget -= 1
-                candidate_genes, candidate_eval = self._intensive_conflict_repair(
-                    candidate_genes,
-                    max_steps=intensive_step_cap,
-                )
-            payload = self._decode_payload(candidate_genes)
-            fingerprint = tuple(
-                sorted(
-                    (
-                        slot.day,
-                        slot.startTime,
-                        slot.endTime,
-                        slot.courseId,
-                        slot.roomId,
-                        slot.facultyId,
-                        slot.section,
-                        slot.batch or "",
-                    )
-                    for slot in payload.timetable_data
-                )
-            )
-            if fingerprint in seen_fingerprints:
-                continue
-            seen_fingerprints.add(fingerprint)
-            alternatives.append(
-                GeneratedAlternative(
-                    rank=len(alternatives) + 1,
-                    fitness=candidate_eval.fitness,
-                    hard_conflicts=candidate_eval.hard_conflicts,
-                    soft_penalty=candidate_eval.soft_penalty,
-                    payload=payload,
-                )
-            )
-
-        if not alternatives:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Generation did not produce any alternatives",
-            )
-
-        runtime_ms = int((perf_counter() - start) * 1000)
-        return GenerateTimetableResponse(
-            alternatives=alternatives,
-            settings_used=self.settings,
-            runtime_ms=runtime_ms,
+        return self._run_moea_search(
+            request,
+            use_simulated_annealing=True,
         )
 
     def _request_priority_order(self) -> list[int]:
@@ -3620,11 +5163,14 @@ class EvolutionaryScheduler:
         )
 
     def _parallel_lab_sync_required(self, req_a: BlockRequest, req_b: BlockRequest) -> bool:
+        same_sync_scope = req_a.section == req_b.section or (
+            self._is_project_phase_request(req_a) and self._is_project_phase_request(req_b)
+        )
         return (
             req_a.is_lab
             and req_b.is_lab
             and req_a.course_id == req_b.course_id
-            and req_a.section == req_b.section
+            and same_sync_scope
             and req_a.allow_parallel_batches
             and req_b.allow_parallel_batches
             and bool(req_a.batch)
@@ -3647,8 +5193,10 @@ class EvolutionaryScheduler:
     ) -> tuple[int, float]:
         req = self.block_requests[req_index]
         option = req.options[option_index]
-        room = self.rooms[option.room_id]
-        faculty = self.faculty[option.faculty_id]
+        requires_room = self._request_requires_room(req)
+        requires_faculty = self._request_requires_faculty(req)
+        room = self.rooms[option.room_id] if requires_room else None
+        faculty = self.faculty[option.faculty_id] if requires_faculty else None
         weights = self.settings.objective_weights
 
         hard = 0
@@ -3657,6 +5205,8 @@ class EvolutionaryScheduler:
 
         if not self._within_semester_time_window(block_start, block_end):
             hard += weights.semester_limit
+        if self._overlaps_non_teaching_window(day=option.day, start_min=block_start, end_min=block_end):
+            hard += weights.semester_limit * 4
 
         reserved_room_conflict, reserved_faculty_conflict = self._reserved_conflict_flags(
             day=option.day,
@@ -3664,42 +5214,47 @@ class EvolutionaryScheduler:
             end_min=block_end,
             room_id=option.room_id,
             faculty_id=option.faculty_id,
+            check_room=requires_room,
+            check_faculty=requires_faculty,
         )
-        if reserved_room_conflict:
+        if requires_room and reserved_room_conflict:
             hard += weights.room_conflict
-        if reserved_faculty_conflict:
+        if requires_faculty and reserved_faculty_conflict:
             hard += weights.faculty_conflict
 
-        if room.capacity < req.student_count:
-            hard += weights.room_capacity
-        if req.is_lab and room.type != RoomType.lab:
-            hard += weights.room_type
-        if not req.is_lab and room.type == RoomType.lab:
-            hard += weights.room_type
-
-        if not self._faculty_allows_day(faculty, option.day):
-            hard += weights.faculty_availability
-
-        faculty_windows = self.faculty_windows.get(option.faculty_id, {})
-        if faculty_windows.get(option.day):
-            if not any(start <= block_start and block_end <= end for start, end in faculty_windows[option.day]):
-                hard += weights.faculty_availability
-
-        room_windows = self.room_windows.get(option.room_id, {})
-        if room_windows.get(option.day):
-            if not any(start <= block_start and block_end <= end for start, end in room_windows[option.day]):
+        if requires_room and room is not None:
+            if room.capacity < req.student_count:
+                hard += weights.room_capacity
+            if req.is_lab and room.type != RoomType.lab:
+                hard += weights.room_type
+            if not req.is_lab and room.type == RoomType.lab:
                 hard += weights.room_type
 
+            room_windows = self.room_windows.get(option.room_id, {})
+            if room_windows.get(option.day):
+                if not any(start <= block_start and block_end <= end for start, end in room_windows[option.day]):
+                    hard += weights.room_type
+
+        if requires_faculty and faculty is not None:
+            if not self._faculty_allows_day(faculty, option.day):
+                hard += weights.faculty_availability
+
+            faculty_windows = self.faculty_windows.get(option.faculty_id, {})
+            if faculty_windows.get(option.day):
+                if not any(start <= block_start and block_end <= end for start, end in faculty_windows[option.day]):
+                    hard += weights.faculty_availability
+
         period_minutes = self.schedule_policy.period_minutes
-        projected_minutes = faculty_minutes.get(option.faculty_id, 0) + (req.block_size * period_minutes)
-        max_minutes = faculty.max_hours * 60
-        if projected_minutes > max_minutes:
-            overflow_periods = max(1, (projected_minutes - max_minutes) // max(1, period_minutes))
-            hard += weights.workload_overflow * overflow_periods
-        elif max_minutes > 0:
-            # Proactively spread teaching load before reaching hard overload.
-            utilization = projected_minutes / max_minutes
-            soft += max(0.0, utilization - 0.55) * max(1.0, weights.spread_balance)
+        if requires_faculty and faculty is not None:
+            projected_minutes = faculty_minutes.get(option.faculty_id, 0) + (req.block_size * period_minutes)
+            max_minutes = self._effective_faculty_max_hours(faculty) * 60
+            if projected_minutes > max_minutes:
+                overflow_periods = max(1, (projected_minutes - max_minutes) // max(1, period_minutes))
+                hard += weights.workload_overflow * overflow_periods
+            elif max_minutes > 0:
+                # Proactively spread teaching load before reaching hard overload.
+                utilization = projected_minutes / max_minutes
+                soft += max(0.0, utilization - 0.55) * max(1.0, weights.spread_balance)
 
         section_keys = section_slot_keys.get(req.section, set())
         projected_section_slot_count = len(section_keys)
@@ -3709,17 +5264,22 @@ class EvolutionaryScheduler:
             if key not in section_keys:
                 projected_section_slot_count += 1
         projected_section_minutes = projected_section_slot_count * period_minutes
-        if self.expected_section_minutes > 0 and projected_section_minutes > self.expected_section_minutes:
+        enforce_student_credit_load = True
+        if self.program_constraint is not None:
+            enforce_student_credit_load = bool(self.program_constraint.enforce_student_credit_load)
+        if enforce_student_credit_load and self.expected_section_minutes > 0 and projected_section_minutes > self.expected_section_minutes:
             overflow_periods = max(
                 1,
                 math.ceil((projected_section_minutes - self.expected_section_minutes) / max(1, period_minutes)),
             )
             hard += weights.semester_limit * overflow_periods
 
-        if not req.is_lab:
+        if not req.is_lab and requires_faculty:
             for other_idx, other_option in selected_options.items():
                 other_req = self.block_requests[other_idx]
                 if other_req.is_lab:
+                    continue
+                if not self._request_requires_faculty(other_req):
                     continue
                 if other_req.course_id != req.course_id:
                     continue
@@ -3755,18 +5315,21 @@ class EvolutionaryScheduler:
                         mismatch_size = max(1, len(set(baseline).symmetric_difference(set(signatures))))
                         hard += weights.section_conflict * mismatch_size
 
-        for other_idx, other_option in selected_options.items():
-            other_req = self.block_requests[other_idx]
-            if self._is_faculty_back_to_back(req, option, other_req, other_option):
-                soft += max(1.0, weights.spread_balance * 0.75)
+        if requires_faculty:
+            for other_idx, other_option in selected_options.items():
+                other_req = self.block_requests[other_idx]
+                if not self._request_requires_faculty(other_req):
+                    continue
+                if self._is_faculty_back_to_back(req, option, other_req, other_option):
+                    soft += max(1.0, weights.spread_balance * 0.75)
 
-        if req.preferred_faculty_ids and option.faculty_id not in req.preferred_faculty_ids:
-            soft += weights.faculty_subject_preference * req.block_size
-        if option.faculty_id != req.primary_faculty_id:
-            soft += (weights.faculty_subject_preference * 0.5) * req.block_size
+            if req.preferred_faculty_ids and option.faculty_id not in req.preferred_faculty_ids:
+                soft += (weights.faculty_subject_preference * 0.20) * req.block_size
+            if req.primary_faculty_id and option.faculty_id != req.primary_faculty_id:
+                soft += (weights.faculty_subject_preference * 0.08) * req.block_size
 
         # Prefer tighter but feasible room fit to preserve larger rooms for heavier sections.
-        if room.capacity > 0:
+        if requires_room and room is not None and room.capacity > 0:
             soft += max(0, room.capacity - req.student_count) / room.capacity
 
         for offset in range(req.block_size):
@@ -3775,17 +5338,23 @@ class EvolutionaryScheduler:
             faculty_key = (option.day, slot_idx, option.faculty_id)
             section_key = (option.day, slot_idx, req.section)
 
-            for other_idx in room_occ.get(room_key, []):
-                other_req = self.block_requests[other_idx]
-                if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
-                    continue
-                hard += weights.room_conflict
+            if requires_room:
+                for other_idx in room_occ.get(room_key, []):
+                    other_req = self.block_requests[other_idx]
+                    if not self._request_requires_room(other_req):
+                        continue
+                    if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
+                        continue
+                    hard += weights.room_conflict
 
-            for other_idx in faculty_occ.get(faculty_key, []):
-                other_req = self.block_requests[other_idx]
-                if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
-                    continue
-                hard += weights.faculty_conflict
+            if requires_faculty:
+                for other_idx in faculty_occ.get(faculty_key, []):
+                    other_req = self.block_requests[other_idx]
+                    if not self._request_requires_faculty(other_req):
+                        continue
+                    if self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
+                        continue
+                    hard += weights.faculty_conflict
 
             for other_idx in section_occ.get(section_key, []):
                 other_req = self.block_requests[other_idx]
@@ -3827,17 +5396,19 @@ class EvolutionaryScheduler:
         req = self.block_requests[req_index]
         option = req.options[option_index]
         block_start, block_end = self._option_bounds(option, req.block_size)
-        room = self.rooms[option.room_id]
-        faculty = self.faculty[option.faculty_id]
+        requires_room = self._request_requires_room(req)
+        requires_faculty = self._request_requires_faculty(req)
+        room = self.rooms[option.room_id] if requires_room else None
+        faculty = self.faculty[option.faculty_id] if requires_faculty else None
 
         if not self._within_semester_time_window(block_start, block_end):
             return False
-        if not self._faculty_allows_day(faculty, option.day):
+        if requires_faculty and faculty is not None and not self._faculty_allows_day(faculty, option.day):
             return False
         # Relax strict capacity check to allow spillover to smaller rooms instead of forcing room conflicts
-        if req.is_lab and room.type != RoomType.lab:
+        if requires_room and room is not None and req.is_lab and room.type != RoomType.lab:
             return False
-        if not req.is_lab and room.type == RoomType.lab:
+        if requires_room and room is not None and not req.is_lab and room.type == RoomType.lab:
             return False
         if self._conflicts_reserved_resources(
             day=option.day,
@@ -3845,16 +5416,19 @@ class EvolutionaryScheduler:
             end_min=block_end,
             room_id=option.room_id,
             faculty_id=option.faculty_id,
+            check_room=requires_room,
+            check_faculty=requires_faculty,
         ):
             return False
 
         period_minutes = self.schedule_policy.period_minutes
-        projected_faculty_minutes = faculty_minutes.get(option.faculty_id, 0) + (req.block_size * period_minutes)
-        max_faculty_minutes = faculty.max_hours * 60
-        # RELAXED: We allow faculty overbooking to prevent hard conflicts (unassigned slots).
-        # The penalty function will discourage this heavily, but it's better than failure.
-        # if projected_faculty_minutes > max_faculty_minutes:
-        #     return False
+        if requires_faculty and faculty is not None:
+            projected_faculty_minutes = faculty_minutes.get(option.faculty_id, 0) + (req.block_size * period_minutes)
+            max_faculty_minutes = self._effective_faculty_max_hours(faculty) * 60
+            # RELAXED: We allow faculty overbooking to prevent hard conflicts (unassigned slots).
+            # The penalty function will discourage this heavily, but it's better than failure.
+            # if projected_faculty_minutes > max_faculty_minutes:
+            #     return False
 
         section_keys = section_slot_keys.get(req.section, set())
         projected_section_slot_count = len(section_keys)
@@ -3863,21 +5437,27 @@ class EvolutionaryScheduler:
             key = (option.day, slot_idx)
             if key not in section_keys:
                 projected_section_slot_count += 1
+        enforce_student_credit_load = True
+        if self.program_constraint is not None:
+            enforce_student_credit_load = bool(self.program_constraint.enforce_student_credit_load)
         if (
-            self.expected_section_minutes > 0
+            enforce_student_credit_load
+            and self.expected_section_minutes > 0
             and projected_section_slot_count * period_minutes > self.expected_section_minutes
         ):
             return False
 
-        faculty_windows = self.faculty_windows.get(option.faculty_id, {})
-        if faculty_windows.get(option.day):
-            if not any(start <= block_start and block_end <= end for start, end in faculty_windows[option.day]):
-                return False
+        if requires_faculty:
+            faculty_windows = self.faculty_windows.get(option.faculty_id, {})
+            if faculty_windows.get(option.day):
+                if not any(start <= block_start and block_end <= end for start, end in faculty_windows[option.day]):
+                    return False
 
-        room_windows = self.room_windows.get(option.room_id, {})
-        if room_windows.get(option.day):
-            if not any(start <= block_start and block_end <= end for start, end in room_windows[option.day]):
-                return False
+        if requires_room:
+            room_windows = self.room_windows.get(option.room_id, {})
+            if room_windows.get(option.day):
+                if not any(start <= block_start and block_end <= end for start, end in room_windows[option.day]):
+                    return False
 
         for offset in range(req.block_size):
             slot_idx = option.start_index + offset
@@ -3885,15 +5465,21 @@ class EvolutionaryScheduler:
             faculty_key = (option.day, slot_idx, option.faculty_id)
             section_key = (option.day, slot_idx, req.section)
 
-            for other_idx in room_occ.get(room_key, []):
-                other_req = self.block_requests[other_idx]
-                if not self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
-                    return False
+            if requires_room:
+                for other_idx in room_occ.get(room_key, []):
+                    other_req = self.block_requests[other_idx]
+                    if not self._request_requires_room(other_req):
+                        continue
+                    if not self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
+                        return False
 
-            for other_idx in faculty_occ.get(faculty_key, []):
-                other_req = self.block_requests[other_idx]
-                if not self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
-                    return False
+            if requires_faculty:
+                for other_idx in faculty_occ.get(faculty_key, []):
+                    other_req = self.block_requests[other_idx]
+                    if not self._request_requires_faculty(other_req):
+                        continue
+                    if not self._is_allowed_shared_overlap(req, other_req, option, selected_options[other_idx]):
+                        return False
 
             for other_idx in section_occ.get(section_key, []):
                 other_req = self.block_requests[other_idx]
@@ -3901,10 +5487,12 @@ class EvolutionaryScheduler:
                     return False
 
         # Keep one faculty per (course, section) for lecture/tutorial requests.
-        if not req.is_lab:
+        if not req.is_lab and requires_faculty:
             for other_idx, other_option in selected_options.items():
                 other_req = self.block_requests[other_idx]
                 if other_req.is_lab or other_req.course_id != req.course_id:
+                    continue
+                if not self._request_requires_faculty(other_req):
                     continue
                 if other_req.section == req.section and other_option.faculty_id != option.faculty_id:
                     return False
@@ -3984,7 +5572,7 @@ class EvolutionaryScheduler:
         period_minutes = self.schedule_policy.period_minutes
 
         remaining_faculty_minutes: dict[str, int] = {
-            faculty_id: max(0, faculty.max_hours) * 60
+            faculty_id: self._effective_faculty_max_hours(faculty) * 60
             for faculty_id, faculty in self.faculty.items()
         }
         planned_faculty_by_course_section: dict[tuple[str, str], str] = {}
@@ -3996,6 +5584,7 @@ class EvolutionaryScheduler:
                 req_index
                 for req_index in request_indices_by_course.get(course_id, [])
                 if not self.block_requests[req_index].is_lab
+                and self._request_requires_faculty(self.block_requests[req_index])
             ]
             if not lecture_indices:
                 continue
@@ -4038,8 +5627,15 @@ class EvolutionaryScheduler:
         for (course_id, section_name), req_indices in section_groups:
             if (course_id, section_name) in planned_faculty_by_course_section:
                 continue
+            applicable_req_indices = [
+                req_index
+                for req_index in req_indices
+                if self._request_requires_faculty(self.block_requests[req_index])
+            ]
+            if not applicable_req_indices:
+                continue
             required_minutes = sum(
-                self.block_requests[req_index].block_size * period_minutes for req_index in req_indices
+                self.block_requests[req_index].block_size * period_minutes for req_index in applicable_req_indices
             )
             candidate_ids = list(common_faculty_candidates_by_course_section.get((course_id, section_name), ()))
             if not candidate_ids:
@@ -4047,10 +5643,10 @@ class EvolutionaryScheduler:
                     set.intersection(
                         *[
                             {option.faculty_id for option in self.block_requests[req_index].options}
-                            for req_index in req_indices
+                            for req_index in applicable_req_indices
                         ]
                     )
-                    if req_indices
+                    if applicable_req_indices
                     else set()
                 )
             if not candidate_ids:
@@ -4080,24 +5676,32 @@ class EvolutionaryScheduler:
             remaining_faculty_minutes[selected_id] -= required_minutes
 
         def selected_faculty_for_request(req: BlockRequest) -> str | None:
-            if req.is_lab:
+            if req.is_lab or not self._request_requires_faculty(req):
                 return None
             for other_idx in request_indices_by_course_section.get((req.course_id, req.section), []):
-                if other_idx in selected_options:
-                    return selected_options[other_idx].faculty_id
+                if other_idx not in selected_options:
+                    continue
+                other_req = self.block_requests[other_idx]
+                if not self._request_requires_faculty(other_req):
+                    continue
+                return selected_options[other_idx].faculty_id
             if self._single_faculty_required(req.course_id):
                 for other_idx in request_indices_by_course.get(req.course_id, []):
                     if other_idx not in selected_options:
                         continue
                     other_req = self.block_requests[other_idx]
-                    if other_req.is_lab:
+                    if other_req.is_lab or not self._request_requires_faculty(other_req):
                         continue
                     return selected_options[other_idx].faculty_id
             return None
 
         def ordered_candidates(req_index: int) -> list[int]:
             req = self.block_requests[req_index]
-            planned_faculty_id = planned_faculty_by_course_section.get((req.course_id, req.section))
+            planned_faculty_id = (
+                planned_faculty_by_course_section.get((req.course_id, req.section))
+                if self._request_requires_faculty(req)
+                else None
+            )
 
             if req.request_id in self.fixed_genes:
                 fixed_option_index = self.fixed_genes[req.request_id]
@@ -4132,7 +5736,7 @@ class EvolutionaryScheduler:
                 all_candidate_indices = list(range(len(req.options)))
 
             fixed_faculty_id = selected_faculty_for_request(req)
-            if fixed_faculty_id is not None:
+            if fixed_faculty_id is not None and self._request_requires_faculty(req):
                 matching = [
                     option_index
                     for option_index in all_candidate_indices
@@ -4147,7 +5751,7 @@ class EvolutionaryScheduler:
                 if not matching:
                     return []
                 all_candidate_indices = matching
-            elif planned_faculty_id is not None:
+            elif planned_faculty_id is not None and self._request_requires_faculty(req):
                 planned_matches = [
                     option_index
                     for option_index in all_candidate_indices
@@ -4257,13 +5861,15 @@ class EvolutionaryScheduler:
                     faculty_minutes=faculty_minutes,
                     section_slot_keys=section_slot_keys,
                 )
-                room = self.rooms[req.options[option_index].room_id]
                 capacity_waste = 0.0
-                if room.capacity >= req.student_count:
-                    capacity_waste = (room.capacity - req.student_count) / max(1, room.capacity)
+                if self._request_requires_room(req):
+                    room = self.rooms[req.options[option_index].room_id]
+                    if room.capacity >= req.student_count:
+                        capacity_waste = (room.capacity - req.student_count) / max(1, room.capacity)
                 final_score = (hard_score * 10000.0) + soft_score + (capacity_waste * 0.5)
                 if (
                     not req.is_lab
+                    and self._request_requires_faculty(req)
                     and planned_faculty_id is not None
                     and req.options[option_index].faculty_id != planned_faculty_id
                 ):
@@ -4530,7 +6136,7 @@ class EvolutionaryScheduler:
             if req.request_id in self.fixed_genes:
                 chosen_index = self.fixed_genes[req.request_id]
                 genes[req_index] = chosen_index
-                if not req.is_lab:
+                if not req.is_lab and self._request_requires_faculty(req):
                     selected_faculty_id = req.options[chosen_index].faculty_id
                     chosen_faculty_by_course_section[(req.course_id, req.section)] = selected_faculty_id
                     if self._single_faculty_required(req.course_id):
@@ -4563,7 +6169,7 @@ class EvolutionaryScheduler:
             if not all_candidate_indices:
                 all_candidate_indices = list(range(len(req.options)))
 
-            if not req.is_lab:
+            if not req.is_lab and self._request_requires_faculty(req):
                 selected_faculty_id = chosen_faculty_by_course_section.get((req.course_id, req.section))
                 if selected_faculty_id is None and self._single_faculty_required(req.course_id):
                     selected_faculty_id = chosen_faculty_by_course.get(req.course_id)
@@ -4644,10 +6250,11 @@ class EvolutionaryScheduler:
                     section_slot_keys=section_slot_keys,
                 )
                 
-                room = self.rooms[req.options[opt_idx].room_id]
                 capacity_waste = 0.0
-                if room.capacity >= req.student_count:
-                    capacity_waste = (room.capacity - req.student_count) / max(1, room.capacity)
+                if self._request_requires_room(req):
+                    room = self.rooms[req.options[opt_idx].room_id]
+                    if room.capacity >= req.student_count:
+                        capacity_waste = (room.capacity - req.student_count) / max(1, room.capacity)
                 
                 # Heuristic Weighting
                 final_score = (hard_score * 10000.0) + soft_score + (capacity_waste * 0.5)
@@ -4668,7 +6275,7 @@ class EvolutionaryScheduler:
                 chosen_index = scored_candidates[0][1]
                 
             genes[req_index] = chosen_index
-            if not req.is_lab:
+            if not req.is_lab and self._request_requires_faculty(req):
                 selected_faculty_id = req.options[chosen_index].faculty_id
                 chosen_faculty_by_course_section[(req.course_id, req.section)] = selected_faculty_id
                 if self._single_faculty_required(req.course_id):
@@ -4707,6 +6314,8 @@ class EvolutionaryScheduler:
     ):
         req = self.block_requests[req_index]
         option = req.options[option_index]
+        requires_room = self._request_requires_room(req)
+        requires_faculty = self._request_requires_faculty(req)
         selected_options[req_index] = option
         
         if req.is_lab:
@@ -4723,14 +6332,17 @@ class EvolutionaryScheduler:
             room_key = (option.day, slot_idx, option.room_id)
             faculty_key = (option.day, slot_idx, option.faculty_id)
             section_key = (option.day, slot_idx, req.section)
-            
-            room_occ[room_key].append(req_index)
-            faculty_occ[faculty_key].append(req_index)
+
+            if requires_room:
+                room_occ[room_key].append(req_index)
+            if requires_faculty:
+                faculty_occ[faculty_key].append(req_index)
             section_occ[section_key].append(req_index)
             section_slot_keys[req.section].add((option.day, slot_idx))
-        
-        added_minutes = req.block_size * self.schedule_policy.period_minutes
-        faculty_minutes[option.faculty_id] = faculty_minutes.get(option.faculty_id, 0) + added_minutes
+
+        if requires_faculty:
+            added_minutes = req.block_size * self.schedule_policy.period_minutes
+            faculty_minutes[option.faculty_id] = faculty_minutes.get(option.faculty_id, 0) + added_minutes
 
     def _unrecord_selection(
         self,
@@ -4748,6 +6360,8 @@ class EvolutionaryScheduler:
     ) -> None:
         req = self.block_requests[req_index]
         option = req.options[option_index]
+        requires_room = self._request_requires_room(req)
+        requires_faculty = self._request_requires_faculty(req)
         selected_options.pop(req_index, None)
 
         if req.is_lab:
@@ -4790,17 +6404,19 @@ class EvolutionaryScheduler:
             faculty_key = (option.day, slot_idx, option.faculty_id)
             section_key = (option.day, slot_idx, req.section)
 
-            room_entries = room_occ.get(room_key, [])
-            if req_index in room_entries:
-                room_entries.remove(req_index)
-            if not room_entries:
-                room_occ.pop(room_key, None)
+            if requires_room:
+                room_entries = room_occ.get(room_key, [])
+                if req_index in room_entries:
+                    room_entries.remove(req_index)
+                if not room_entries:
+                    room_occ.pop(room_key, None)
 
-            faculty_entries = faculty_occ.get(faculty_key, [])
-            if req_index in faculty_entries:
-                faculty_entries.remove(req_index)
-            if not faculty_entries:
-                faculty_occ.pop(faculty_key, None)
+            if requires_faculty:
+                faculty_entries = faculty_occ.get(faculty_key, [])
+                if req_index in faculty_entries:
+                    faculty_entries.remove(req_index)
+                if not faculty_entries:
+                    faculty_occ.pop(faculty_key, None)
 
             section_entries = section_occ.get(section_key, [])
             if req_index in section_entries:
@@ -4812,12 +6428,13 @@ class EvolutionaryScheduler:
         if req.section in section_slot_keys and not section_slot_keys[req.section]:
             section_slot_keys.pop(req.section, None)
 
-        removed_minutes = req.block_size * self.schedule_policy.period_minutes
-        updated_minutes = faculty_minutes.get(option.faculty_id, 0) - removed_minutes
-        if updated_minutes > 0:
-            faculty_minutes[option.faculty_id] = updated_minutes
-        else:
-            faculty_minutes.pop(option.faculty_id, None)
+        if requires_faculty:
+            removed_minutes = req.block_size * self.schedule_policy.period_minutes
+            updated_minutes = faculty_minutes.get(option.faculty_id, 0) - removed_minutes
+            if updated_minutes > 0:
+                faculty_minutes[option.faculty_id] = updated_minutes
+            else:
+                faculty_minutes.pop(option.faculty_id, None)
 
 
     def _perturb_individual(self, genes: list[int], *, intensity: float) -> list[int]:
@@ -4852,36 +6469,40 @@ class EvolutionaryScheduler:
 
     @staticmethod
     def _dominates_eval(left: EvaluationResult, right: EvaluationResult) -> bool:
+        left_obj = EvolutionaryScheduler._objective_values(left)
+        right_obj = EvolutionaryScheduler._objective_values(right)
         return (
-            left.hard_conflicts <= right.hard_conflicts
-            and left.soft_penalty <= right.soft_penalty
-            and (
-                left.hard_conflicts < right.hard_conflicts
-                or left.soft_penalty < right.soft_penalty
-            )
+            all(left_value <= right_value for left_value, right_value in zip(left_obj, right_obj))
+            and any(left_value < right_value for left_value, right_value in zip(left_obj, right_obj))
         )
 
     @staticmethod
     def _is_better_eval(left: EvaluationResult, right: EvaluationResult) -> bool:
+        left_obj = EvolutionaryScheduler._objective_values(left)
+        right_obj = EvolutionaryScheduler._objective_values(right)
+        if left_obj != right_obj:
+            return left_obj < right_obj
+        return left.fitness > right.fitness
+
+    @staticmethod
+    def _objective_values(evaluation: EvaluationResult) -> tuple[float, float, float]:
+        default = (0.0, 0.0, 0.0)
+        if evaluation.objectives != default:
+            return (
+                float(evaluation.objectives[0]),
+                float(evaluation.objectives[1]),
+                float(evaluation.objectives[2]),
+            )
         return (
-            left.hard_conflicts < right.hard_conflicts
-            or (
-                left.hard_conflicts == right.hard_conflicts
-                and left.soft_penalty < right.soft_penalty
-            )
-            or (
-                left.hard_conflicts == right.hard_conflicts
-                and left.soft_penalty == right.soft_penalty
-                and left.fitness > right.fitness
-            )
+            float(evaluation.hard_conflicts),
+            float(evaluation.soft_penalty),
+            float(max(0.0, -evaluation.fitness)),
         )
 
     @staticmethod
     def _annealing_energy(evaluation: EvaluationResult) -> float:
-        hard_component = evaluation.hard_conflicts * 10_000.0
-        soft_component = evaluation.soft_penalty
-        tie_break = max(0.0, -evaluation.fitness) * 0.01
-        return hard_component + soft_component + tie_break
+        objective_1, objective_2, objective_3 = EvolutionaryScheduler._objective_values(evaluation)
+        return (objective_1 * 10_000.0) + objective_2 + (objective_3 * 5.0)
 
     def _payload_fingerprint(self, payload: OfficialTimetablePayload) -> tuple[tuple[str, ...], ...]:
         return tuple(
@@ -4893,6 +6514,7 @@ class EvolutionaryScheduler:
                     slot.courseId,
                     slot.roomId,
                     slot.facultyId,
+                    ",".join(sorted(slot.assistant_faculty_ids or [])),
                     slot.section,
                     slot.batch or "",
                     slot.sessionType or "",
@@ -4901,321 +6523,215 @@ class EvolutionaryScheduler:
             )
         )
 
-    def _run_hybrid_search(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
-        start = perf_counter()
-        archive: list[tuple[EvaluationResult, list[int]]] = []
-        seen_genotypes: set[tuple[int, ...]] = set()
-        archive_limit = min(120, max(24, request.alternative_count * 24))
-        block_count = len(self.block_requests)
+    def _non_dominated_sort(
+        self,
+        evaluations: list[EvaluationResult],
+    ) -> tuple[list[list[int]], dict[int, int]]:
+        if not evaluations:
+            return [], {}
 
-        def add_candidate(candidate_genes: list[int], *, repair_passes: int) -> None:
-            repaired = self._repair_individual(list(candidate_genes), max_passes=repair_passes)
-            key = tuple(repaired)
-            if key in seen_genotypes:
-                return
-            seen_genotypes.add(key)
+        domination_sets: list[set[int]] = [set() for _ in evaluations]
+        dominated_counts = [0] * len(evaluations)
+        fronts: list[list[int]] = [[]]
 
-            evaluation = self._evaluate(repaired)
-            survivors: list[tuple[EvaluationResult, list[int]]] = []
-            for existing_eval, existing_genes in archive:
-                if self._dominates_eval(existing_eval, evaluation):
-                    return
-                if not self._dominates_eval(evaluation, existing_eval):
-                    survivors.append((existing_eval, existing_genes))
-            survivors.append((evaluation, repaired))
-            survivors.sort(key=lambda item: (item[0].hard_conflicts, item[0].soft_penalty, -item[0].fitness))
-            archive[:] = survivors[:archive_limit]
+        for left_index in range(len(evaluations)):
+            left_eval = evaluations[left_index]
+            for right_index in range(left_index + 1, len(evaluations)):
+                right_eval = evaluations[right_index]
+                if self._dominates_eval(left_eval, right_eval):
+                    domination_sets[left_index].add(right_index)
+                    dominated_counts[right_index] += 1
+                elif self._dominates_eval(right_eval, left_eval):
+                    domination_sets[right_index].add(left_index)
+                    dominated_counts[left_index] += 1
 
-        constructive_trials = min(64, max(10, self.settings.population_size // 3))
-        if block_count >= 220:
-            constructive_trials = min(constructive_trials, 6)
-        elif block_count >= 160:
-            constructive_trials = min(constructive_trials, 10)
-        elif block_count >= 120:
-            constructive_trials = min(constructive_trials, 14)
-        elif block_count >= 80:
-            constructive_trials = min(constructive_trials, 20)
-        for trial in range(constructive_trials):
-            add_candidate(
-                self._constructive_individual(
-                    randomized=trial > 0,
-                    rcl_alpha=0.10 + (0.30 * (trial / max(1, constructive_trials))),
-                ),
-                repair_passes=2 if trial < 4 else 1,
-            )
+            if dominated_counts[left_index] == 0:
+                fronts[0].append(left_index)
 
-        if not archive:
-            add_candidate(self._random_individual(), repair_passes=2)
+        rank_by_index: dict[int, int] = {}
+        front_cursor = 0
+        while front_cursor < len(fronts) and fronts[front_cursor]:
+            next_front: list[int] = []
+            for current_index in fronts[front_cursor]:
+                rank_by_index[current_index] = front_cursor
+                for dominated_index in domination_sets[current_index]:
+                    dominated_counts[dominated_index] -= 1
+                    if dominated_counts[dominated_index] == 0:
+                        next_front.append(dominated_index)
+            if next_front:
+                fronts.append(next_front)
+            front_cursor += 1
 
-        local_iterations = min(180, max(36, self.settings.generations // 2))
-        if block_count >= 220:
-            local_iterations = min(local_iterations, 16)
-        elif block_count >= 160:
-            local_iterations = min(local_iterations, 26)
-        elif block_count >= 120:
-            local_iterations = min(local_iterations, 42)
-        elif block_count >= 80:
-            local_iterations = min(local_iterations, 60)
-        else:
-            local_iterations = min(local_iterations, 90)
-        for iteration in range(local_iterations):
-            if not archive:
-                break
-            if (
-                archive[0][0].hard_conflicts == 0
-                and len(archive) >= max(4, request.alternative_count)
-                and iteration >= max(6, local_iterations // 4)
+        return fronts, rank_by_index
+
+    def _crowding_distances(
+        self,
+        front: list[int],
+        evaluations: list[EvaluationResult],
+    ) -> dict[int, float]:
+        if not front:
+            return {}
+        if len(front) <= 2:
+            return {index: float("inf") for index in front}
+
+        distances = {index: 0.0 for index in front}
+        objectives = (
+            lambda idx: self._objective_values(evaluations[idx])[0],
+            lambda idx: self._objective_values(evaluations[idx])[1],
+            lambda idx: self._objective_values(evaluations[idx])[2],
+        )
+
+        for objective in objectives:
+            ordered = sorted(front, key=objective)
+            distances[ordered[0]] = float("inf")
+            distances[ordered[-1]] = float("inf")
+
+            minimum = objective(ordered[0])
+            maximum = objective(ordered[-1])
+            span = maximum - minimum
+            if span <= 1e-9:
+                continue
+
+            for position in range(1, len(ordered) - 1):
+                index = ordered[position]
+                if math.isinf(distances[index]):
+                    continue
+                previous_value = objective(ordered[position - 1])
+                next_value = objective(ordered[position + 1])
+                distances[index] += (next_value - previous_value) / span
+
+        return distances
+
+    def _moea_parent_better(
+        self,
+        left_index: int,
+        right_index: int,
+        *,
+        evaluations: list[EvaluationResult],
+        rank_by_index: dict[int, int],
+        crowding_by_index: dict[int, float],
+    ) -> bool:
+        left_rank = rank_by_index.get(left_index, math.inf)
+        right_rank = rank_by_index.get(right_index, math.inf)
+        if left_rank != right_rank:
+            return left_rank < right_rank
+
+        left_crowding = crowding_by_index.get(left_index, 0.0)
+        right_crowding = crowding_by_index.get(right_index, 0.0)
+        if left_crowding != right_crowding:
+            return left_crowding > right_crowding
+
+        return self._is_better_eval(evaluations[left_index], evaluations[right_index])
+
+    def _select_moea_parent(
+        self,
+        population: list[list[int]],
+        evaluations: list[EvaluationResult],
+        rank_by_index: dict[int, int],
+        crowding_by_index: dict[int, float],
+    ) -> list[int]:
+        tournament_size = min(self.settings.tournament_size, len(population))
+        contenders = self.random.sample(range(len(population)), tournament_size)
+        best_index = contenders[0]
+        for contender_index in contenders[1:]:
+            if self._moea_parent_better(
+                contender_index,
+                best_index,
+                evaluations=evaluations,
+                rank_by_index=rank_by_index,
+                crowding_by_index=crowding_by_index,
             ):
-                break
+                best_index = contender_index
+        return list(population[best_index])
 
-            archive.sort(key=lambda item: (item[0].hard_conflicts, item[0].soft_penalty, -item[0].fitness))
-            elite_window = max(1, min(len(archive), max(3, self.settings.elite_count)))
-            base_eval, base_genes = archive[self.random.randrange(elite_window)]
-            candidate = list(base_genes)
+    def _add_pareto_candidate(
+        self,
+        archive: list[tuple[EvaluationResult, list[int]]],
+        seen_genotypes: set[tuple[int, ...]],
+        *,
+        genes: list[int],
+        evaluation: EvaluationResult,
+        archive_limit: int,
+    ) -> None:
+        key = tuple(genes)
+        if key in seen_genotypes:
+            return
+        seen_genotypes.add(key)
 
-            intensity = 0.03 + (0.15 * (iteration / max(1, local_iterations)))
-            candidate = self._perturb_individual(candidate, intensity=intensity)
+        survivors: list[tuple[EvaluationResult, list[int]]] = []
+        for existing_eval, existing_genes in archive:
+            if self._dominates_eval(existing_eval, evaluation):
+                return
+            if not self._dominates_eval(evaluation, existing_eval):
+                survivors.append((existing_eval, existing_genes))
+        survivors.append((evaluation, list(genes)))
+        survivors.sort(key=lambda item: self._eval_sort_key(item[0]))
+        archive[:] = survivors[:archive_limit]
 
-            mutation_boost = 1.3 if base_eval.hard_conflicts > 0 else 1.0
-            mutation_rate = min(0.35, self.settings.mutation_rate * mutation_boost)
-            if self.random.random() < 0.65:
-                candidate = self._mutate(candidate, mutation_rate=mutation_rate)
+    def _simulated_annealing_refine(
+        self,
+        seed_genes: list[int],
+        seed_evaluation: EvaluationResult,
+        *,
+        iterations: int,
+    ) -> tuple[list[int], EvaluationResult]:
+        current_genes = list(seed_genes)
+        current_eval = seed_evaluation
+        best_genes = list(seed_genes)
+        best_eval = seed_evaluation
 
-            if len(archive) > 1 and self.random.random() < min(0.85, self.settings.crossover_rate + 0.1):
-                mate = archive[self.random.randrange(len(archive))][1]
-                candidate = self._crossover(candidate, mate)
-
-            add_candidate(
-                candidate,
-                repair_passes=2 if (iteration % 7 == 0 or base_eval.hard_conflicts > 0) else 1,
-            )
-
-        ranked = sorted(archive, key=lambda item: (item[0].hard_conflicts, item[0].soft_penalty, -item[0].fitness))
-        alternatives: list[GeneratedAlternative] = []
-        seen_fingerprints: set[tuple[tuple[str, ...], ...]] = set()
-        intensive_budget = (
-            max(2, request.alternative_count * 2)
-            if block_count >= 180
-            else max(4, request.alternative_count * 4)
-        )
-        intensive_step_cap = self._intensive_repair_step_cap()
-
-        for evaluation, genes in ranked:
-            best_genes = genes
-            best_eval = evaluation
-            if best_eval.hard_conflicts > 0 and intensive_budget > 0:
-                intensive_budget -= 1
-                intensified_genes, intensified_eval = self._intensive_conflict_repair(
-                    list(best_genes),
-                    max_steps=intensive_step_cap,
-                )
-                if self._is_better_eval(intensified_eval, best_eval):
-                    best_genes = intensified_genes
-                    best_eval = intensified_eval
-
-            payload = self._decode_payload(best_genes)
-            fingerprint = self._payload_fingerprint(payload)
-            if fingerprint in seen_fingerprints:
-                continue
-            seen_fingerprints.add(fingerprint)
-            alternatives.append(
-                GeneratedAlternative(
-                    rank=len(alternatives) + 1,
-                    fitness=best_eval.fitness,
-                    hard_conflicts=best_eval.hard_conflicts,
-                    soft_penalty=best_eval.soft_penalty,
-                    payload=payload,
-                )
-            )
-            if len(alternatives) >= request.alternative_count:
-                break
-
-        attempts = 0
-        while len(alternatives) < request.alternative_count and attempts < request.alternative_count * 18:
-            attempts += 1
-            candidate_genes = self._repair_individual(
-                self._constructive_individual(randomized=True, rcl_alpha=0.35),
-                max_passes=1,
-            )
-            candidate_eval = self._evaluate(candidate_genes)
-            if candidate_eval.hard_conflicts > 0 and intensive_budget > 0:
-                intensive_budget -= 1
-                candidate_genes, candidate_eval = self._intensive_conflict_repair(
-                    candidate_genes,
-                    max_steps=intensive_step_cap,
-                )
-            payload = self._decode_payload(candidate_genes)
-            fingerprint = self._payload_fingerprint(payload)
-            if fingerprint in seen_fingerprints:
-                continue
-            seen_fingerprints.add(fingerprint)
-            alternatives.append(
-                GeneratedAlternative(
-                    rank=len(alternatives) + 1,
-                    fitness=candidate_eval.fitness,
-                    hard_conflicts=candidate_eval.hard_conflicts,
-                    soft_penalty=candidate_eval.soft_penalty,
-                    payload=payload,
-                )
-            )
-
-        if not alternatives:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Generation did not produce any alternatives",
-            )
-
-        runtime_ms = int((perf_counter() - start) * 1000)
-        return GenerateTimetableResponse(
-            alternatives=alternatives,
-            settings_used=self.settings,
-            runtime_ms=runtime_ms,
-        )
-
-    def _run_simulated_annealing(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
-        start = perf_counter()
-        archive: list[tuple[EvaluationResult, list[int]]] = []
-        seen_genotypes: set[tuple[int, ...]] = set()
-        archive_limit = min(140, max(28, request.alternative_count * 28))
-
-        def add_candidate(candidate_genes: list[int], *, repair_passes: int) -> EvaluationResult:
-            repaired = self._repair_individual(list(candidate_genes), max_passes=repair_passes)
-            key = tuple(repaired)
-            if key in seen_genotypes:
-                return self._evaluate(repaired)
-            seen_genotypes.add(key)
-
-            evaluation = self._evaluate(repaired)
-            survivors: list[tuple[EvaluationResult, list[int]]] = []
-            for existing_eval, existing_genes in archive:
-                if self._dominates_eval(existing_eval, evaluation):
-                    return evaluation
-                if not self._dominates_eval(evaluation, existing_eval):
-                    survivors.append((existing_eval, existing_genes))
-            survivors.append((evaluation, repaired))
-            survivors.sort(key=lambda item: (item[0].hard_conflicts, item[0].soft_penalty, -item[0].fitness))
-            archive[:] = survivors[:archive_limit]
-            return evaluation
-
-        seed_trials = min(20, max(6, request.alternative_count * 4))
-        current_genes: list[int] | None = None
-        current_eval: EvaluationResult | None = None
-        best_genes: list[int] | None = None
-        best_eval: EvaluationResult | None = None
-
-        for trial in range(seed_trials):
-            candidate = self._constructive_individual(
-                randomized=trial > 0,
-                rcl_alpha=0.10 + (0.30 * (trial / max(1, seed_trials))),
-            )
-            evaluation = add_candidate(candidate, repair_passes=2 if trial < 3 else 1)
-            if current_genes is None:
-                current_genes = self._repair_individual(list(candidate), max_passes=1)
-                current_eval = self._evaluate(current_genes)
-                best_genes = list(current_genes)
-                best_eval = current_eval
-            elif best_eval is not None and self._is_better_eval(evaluation, best_eval):
-                best_genes = self._repair_individual(list(candidate), max_passes=1)
-                best_eval = self._evaluate(best_genes)
-
-        if current_genes is None or current_eval is None or best_genes is None or best_eval is None:
-            current_genes = self._repair_individual(self._random_individual(), max_passes=2)
-            current_eval = self._evaluate(current_genes)
-            best_genes = list(current_genes)
-            best_eval = current_eval
-            add_candidate(current_genes, repair_passes=0)
-
-        block_count = len(self.block_requests)
-        iterations = self.settings.annealing_iterations
-        if block_count >= 220:
-            iterations = min(iterations, 80)
-        elif block_count >= 160:
-            iterations = min(iterations, 140)
-        elif block_count >= 120:
-            iterations = min(iterations, 220)
-        elif block_count >= 80:
-            iterations = min(iterations, 320)
-        else:
-            iterations = min(iterations, 480)
         temperature = max(0.05, self.settings.annealing_initial_temperature)
         cooling_rate = self.settings.annealing_cooling_rate
-        stagnant_steps = 0
+        local_iterations = max(12, iterations)
 
-        for step in range(iterations):
-            progress = step / max(1, iterations - 1)
-            intensity = min(0.35, 0.03 + (0.18 * progress) + min(0.10, stagnant_steps * 0.002))
+        for step in range(local_iterations):
+            progress = step / max(1, local_iterations - 1)
+            intensity = min(0.38, 0.03 + (0.18 * progress))
             candidate = self._perturb_individual(current_genes, intensity=intensity)
 
-            mutation_scale = 1.35 if current_eval.hard_conflicts > 0 else 1.0
-            mutation_rate = min(0.40, self.settings.mutation_rate * mutation_scale)
-            if self.random.random() < 0.8:
+            if self.random.random() < 0.85:
+                mutation_scale = 1.35 if current_eval.hard_conflicts > 0 else 1.0
+                mutation_rate = min(0.45, self.settings.mutation_rate * mutation_scale)
                 candidate = self._mutate(candidate, mutation_rate=mutation_rate)
-            if self.random.random() < 0.22 or current_eval.hard_conflicts > 0:
+            if self.random.random() < 0.25 or current_eval.hard_conflicts > 0:
                 candidate = self._repair_individual(candidate, max_passes=1)
 
             candidate_eval = self._evaluate(candidate)
-            current_energy = self._annealing_energy(current_eval)
-            candidate_energy = self._annealing_energy(candidate_eval)
-            delta = candidate_energy - current_energy
-
-            accept = False
+            delta = self._annealing_energy(candidate_eval) - self._annealing_energy(current_eval)
             if delta <= 0:
-                accept = True
-            else:
-                probability = math.exp(-delta / max(temperature, 1e-9))
-                accept = self.random.random() < probability
-
-            if accept:
                 current_genes = candidate
                 current_eval = candidate_eval
-                stagnant_steps = 0 if delta < 0 else stagnant_steps + 1
             else:
-                stagnant_steps += 1
+                acceptance_probability = math.exp(-delta / max(temperature, 1e-9))
+                if self.random.random() < acceptance_probability:
+                    current_genes = candidate
+                    current_eval = candidate_eval
 
-            add_candidate(candidate, repair_passes=0)
             if self._is_better_eval(candidate_eval, best_eval):
                 best_genes = list(candidate)
                 best_eval = candidate_eval
 
-            if step % 45 == 0:
-                probe = self._constructive_individual(randomized=True, rcl_alpha=0.30)
-                probe_eval = add_candidate(probe, repair_passes=1)
-                if self._is_better_eval(probe_eval, best_eval):
-                    best_genes = self._repair_individual(list(probe), max_passes=1)
-                    best_eval = self._evaluate(best_genes)
-                if self._is_better_eval(probe_eval, current_eval):
-                    current_genes = self._repair_individual(list(probe), max_passes=1)
-                    current_eval = self._evaluate(current_genes)
-                    stagnant_steps = 0
-
-            if stagnant_steps >= 120:
-                restart = self._constructive_individual(randomized=True, rcl_alpha=0.35)
-                current_genes = self._repair_individual(restart, max_passes=1)
-                current_eval = self._evaluate(current_genes)
-                add_candidate(current_genes, repair_passes=0)
-                stagnant_steps = 0
-                temperature = max(
-                    temperature,
-                    self.settings.annealing_initial_temperature * 0.45,
-                )
-
             temperature *= cooling_rate
-            if temperature < 0.03:
-                temperature = max(
-                    0.05,
-                    self.settings.annealing_initial_temperature * (0.30 + (0.20 * self.random.random())),
-                )
-            if (
-                best_eval.hard_conflicts == 0
-                and len(archive) >= max(4, request.alternative_count)
-                and step >= max(30, int(iterations * 0.35))
-            ):
+            if temperature < 0.02:
+                temperature = max(0.05, self.settings.annealing_initial_temperature * 0.30)
+
+            if best_eval.hard_conflicts == 0 and step >= max(10, local_iterations // 3):
                 break
 
-        add_candidate(best_genes, repair_passes=0)
-        ranked = sorted(archive, key=lambda item: (item[0].hard_conflicts, item[0].soft_penalty, -item[0].fitness))
+        return best_genes, best_eval
+
+    def _build_response_from_archive(
+        self,
+        *,
+        request: GenerateTimetableRequest,
+        start_time: float,
+        archive: list[tuple[EvaluationResult, list[int]]],
+        block_count: int,
+        fallback_attempt_multiplier: int,
+    ) -> GenerateTimetableResponse:
+        ranked = sorted(archive, key=lambda item: self._eval_sort_key(item[0]))
         alternatives: list[GeneratedAlternative] = []
-        seen_fingerprints: set[tuple[tuple[str, ...], ...]] = set()
+        seen_fingerprints: set[str] = set()
         intensive_budget = (
             max(2, request.alternative_count * 2)
             if block_count >= 180
@@ -5224,29 +6740,30 @@ class EvolutionaryScheduler:
         intensive_step_cap = self._intensive_repair_step_cap()
 
         for evaluation, genes in ranked:
-            best_genes_local = genes
-            best_eval_local = evaluation
-            if best_eval_local.hard_conflicts > 0 and intensive_budget > 0:
+            candidate_genes = list(genes)
+            candidate_eval = evaluation
+            if candidate_eval.hard_conflicts > 0 and intensive_budget > 0:
                 intensive_budget -= 1
                 intensified_genes, intensified_eval = self._intensive_conflict_repair(
-                    list(best_genes_local),
+                    candidate_genes,
                     max_steps=intensive_step_cap,
                 )
-                if self._is_better_eval(intensified_eval, best_eval_local):
-                    best_genes_local = intensified_genes
-                    best_eval_local = intensified_eval
+                if self._is_better_eval(intensified_eval, candidate_eval):
+                    candidate_genes = intensified_genes
+                    candidate_eval = intensified_eval
 
-            payload = self._decode_payload(best_genes_local)
+            payload = self._decode_payload(candidate_genes)
             fingerprint = self._payload_fingerprint(payload)
-            if fingerprint in seen_fingerprints:
+            fingerprint_key = repr(fingerprint)
+            if fingerprint_key in seen_fingerprints:
                 continue
-            seen_fingerprints.add(fingerprint)
+            seen_fingerprints.add(fingerprint_key)
             alternatives.append(
                 GeneratedAlternative(
                     rank=len(alternatives) + 1,
-                    fitness=best_eval_local.fitness,
-                    hard_conflicts=best_eval_local.hard_conflicts,
-                    soft_penalty=best_eval_local.soft_penalty,
+                    fitness=candidate_eval.fitness,
+                    hard_conflicts=candidate_eval.hard_conflicts,
+                    soft_penalty=candidate_eval.soft_penalty,
                     payload=payload,
                 )
             )
@@ -5254,12 +6771,13 @@ class EvolutionaryScheduler:
                 break
 
         attempts = 0
-        while len(alternatives) < request.alternative_count and attempts < request.alternative_count * 20:
+        max_attempts = request.alternative_count * fallback_attempt_multiplier
+        while len(alternatives) < request.alternative_count and attempts < max_attempts:
             attempts += 1
-            candidate_genes = self._repair_individual(
-                self._constructive_individual(randomized=True, rcl_alpha=0.35),
-                max_passes=1,
-            )
+            seed = self._constructive_individual(randomized=True, rcl_alpha=0.35)
+            if seed is None:
+                seed = self._random_individual()
+            candidate_genes = self._repair_individual(seed, max_passes=1)
             candidate_eval = self._evaluate(candidate_genes)
             if candidate_eval.hard_conflicts > 0 and intensive_budget > 0:
                 intensive_budget -= 1
@@ -5269,9 +6787,10 @@ class EvolutionaryScheduler:
                 )
             payload = self._decode_payload(candidate_genes)
             fingerprint = self._payload_fingerprint(payload)
-            if fingerprint in seen_fingerprints:
+            fingerprint_key = repr(fingerprint)
+            if fingerprint_key in seen_fingerprints:
                 continue
-            seen_fingerprints.add(fingerprint)
+            seen_fingerprints.add(fingerprint_key)
             alternatives.append(
                 GeneratedAlternative(
                     rank=len(alternatives) + 1,
@@ -5288,169 +6807,339 @@ class EvolutionaryScheduler:
                 detail="Generation did not produce any alternatives",
             )
 
-        runtime_ms = int((perf_counter() - start) * 1000)
+        runtime_ms = int((perf_counter() - start_time) * 1000)
         return GenerateTimetableResponse(
             alternatives=alternatives,
             settings_used=self.settings,
             runtime_ms=runtime_ms,
         )
 
-    def _payload_fingerprint(self, payload: OfficialTimetablePayload) -> tuple:
-        return tuple(
-            sorted(
-                (
-                    slot.day,
-                    slot.startTime,
-                    slot.endTime,
-                    slot.courseId,
-                    slot.roomId,
-                    slot.facultyId,
-                    slot.section,
-                    slot.batch or "",
-                    slot.sessionType or "",
-                )
-                for slot in payload.timetable_data
+    def _run_moea_search(
+        self,
+        request: GenerateTimetableRequest,
+        *,
+        use_simulated_annealing: bool,
+        auto_tune: bool = True,
+    ) -> GenerateTimetableResponse:
+        start = perf_counter()
+        solver_strategy = str(getattr(self.settings, "solver_strategy", "") or "").strip().lower()
+        can_auto_tune = auto_tune and all(
+            hasattr(self, attr)
+            for attr in ("program_id", "term_number", "expected_section_minutes", "block_requests", "day_slots")
+        ) and solver_strategy != "fast"
+        self._report_progress(
+            stage="initialization",
+            progress_percent=0.0,
+            message="Preparing MOEA-SA optimizer.",
+            metrics={"auto_tune_enabled": can_auto_tune, "sa_enabled": use_simulated_annealing},
+        )
+        if can_auto_tune:
+            self._tune_hyperparameters_with_ga(request)
+
+        block_count = len(self.block_requests)
+        population = self._build_initial_population()
+        if not population:
+            population = [self._repair_individual(self._random_individual(), max_passes=1)]
+
+        evaluations = [self._evaluate(genes) for genes in population]
+        archive: list[tuple[EvaluationResult, list[int]]] = []
+        seen_genotypes: set[tuple[int, ...]] = set()
+        archive_limit = min(180, max(36, request.alternative_count * 36))
+        for genes, evaluation in zip(population, evaluations):
+            self._add_pareto_candidate(
+                archive,
+                seen_genotypes,
+                genes=genes,
+                evaluation=evaluation,
+                archive_limit=archive_limit,
             )
+
+        generation_cap = self.settings.generations
+        if block_count >= 220:
+            generation_cap = min(generation_cap, 24)
+        elif block_count >= 160:
+            generation_cap = min(generation_cap, 36)
+        elif block_count >= 120:
+            generation_cap = min(generation_cap, 54)
+        elif block_count >= 80:
+            generation_cap = min(generation_cap, 78)
+        else:
+            generation_cap = min(generation_cap, 120)
+        generation_cap = max(8, generation_cap)
+
+        sa_iterations = max(16, self.settings.annealing_iterations // 8)
+        if block_count >= 220:
+            sa_iterations = min(sa_iterations, 28)
+        elif block_count >= 160:
+            sa_iterations = min(sa_iterations, 36)
+        elif block_count >= 120:
+            sa_iterations = min(sa_iterations, 48)
+        elif block_count >= 80:
+            sa_iterations = min(sa_iterations, 64)
+        else:
+            sa_iterations = min(sa_iterations, 90)
+
+        search_wall_time_limit_seconds = self._search_wall_time_limit_seconds(block_count)
+        search_started_at = perf_counter()
+        search_deadline = search_started_at + search_wall_time_limit_seconds
+
+        best_eval = min(evaluations, key=self._eval_sort_key)
+        stagnant = 0
+        termination_reason = "generation_budget_exhausted"
+        best_genes = list(population[min(range(len(population)), key=lambda idx: self._eval_sort_key(evaluations[idx]))])
+
+        self._report_progress(
+            stage="search",
+            progress_percent=35.0,
+            message="Starting MOEA exploration and SA exploitation.",
+            metrics={
+                "population_size": self.settings.population_size,
+                "generation_cap": generation_cap,
+                "annealing_iterations": sa_iterations,
+                "search_wall_time_limit_seconds": search_wall_time_limit_seconds,
+            },
+            best_genes=best_genes,
+            best_evaluation=best_eval,
+        )
+
+        for generation in range(generation_cap):
+            if perf_counter() >= search_deadline:
+                termination_reason = "wall_time_budget_exhausted"
+                elapsed_seconds = perf_counter() - search_started_at
+                self._report_progress(
+                    stage="search",
+                    level="warn",
+                    progress_percent=90.0,
+                    message=(
+                        "MOEA-SA wall-time budget reached. "
+                        "Stopping with the best feasible archive found so far."
+                    ),
+                    metrics={
+                        "generation_index": generation,
+                        "elapsed_seconds": round(elapsed_seconds, 2),
+                        "search_wall_time_limit_seconds": search_wall_time_limit_seconds,
+                        "hard_conflicts": best_eval.hard_conflicts,
+                        "soft_penalty": round(best_eval.soft_penalty, 4),
+                        "fitness": round(best_eval.fitness, 4),
+                    },
+                    best_genes=best_genes,
+                    best_evaluation=best_eval,
+                )
+                break
+
+            fronts, rank_by_index = self._non_dominated_sort(evaluations)
+            crowding_by_index: dict[int, float] = {}
+            for front in fronts:
+                crowding_by_index.update(self._crowding_distances(front, evaluations))
+
+            ordered_indices = sorted(
+                range(len(population)),
+                key=lambda index: (
+                    rank_by_index.get(index, math.inf),
+                    -crowding_by_index.get(index, 0.0),
+                    *self._eval_sort_key(evaluations[index]),
+                ),
+            )
+            if not ordered_indices:
+                break
+
+            archive_window = min(
+                len(ordered_indices),
+                max(request.alternative_count * 12, self.settings.elite_count * 6),
+            )
+            for candidate_index in ordered_indices[:archive_window]:
+                self._add_pareto_candidate(
+                    archive,
+                    seen_genotypes,
+                    genes=population[candidate_index],
+                    evaluation=evaluations[candidate_index],
+                    archive_limit=archive_limit,
+                )
+
+            generation_best_eval = evaluations[ordered_indices[0]]
+            if self._is_better_eval(generation_best_eval, best_eval):
+                best_eval = generation_best_eval
+                best_genes = list(population[ordered_indices[0]])
+                stagnant = 0
+            else:
+                stagnant += 1
+
+            self._report_progress(
+                stage="search",
+                progress_percent=35.0 + (((generation + 1) / max(1, generation_cap)) * 55.0),
+                message=(
+                    f"MOEA generation {generation + 1}/{generation_cap}: "
+                    f"best hard={best_eval.hard_conflicts}, soft={best_eval.soft_penalty:.2f}, "
+                    f"stagnant={stagnant}."
+                ),
+                metrics={
+                    "generation_index": generation + 1,
+                    "hard_conflicts": best_eval.hard_conflicts,
+                    "soft_penalty": round(best_eval.soft_penalty, 4),
+                    "workload_balance_penalty": round(best_eval.workload_balance_penalty, 4),
+                    "fitness": round(best_eval.fitness, 4),
+                    "stagnant_generations": stagnant,
+                },
+                best_genes=best_genes,
+                best_evaluation=best_eval,
+            )
+
+            if (
+                best_eval.hard_conflicts == 0
+                and len(archive) >= max(4, request.alternative_count)
+                and stagnant >= max(6, self.settings.stagnation_limit // 3)
+            ):
+                termination_reason = "converged_conflict_free_with_stagnation"
+                break
+
+            mutation_rate = self._adaptive_mutation_rate(stagnant)
+            next_population: list[list[int]] = []
+            elite_keep = min(len(ordered_indices), max(2, self.settings.elite_count))
+            for index in ordered_indices[:elite_keep]:
+                next_population.append(list(population[index]))
+
+            if use_simulated_annealing and (generation % 2 == 0 or best_eval.hard_conflicts > 0):
+                refinement_targets = ordered_indices[: min(len(ordered_indices), max(1, request.alternative_count))]
+                for index in refinement_targets:
+                    refined_genes, refined_eval = self._simulated_annealing_refine(
+                        population[index],
+                        evaluations[index],
+                        iterations=sa_iterations,
+                    )
+                    self._add_pareto_candidate(
+                        archive,
+                        seen_genotypes,
+                        genes=refined_genes,
+                        evaluation=refined_eval,
+                        archive_limit=archive_limit,
+                    )
+                    if len(next_population) < self.settings.population_size:
+                        next_population.append(refined_genes)
+
+            while len(next_population) < self.settings.population_size:
+                parent_a = self._select_moea_parent(
+                    population,
+                    evaluations,
+                    rank_by_index,
+                    crowding_by_index,
+                )
+                parent_b = self._select_moea_parent(
+                    population,
+                    evaluations,
+                    rank_by_index,
+                    crowding_by_index,
+                )
+                if self.random.random() < self.settings.crossover_rate:
+                    child = self._crossover(parent_a, parent_b)
+                else:
+                    child = list(parent_a)
+
+                if self.random.random() < 0.85:
+                    child = self._mutate(child, mutation_rate=mutation_rate)
+
+                perturb_probability = min(0.40, 0.08 + (0.03 * stagnant))
+                if self.random.random() < perturb_probability:
+                    progress = generation / max(1, generation_cap - 1)
+                    perturb_intensity = min(0.40, 0.05 + (0.17 * progress))
+                    child = self._perturb_individual(child, intensity=perturb_intensity)
+
+                if self.random.random() < 0.20 or generation_best_eval.hard_conflicts > 0:
+                    child = self._repair_individual(child, max_passes=1)
+
+                next_population.append(child)
+
+            if stagnant >= self.settings.stagnation_limit:
+                restart_count = max(1, self.settings.population_size // 4)
+                for offset in range(restart_count):
+                    restart_index = len(next_population) - 1 - offset
+                    replacement = self._random_individual()
+                    if self.random.random() < 0.60:
+                        replacement = self._repair_individual(replacement, max_passes=1)
+                    next_population[restart_index] = replacement
+                stagnant = self.settings.stagnation_limit // 3
+
+            population = next_population[: self.settings.population_size]
+            evaluations = [self._evaluate(genes) for genes in population]
+
+        if generation_cap <= 0:
+            termination_reason = "no_generations_configured"
+
+        for genes, evaluation in zip(population, evaluations):
+            self._add_pareto_candidate(
+                archive,
+                seen_genotypes,
+                genes=genes,
+                evaluation=evaluation,
+                archive_limit=archive_limit,
+            )
+
+        result = self._build_response_from_archive(
+            request=request,
+            start_time=start,
+            archive=archive,
+            block_count=block_count,
+            fallback_attempt_multiplier=20,
+        )
+        best_result = result.alternatives[0]
+        self._report_progress(
+            stage="finalization",
+            level="success",
+            progress_percent=92.0,
+            message=(
+                "MOEA-SA optimization phase complete. "
+                "Applying final post-processing. "
+                f"Termination: {termination_reason}. Best hard conflicts: {best_result.hard_conflicts}."
+            ),
+            metrics={
+                "termination_reason": termination_reason,
+                "runtime_ms": result.runtime_ms,
+                "alternatives": len(result.alternatives),
+                "best_hard_conflicts": best_result.hard_conflicts,
+                "best_soft_penalty": round(best_result.soft_penalty, 4),
+                "best_workload_balance_penalty": round(getattr(best_eval, "workload_balance_penalty", 0.0), 4),
+                "best_fitness": round(best_result.fitness, 4),
+            },
+        )
+        return result
+
+    def _run_hybrid_search(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
+        return self._run_moea_search(
+            request,
+            use_simulated_annealing=True,
+        )
+
+    def _run_simulated_annealing(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
+        return self._run_moea_search(
+            request,
+            use_simulated_annealing=True,
         )
 
     def _run_fast_solver(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
-        start = perf_counter()
-        block_count = len(self.block_requests)
-        strict_attempts = 4
-        if block_count >= 220:
-            strict_attempts = 3
-        elif block_count >= 160:
-            strict_attempts = 3
-        elif block_count >= 120:
-            strict_attempts = 4
-
-        best_genes: list[int] | None = None
-        best_eval: EvaluationResult | None = None
-
-        # Try strict conflict-first constructive starts before entering repair-heavy mode.
-        for attempt in range(strict_attempts):
-            strict_genes = self._constructive_individual(
-                randomized=attempt > 0,
-                rcl_alpha=0.08 + (0.16 * (attempt / max(1, strict_attempts))),
-                strict_dead_end=True,
-            )
-            if strict_genes is None:
-                continue
-            strict_eval = self._evaluate(strict_genes)
-            if best_eval is None or self._is_better_eval(strict_eval, best_eval):
-                best_genes = strict_genes
-                best_eval = strict_eval
-            if strict_eval.hard_conflicts == 0:
-                break
-
-        if best_genes is None or best_eval is None:
-            # Fallback: try a few widened constructive starts and keep the best one.
-            fallback_trials = 3 if block_count >= 140 else 2
-            for trial in range(fallback_trials):
-                candidate = self._constructive_individual(
-                    randomized=trial > 0,
-                    rcl_alpha=0.20 + (0.10 * (trial / max(1, fallback_trials))),
-                )
-                if candidate is None:
-                    candidate = self._random_individual()
-                candidate = self._harmonize_faculty_assignments(candidate)
-                candidate = self._repair_individual(candidate, max_passes=2 if trial == 0 else 1)
-                candidate_eval = self._evaluate(candidate)
-                if best_eval is None or self._is_better_eval(candidate_eval, best_eval):
-                    best_genes = candidate
-                    best_eval = candidate_eval
-            if best_genes is None or best_eval is None:
-                best_genes = self._repair_individual(self._random_individual(), max_passes=1)
-                best_eval = self._evaluate(best_genes)
-
-        if best_eval.hard_conflicts > 0:
-            # Try to repair the baseline candidate.
-            best_genes = self._repair_individual(best_genes, max_passes=1)
-            best_eval = self._evaluate(best_genes)
-
-        if best_eval.hard_conflicts > 0:
-            # Intensive repair if still conflicted
-            intensive_steps = self._intensive_repair_step_cap()
-            if block_count >= 220:
-                intensive_steps = min(intensive_steps, 8)
-            elif block_count >= 160:
-                intensive_steps = min(intensive_steps, 10)
-            elif block_count >= 120:
-                intensive_steps = min(intensive_steps, 14)
-            best_genes, best_eval = self._intensive_conflict_repair(
-                best_genes,
-                max_steps=intensive_steps,
-            )
-
-        if best_eval.hard_conflicts > 0:
-            overlap_repaired = self._greedy_overlap_repair(
-                best_genes,
-                max_iterations=220 if block_count >= 180 else 140,
-            )
-            overlap_eval = self._evaluate(overlap_repaired)
-            if self._is_better_eval(overlap_eval, best_eval):
-                best_genes = overlap_repaired
-                best_eval = overlap_eval
-
-        if best_eval.hard_conflicts > 0:
-            room_repaired = self._repair_room_conflicts(
-                best_genes,
-                max_iterations=10 if block_count >= 180 else 6,
-            )
-            room_eval = self._evaluate(room_repaired)
-            if self._is_better_eval(room_eval, best_eval):
-                best_genes = room_repaired
-                best_eval = room_eval
-
-        alternatives: list[GeneratedAlternative] = []
-        
-        def add_result(genes: list[int], evaluation: EvaluationResult) -> bool:
-            payload = self._decode_payload(genes)
-            alternatives.append(
-                GeneratedAlternative(
-                    rank=len(alternatives) + 1,
-                    fitness=evaluation.fitness,
-                    hard_conflicts=evaluation.hard_conflicts,
-                    soft_penalty=evaluation.soft_penalty,
-                    payload=payload,
-                )
-            )
-            return len(alternatives) >= request.alternative_count
-
-        add_result(best_genes, best_eval)
-        
-        # 2. If we need more alternatives or the first one failed, try randomized starts
-        attempts = 0
-        while len(alternatives) < request.alternative_count and attempts < 10:
-            attempts += 1
-            # Diverse constructive starts
-            candidate = self._constructive_individual(randomized=True, rcl_alpha=0.2)
-            candidate = self._repair_individual(candidate, max_passes=1)
-            candidate = self._repair_room_conflicts(
-                candidate,
-                max_iterations=8 if block_count >= 180 else 5,
-            )
-            eval_res = self._evaluate(candidate)
-            
-            if eval_res.hard_conflicts > 0:
-                 retry_steps = 10
-                 if block_count >= 160:
-                     retry_steps = 6
-                 candidate, eval_res = self._intensive_conflict_repair(candidate, max_steps=retry_steps)
-            
-            # Simple dedup based on fitness/conflicts
-            is_duplicate = any(
-                a.fitness == eval_res.fitness and a.hard_conflicts == eval_res.hard_conflicts 
-                for a in alternatives
-            )
-            if not is_duplicate:
-                add_result(candidate, eval_res)
-
-        return GenerateTimetableResponse(
-            alternatives=alternatives,
-            settings_used=self.settings,
-            runtime_ms=int((perf_counter() - start) * 1000),
+        baseline = self._current_hyperparameters()
+        fast_profile = self._coerce_hyperparameters(
+            SearchHyperParameters(
+                population_size=min(self.settings.population_size, 26),
+                generations=min(self.settings.generations, 18),
+                mutation_rate=self.settings.mutation_rate,
+                crossover_rate=self.settings.crossover_rate,
+                elite_count=min(self.settings.elite_count, 4),
+                tournament_size=min(self.settings.tournament_size, 3),
+                stagnation_limit=min(self.settings.stagnation_limit, 10),
+                annealing_iterations=min(self.settings.annealing_iterations, 90),
+                annealing_initial_temperature=self.settings.annealing_initial_temperature,
+                annealing_cooling_rate=self.settings.annealing_cooling_rate,
+            ),
+            block_count=len(getattr(self, "block_requests", [])),
         )
+        self._apply_hyperparameters(fast_profile)
+        try:
+            return self._run_moea_search(
+                request,
+                use_simulated_annealing=True,
+                auto_tune=False,
+            )
+        finally:
+            self._apply_hyperparameters(baseline)
 
     def _merge_results(
         self,
@@ -5460,16 +7149,17 @@ class EvolutionaryScheduler:
         alternative_count: int,
     ) -> GenerateTimetableResponse:
         merged: list[GeneratedAlternative] = []
-        seen_fingerprints: set[tuple[tuple[str, ...], ...]] = set()
+        seen_fingerprints: set[str] = set()
 
         ordered = [*primary.alternatives, *secondary.alternatives]
-        ordered.sort(key=lambda item: (item.hard_conflicts, item.soft_penalty, -item.fitness))
+        ordered.sort(key=self._eval_sort_key)
 
         for candidate in ordered:
             fingerprint = self._payload_fingerprint(candidate.payload)
-            if fingerprint in seen_fingerprints:
+            fingerprint_key = repr(fingerprint)
+            if fingerprint_key in seen_fingerprints:
                 continue
-            seen_fingerprints.add(fingerprint)
+            seen_fingerprints.add(fingerprint_key)
             merged.append(
                 GeneratedAlternative(
                     rank=len(merged) + 1,
@@ -5489,95 +7179,25 @@ class EvolutionaryScheduler:
         )
 
     def run(self, request: GenerateTimetableRequest) -> GenerateTimetableResponse:
-        strategy = self.settings.solver_strategy
         logger.info(
-            "Scheduler run strategy=%s program_id=%s term=%s alternatives=%s",
-            strategy,
+            "Scheduler run strategy=moea_sa_auto program_id=%s term=%s alternatives=%s",
             self.program_id,
             self.term_number,
             request.alternative_count,
         )
 
-        def has_enough_alternatives(result: GenerateTimetableResponse) -> bool:
-            return bool(result.alternatives) and len(result.alternatives) >= request.alternative_count
-
-        def has_conflict_free_alternative(result: GenerateTimetableResponse) -> bool:
-            return any(item.hard_conflicts == 0 for item in result.alternatives)
-
-        can_run_fast = hasattr(self, "block_requests")
-        block_count = len(self.block_requests) if can_run_fast else 0
-
-        if strategy == "fast":
-            return self._run_fast_solver(request)
-        if strategy == "hybrid":
-            fast: GenerateTimetableResponse | None = None
-            if can_run_fast:
-                fast = self._run_fast_solver(request)
-                if has_enough_alternatives(fast) and (
-                    has_conflict_free_alternative(fast) or block_count >= 120
-                ):
-                    return fast
+        if not hasattr(self, "block_requests"):
+            # Compatibility fallback for lightweight unit stubs that bypass __init__.
             hybrid = self._run_hybrid_search(request)
-            if fast is not None:
-                merged = self._merge_results(
-                    primary=fast,
-                    secondary=hybrid,
-                    alternative_count=request.alternative_count,
-                )
-                if merged.alternatives:
-                    return merged
-            return hybrid
-        if strategy == "simulated_annealing":
-            return self._run_simulated_annealing(request)
-        if strategy == "genetic":
-            return self._run_classic_ga(request)
-
-        fast: GenerateTimetableResponse | None = None
-        if can_run_fast:
-            fast = self._run_fast_solver(request)
-            if has_enough_alternatives(fast) and (
-                has_conflict_free_alternative(fast) or block_count >= 120
-            ):
-                return fast
-
-        hybrid = self._run_hybrid_search(request)
-        if has_enough_alternatives(hybrid) and (
-            has_conflict_free_alternative(hybrid) or block_count >= 120
-        ):
+            if any(item.hard_conflicts == 0 for item in hybrid.alternatives):
+                return hybrid
+            annealed = self._run_simulated_annealing(request)
+            if annealed.alternatives:
+                return annealed
             return hybrid
 
-        merged_fast_hybrid = hybrid
-        if fast is not None:
-            merged_fast_hybrid = self._merge_results(
-                primary=fast,
-                secondary=hybrid,
-                alternative_count=request.alternative_count,
-            )
-            if has_enough_alternatives(merged_fast_hybrid) and (
-                has_conflict_free_alternative(merged_fast_hybrid) or block_count >= 120
-            ):
-                return merged_fast_hybrid
-
-        # For small search spaces, keep deeper fallback to chase conflict-free results.
-        # For dense terms (block_count >= 120), return fast/hybrid output promptly.
-        annealed = self._run_simulated_annealing(request)
-        if has_enough_alternatives(annealed):
-            return annealed
-
-        merged_hybrid_annealed = self._merge_results(
-            primary=merged_fast_hybrid,
-            secondary=annealed,
-            alternative_count=request.alternative_count,
+        return self._run_moea_search(
+            request,
+            use_simulated_annealing=True,
+            auto_tune=True,
         )
-        if has_enough_alternatives(merged_hybrid_annealed):
-            return merged_hybrid_annealed
-
-        classic = self._run_classic_ga(request)
-        merged = self._merge_results(
-            primary=merged_hybrid_annealed,
-            secondary=classic,
-            alternative_count=request.alternative_count,
-        )
-        if merged.alternatives:
-            return merged
-        return classic

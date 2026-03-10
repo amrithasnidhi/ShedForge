@@ -12,6 +12,7 @@ class Faculty(Base):
     __tablename__ = "faculty"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    program_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     designation: Mapped[str] = mapped_column(String(200), nullable=False, default="Faculty")
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)

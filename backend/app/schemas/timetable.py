@@ -60,7 +60,7 @@ class CoursePayload(BaseModel):
     code: str = Field(min_length=1, max_length=50)
     name: str = Field(min_length=1, max_length=200)
     type: Literal["theory", "lab", "elective"]
-    credits: int = Field(ge=0, le=40)
+    credits: float = Field(ge=0, le=40, multiple_of=0.5)
     facultyId: str = Field(min_length=1, max_length=36)
     duration: int = Field(ge=1, le=8)
     sections: int | None = None
@@ -70,6 +70,12 @@ class CoursePayload(BaseModel):
     theory_hours: int | None = Field(default=None, alias="theoryHours", ge=0, le=40)
     lab_hours: int | None = Field(default=None, alias="labHours", ge=0, le=40)
     tutorial_hours: int | None = Field(default=None, alias="tutorialHours", ge=0, le=40)
+    batch_segregation: bool = Field(default=True, alias="batchSegregation")
+    practical_contiguous_slots: int = Field(default=2, alias="practicalContiguousSlots", ge=1, le=40)
+    assign_faculty: bool = Field(default=True, alias="assignFaculty")
+    assign_classroom: bool = Field(default=True, alias="assignClassroom")
+    default_room_id: str | None = Field(default=None, alias="defaultRoomId", min_length=1, max_length=36)
+    elective_category: str | None = Field(default=None, alias="electiveCategory", max_length=120)
 
     @model_validator(mode="after")
     def validate_credit_split(self) -> "CoursePayload":
@@ -92,15 +98,23 @@ class CoursePayload(BaseModel):
         self.lab_hours = lab
         self.tutorial_hours = tutorial
 
-        if self.type == "lab":
-            if self.lab_hours <= 0:
-                raise ValueError("Lab courses require labHours > 0")
-            if self.theory_hours != 0 or self.tutorial_hours != 0:
-                raise ValueError("Lab courses must have theoryHours = 0 and tutorialHours = 0")
-        elif self.lab_hours > 0:
-            raise ValueError("Non-lab courses cannot include labHours")
-        if self.theory_hours + self.lab_hours + self.tutorial_hours != self.hoursPerWeek:
+        split_total = self.theory_hours + self.lab_hours + self.tutorial_hours
+        if split_total <= 0:
+            raise ValueError("Course must include at least one theory/tutorial/lab hour")
+        if split_total != self.hoursPerWeek:
             raise ValueError("hoursPerWeek must equal theoryHours + labHours + tutorialHours")
+        computed_credits = float(self.theory_hours + self.tutorial_hours + (self.lab_hours / 2.0))
+        if abs(self.credits - computed_credits) > 0.01:
+            self.credits = round(computed_credits, 2)
+        if self.lab_hours <= 0:
+            self.practical_contiguous_slots = 1
+        elif self.practical_contiguous_slots > self.lab_hours:
+            raise ValueError("practicalContiguousSlots must be <= labHours")
+        if self.type == "elective":
+            if "assign_faculty" not in self.model_fields_set and "assignFaculty" not in self.model_fields_set:
+                self.assign_faculty = False
+            if "assign_classroom" not in self.model_fields_set and "assignClassroom" not in self.model_fields_set:
+                self.assign_classroom = False
         return self
 
 
@@ -127,6 +141,26 @@ class TimeSlotPayload(BaseModel):
     batch: str | None = Field(default=None, min_length=1, max_length=50)
     studentCount: int | None = Field(default=None, alias="studentCount", ge=1, le=2000)
     sessionType: Literal["theory", "tutorial", "lab"] | None = Field(default=None, alias="sessionType")
+    assistant_faculty_ids: list[str] = Field(default_factory=list, alias="assistantFacultyIds")
+
+    @field_validator("assistant_faculty_ids")
+    @classmethod
+    def validate_assistant_faculty_ids(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            faculty_id = (item or "").strip()
+            if not faculty_id:
+                continue
+            if len(faculty_id) > 36:
+                raise ValueError("assistantFacultyIds values must be 36 characters or fewer")
+            if faculty_id in seen:
+                continue
+            seen.add(faculty_id)
+            cleaned.append(faculty_id)
+        if len(cleaned) > 8:
+            raise ValueError("assistantFacultyIds can include at most 8 faculty IDs")
+        return cleaned
 
     @field_validator("day")
     @classmethod
@@ -180,12 +214,25 @@ class OfficialTimetablePayload(BaseModel):
                 raise ValueError(f"Timeslot {slot.id} references unknown roomId {slot.roomId}")
             if slot.facultyId not in faculty_ids:
                 raise ValueError(f"Timeslot {slot.id} references unknown facultyId {slot.facultyId}")
+            for assistant_id in slot.assistant_faculty_ids:
+                if assistant_id not in faculty_ids:
+                    raise ValueError(
+                        f"Timeslot {slot.id} references unknown assistantFacultyId {assistant_id}"
+                    )
+                if assistant_id == slot.facultyId:
+                    raise ValueError(
+                        f"Timeslot {slot.id} assistantFacultyIds cannot include primary facultyId"
+                    )
             if slot.sessionType is None:
                 slot.sessionType = "lab" if course.type == "lab" else "theory"
-            if course.type == "lab" and slot.sessionType != "lab":
+            course_practical_hours = int(course.lab_hours or 0)
+            course_theory_tutorial_hours = int(course.theory_hours or 0) + int(course.tutorial_hours or 0)
+            if slot.sessionType == "lab" and course_practical_hours <= 0:
+                raise ValueError(
+                    f"Timeslot {slot.id} uses sessionType=lab but course has no practical hours configured"
+                )
+            if course.type == "lab" and course_theory_tutorial_hours <= 0 and slot.sessionType != "lab":
                 raise ValueError(f"Timeslot {slot.id} for lab course must use sessionType=lab")
-            if course.type != "lab" and slot.sessionType == "lab":
-                raise ValueError(f"Timeslot {slot.id} for non-lab course cannot use sessionType=lab")
 
         def ensure_unique(label: str, items: list[BaseModel]) -> None:
             seen: set[str] = set()
@@ -260,6 +307,7 @@ class FacultyCourseSectionAssignment(BaseModel):
     end_time: str = Field(alias="endTime")
     room_id: str = Field(min_length=1, max_length=36)
     room_name: str = Field(min_length=1, max_length=100)
+    assignment_role: Literal["primary", "assistant"] = Field(default="primary", alias="assignmentRole")
 
     model_config = {
         "populate_by_name": True,

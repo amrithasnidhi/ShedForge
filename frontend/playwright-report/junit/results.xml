@@ -1,0 +1,45 @@
+<testsuites id="" name="" tests="5" failures="0" skipped="0" errors="0" time="7.916933">
+<testsuite name="accessibility.spec.ts" timestamp="2026-03-10T15:33:46.030Z" hostname="chromium" tests="1" failures="0" skipped="0" time="3.63" errors="0">
+<testcase name="Accessibility smoke › dashboard and schedule accessibility scan executes" classname="accessibility.spec.ts" time="3.63">
+<system-out>
+<![CDATA[┌─────────┬─────────────────────────┬────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬───────┐
+│ (index) │ id                      │ impact     │ description                                                                                                      │ nodes │
+├─────────┼─────────────────────────┼────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼───────┤
+│ 0       │ [32m'aria-progressbar-name'[39m │ [32m'serious'[39m  │ [32m'Ensure every ARIA progressbar node has an accessible name'[39m                                                      │ [33m3[39m     │
+│ 1       │ [32m'button-name'[39m           │ [32m'critical'[39m │ [32m'Ensure buttons have discernible text'[39m                                                                           │ [33m1[39m     │
+│ 2       │ [32m'color-contrast'[39m        │ [32m'serious'[39m  │ [32m'Ensure the contrast between foreground and background colors meets WCAG 2 AA minimum contrast ratio thresholds'[39m │ [33m6[39m     │
+└─────────┴─────────────────────────┴────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴───────┘
+┌─────────┬──────────────────┬────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬───────┐
+│ (index) │ id               │ impact     │ description                                                                                                      │ nodes │
+├─────────┼──────────────────┼────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼───────┤
+│ 0       │ [32m'button-name'[39m    │ [32m'critical'[39m │ [32m'Ensure buttons have discernible text'[39m                                                                           │ [33m10[39m    │
+│ 1       │ [32m'color-contrast'[39m │ [32m'serious'[39m  │ [32m'Ensure the contrast between foreground and background colors meets WCAG 2 AA minimum contrast ratio thresholds'[39m │ [33m6[39m     │
+└─────────┴──────────────────┴────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴───────┘
+]]>
+</system-out>
+<system-err>
+<![CDATA[{
+  name: [32m'a11y violation summary'[39m,
+  message: [32m'3 accessibility violations were detected'[39m
+}
+{
+  name: [32m'a11y violation summary'[39m,
+  message: [32m'2 accessibility violations were detected'[39m
+}
+]]>
+</system-err>
+</testcase>
+</testsuite>
+<testsuite name="role-workflows.spec.ts" timestamp="2026-03-10T15:33:46.030Z" hostname="chromium" tests="3" failures="0" skipped="0" time="6.102" errors="0">
+<testcase name="Role workflows › admin can open dashboard and schedule workspace" classname="role-workflows.spec.ts" time="2.892">
+</testcase>
+<testcase name="Role workflows › faculty can open dashboard and my schedule" classname="role-workflows.spec.ts" time="1.641">
+</testcase>
+<testcase name="Role workflows › student can open dashboard and my timetable" classname="role-workflows.spec.ts" time="1.569">
+</testcase>
+</testsuite>
+<testsuite name="visual-regression.spec.ts" timestamp="2026-03-10T15:33:46.030Z" hostname="chromium" tests="1" failures="0" skipped="0" time="4.239" errors="0">
+<testcase name="Visual baseline capture › capture dashboard, schedule grid, and conflicts panel" classname="visual-regression.spec.ts" time="4.239">
+</testcase>
+</testsuite>
+</testsuites>

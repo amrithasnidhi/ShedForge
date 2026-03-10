@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { listStudents, type StudentUser } from "@/lib/academic-api";
+import { listPrograms, listStudents, type Program, type StudentUser } from "@/lib/academic-api";
 
 function formatJoinedDate(value: string): string {
   const date = new Date(value);
@@ -31,6 +31,8 @@ export default function StudentsPage() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [sectionFilter, setSectionFilter] = useState("all");
+  const [selectedProgramId, setSelectedProgramId] = useState("all");
+  const [programs, setPrograms] = useState<Program[]>([]);
 
   const loadStudents = async (refresh = false) => {
     setError(null);
@@ -40,7 +42,7 @@ export default function StudentsPage() {
       setIsLoading(true);
     }
     try {
-      const data = await listStudents();
+      const data = await listStudents(selectedProgramId === "all" ? undefined : selectedProgramId);
       setStudents(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load students");
@@ -52,6 +54,18 @@ export default function StudentsPage() {
 
   useEffect(() => {
     void loadStudents();
+  }, [selectedProgramId]);
+
+  useEffect(() => {
+    const loadPrograms = async () => {
+      try {
+        const data = await listPrograms();
+        setPrograms(data);
+      } catch {
+        setPrograms([]);
+      }
+    };
+    void loadPrograms();
   }, []);
 
   const sections = useMemo(() => {
@@ -133,7 +147,7 @@ export default function StudentsPage() {
         <CardHeader>
           <CardTitle className="text-base">Filters</CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
+        <CardContent className="grid gap-4 md:grid-cols-3">
           <div className="space-y-2">
             <Label>Search</Label>
             <div className="relative">
@@ -152,6 +166,22 @@ export default function StudentsPage() {
                 {sections.map((section) => (
                   <SelectItem key={section} value={section}>
                     {section}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>Program</Label>
+            <Select value={selectedProgramId} onValueChange={setSelectedProgramId}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Programs</SelectItem>
+                {programs.map((program) => (
+                  <SelectItem key={program.id} value={program.id}>
+                    {program.code} - {program.name}
                   </SelectItem>
                 ))}
               </SelectContent>

@@ -203,7 +203,7 @@ export default function LoginPage() {
         <ThemeToggle />
       </div>
       {/* Left Panel - Branding */}
-      <div className="hidden lg:flex lg:w-1/2 bg-primary flex-col justify-between p-12">
+      <div className="hidden lg:flex lg:w-[55%] xl:w-[56%] bg-gradient-to-b from-primary via-primary to-[#8f006a] flex-col justify-between p-12 xl:p-16">
         <div className="flex items-center gap-3">
           <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary-foreground/10">
             <GraduationCap className="h-7 w-7 text-primary-foreground" />
@@ -211,43 +211,57 @@ export default function LoginPage() {
           <span className="text-2xl font-semibold text-primary-foreground">ShedForge</span>
         </div>
 
-        <div className="space-y-6">
-          <h1 className="text-4xl font-semibold text-primary-foreground leading-tight text-balance">
+        <div className="space-y-8 max-w-2xl">
+          <h1 className="text-4xl xl:text-6xl font-semibold text-primary-foreground leading-tight text-balance">
             Timetable Scheduling System
           </h1>
-          <p className="text-lg text-primary-foreground/80 max-w-md">
-            Role-driven timetable operations with configurable institutional constraints and optimization workflows.
+          <p className="text-lg xl:text-2xl text-primary-foreground/85 max-w-2xl leading-relaxed">
+            ShedForge is an optimization-first academic scheduling platform built for high-volume institutional operations.
+            It combines automation, governance, and live visibility to generate reliable timetables faster with fewer manual corrections.
           </p>
-          <div className="flex flex-col gap-4 pt-4">
-            <div className="flex items-center gap-3 text-primary-foreground/70">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/10">
-                <span className="text-sm font-medium text-primary-foreground">1</span>
-              </div>
-              <span>Intelligent constraint satisfaction</span>
+
+          <div className="rounded-2xl border border-primary-foreground/20 bg-primary-foreground/8 p-5 xl:p-6 space-y-4">
+            <p className="text-sm xl:text-base uppercase tracking-[0.12em] text-primary-foreground/80">Why ShedForge Stands Out</p>
+            <div className="grid grid-cols-1 gap-3 xl:gap-4 text-primary-foreground/85">
+              <p className="text-base xl:text-lg">Conflict-first generation with multi-objective optimization at scale.</p>
+              <p className="text-base xl:text-lg">Live algorithm visibility with convergence logs and transparent resolution flow.</p>
+              <p className="text-base xl:text-lg">Program-scoped data architecture for clean separation and reliable governance.</p>
             </div>
-            <div className="flex items-center gap-3 text-primary-foreground/70">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/10">
-                <span className="text-sm font-medium text-primary-foreground">2</span>
+          </div>
+
+          <div className="space-y-4">
+            <p className="text-sm xl:text-base uppercase tracking-[0.12em] text-primary-foreground/75">Methodology</p>
+            <div className="flex flex-col gap-3 text-primary-foreground/80">
+              <div className="flex items-center gap-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/12">
+                  <span className="text-sm font-medium text-primary-foreground">1</span>
+                </div>
+                <span>Genetic hyperparameter tuning for scenario-specific search control.</span>
               </div>
-              <span>Automatic conflict resolution</span>
-            </div>
-            <div className="flex items-center gap-3 text-primary-foreground/70">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/10">
-                <span className="text-sm font-medium text-primary-foreground">3</span>
+              <div className="flex items-center gap-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/12">
+                  <span className="text-sm font-medium text-primary-foreground">2</span>
+                </div>
+                <span>MOEA exploration to discover high-quality feasible timetable regions.</span>
               </div>
-              <span>Faculty workload balancing</span>
+              <div className="flex items-center gap-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-foreground/12">
+                  <span className="text-sm font-medium text-primary-foreground">3</span>
+                </div>
+                <span>Simulated Annealing exploitation and automated conflict repair for final refinement.</span>
+              </div>
             </div>
           </div>
         </div>
 
-        <p className="text-sm text-primary-foreground/50">
+        <p className="text-sm text-primary-foreground/55">
           ShedForge Campus Scheduling
         </p>
       </div>
 
       {/* Right Panel - Login Form */}
-      <div className="flex-1 flex items-center justify-center p-8 bg-background">
-        <div className="w-full max-w-md space-y-8">
+      <div className="flex-1 flex items-center justify-center px-6 py-10 lg:px-10 xl:px-14 bg-background">
+        <div className="w-full max-w-2xl xl:max-w-3xl space-y-8">
           {/* Mobile Logo */}
           <div className="lg:hidden flex items-center justify-center gap-3 mb-8">
             <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary">
@@ -256,9 +270,9 @@ export default function LoginPage() {
             <span className="text-2xl font-semibold text-foreground">ShedForge</span>
           </div>
 
-          <Card className="border-border shadow-sm">
-            <CardHeader className="space-y-1 pb-6">
-              <CardTitle className="text-2xl font-semibold">
+          <Card className="border-border shadow-md min-h-[620px]">
+            <CardHeader className="space-y-2 pb-6 px-6 pt-6 md:px-10 md:pt-10">
+              <CardTitle className="text-3xl font-semibold">
                 {mode === "register"
                   ? "Create account"
                   : mode === "forgot"
@@ -277,9 +291,9 @@ export default function LoginPage() {
                       : "Step 1 of 2: submit credentials to receive a one-time email verification code."}
               </CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="px-6 pb-6 md:px-10 md:pb-10">
               {mode === "forgot" ? (
-                <form onSubmit={handleForgotSubmit} className="space-y-5">
+                <form onSubmit={handleForgotSubmit} className="space-y-6">
                   <div className="space-y-2">
                     <Label htmlFor="email">Email</Label>
                     <div className="relative">
@@ -359,7 +373,7 @@ export default function LoginPage() {
                   </Button>
                 </form>
               ) : (
-                <form onSubmit={handleSubmit} className="space-y-5" noValidate>
+                <form onSubmit={handleSubmit} className="space-y-6" noValidate>
                   {mode === "register" ? (
                     <>
                       <div className="space-y-2">

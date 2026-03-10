@@ -1,226 +1,110 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
-import html2canvas from "html2canvas";
-import jsPDF from "jspdf";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  AlertTriangle,
   CheckCircle2,
-  ChevronLeft,
-  ChevronRight,
   Download,
+  Loader2,
+  Redo2,
   RefreshCw,
   Send,
-  Upload,
+  Sparkles,
+  Undo2,
 } from "lucide-react";
-
-import { useAuth } from "@/components/auth-provider";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { listPrograms, type Program } from "@/lib/academic-api";
+import { getProgramConstraint, type ProgramDailyTimeSlot } from "@/lib/constraints-api";
+import { WeeklyTimetableGrid, type WeeklyGridResolvedSlot, type WeeklyGridRow } from "@/components/timetable/weekly-timetable-grid";
 import {
-  listProgramSections,
-  listProgramTerms,
-  listPrograms,
-  type Program,
-  type ProgramSection,
-  type ProgramTerm,
-} from "@/lib/academic-api";
-import {
-  type GenerateTimetableCycleResponse,
-  type GenerateTimetableResponse,
-  type GeneratedAlternative,
-  type GeneratedCycleSolution,
-  type GenerationCycle,
-} from "@/lib/generator-api";
-import {
-  DEFAULT_SCHEDULE_POLICY,
-  DEFAULT_WORKING_HOURS,
-  fetchSchedulePolicy,
-  fetchWorkingHours,
-  type SchedulePolicyUpdate,
-  type WorkingHoursEntry,
-} from "@/lib/settings-api";
-import { generateICSContent } from "@/lib/ics";
-import { buildTemplateDays, buildTemplateTimeSlots, parseTimeToMinutes, sortTimes } from "@/lib/schedule-template";
-import { downloadTimetableCsv } from "@/lib/timetable-csv";
-import { downloadTimetableExcel, type TimetableExcelRow } from "@/lib/timetable-excel";
-import {
-  // decideTimetableConflict,
-  fetchOfficialFacultyMappings,
-  fetchTimetableConflicts,
-  publishOfflineTimetable,
-  publishOfflineTimetableAll,
-  publishOfficialTimetable,
-  type FacultyCourseSectionMapping,
-} from "@/lib/timetable-api";
-import { AlternativesViewer } from "@/components/alternatives/alternatives-viewer";
-import type { Conflict, Course, Faculty, Room, TimeSlot } from "@/lib/timetable-types";
+  LUNCH_END_TIME,
+  LUNCH_START_TIME,
+  isCanonicalLunchRange,
+  isRemovedLegacySlotRange,
+  overlapsCanonicalLunchWindow,
+} from "@/components/timetable/weekly-grid-utils";
 import { useOfficialTimetable } from "@/hooks/use-official-timetable";
+import { parseTimeToMinutes } from "@/lib/schedule-template";
 import {
-  buildCycleTermDraftSnapshot,
-  buildSingleDraftSnapshot,
-  clearGeneratedDraft,
-  loadGeneratedDraft,
-  saveGeneratedDraft,
-  type GeneratedDraftSnapshot,
-} from "@/lib/generated-draft-store";
-import { loadGeneratedResults } from "@/lib/generated-results-store";
+  analyzeTimetableConflicts,
+  decideTimetableChangeRequest,
+  fetchLatestGeneratedDraftSnapshot,
+  listTimetableChangeRequests,
+  publishOfficialTimetable,
+  publishTimetableDistribution,
+  resolveAllTimetableConflicts,
+  reviewTimetableConflicts,
+  type OfficialTimetablePayload,
+  type TimetableChangeRequest,
+} from "@/lib/timetable-api";
+import { loadGeneratedDraft } from "@/lib/generated-draft-store";
+import { downloadTimetablePdf, downloadTimetableXlsx } from "@/lib/timetable-export";
+import type { Conflict, Course, Faculty, Room, TimeSlot, TimetableConflictReview } from "@/lib/timetable-types";
 
-const ALL = "all";
-const TERM_OPTIONS = ["1", "2", "3", "4", "5", "6", "7", "8"];
-const DAY_SEQUENCE = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-const DAY_ORDER = new Map(DAY_SEQUENCE.map((day, index) => [day, index]));
+const DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const ROOM_ONLY_CONFLICT_TYPES = new Set(["room_conflict", "room-overlap", "room_capacity", "capacity", "room_type"]);
+const MAX_HISTORY_STEPS = 50;
 
-type ExportFormat = "pdf" | "excel" | "png" | "csv" | "ics" | "json";
-type ScheduleGenerationMode = "single" | GenerationCycle;
+type ExportFormat = "pdf" | "xlsx";
 
-interface Filters {
-  department: string;
-  programId: string;
-  semester: string;
-  section: string;
-  roomId: string;
-  facultyId: string;
+interface ConflictPopupState {
+  payload: OfficialTimetablePayload;
+  slotId: string;
+  message: string;
+  conflictTypeLabels: string[];
+  availableRooms: Room[];
+  selectedRoomId: string;
+  anchorX: number;
+  anchorY: number;
 }
 
-interface ResolvedSlot {
-  slot: TimeSlot;
-  course: Course | undefined;
-  room: Room | undefined;
-  faculty: Faculty | undefined;
+interface AlternativeSlotSuggestion {
+  day: string;
+  startTime: string;
+  endTime: string;
 }
 
-interface FilterParams {
-  slots: TimeSlot[];
-  filters: Filters;
-  payloadProgramId?: string;
-  payloadTermNumber?: number;
-  fallbackDepartment?: string;
-  facultyById: Map<string, Faculty>;
+function clonePayload(payload: OfficialTimetablePayload): OfficialTimetablePayload {
+  return JSON.parse(JSON.stringify(payload)) as OfficialTimetablePayload;
 }
 
-function normalize(value: string | null | undefined): string {
-  return (value ?? "").trim().toLowerCase();
+function rangesOverlap(startA: number, endA: number, startB: number, endB: number): boolean {
+  return startA < endB && startB < endA;
 }
 
-function toTimeString(totalMinutes: number): string {
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+function slotOverlaps(left: TimeSlot, right: TimeSlot): boolean {
+  if (left.day !== right.day) {
+    return false;
+  }
+  const leftStart = parseTimeToMinutes(left.startTime);
+  const leftEnd = parseTimeToMinutes(left.endTime);
+  const rightStart = parseTimeToMinutes(right.startTime);
+  const rightEnd = parseTimeToMinutes(right.endTime);
+  if (!Number.isFinite(leftStart) || !Number.isFinite(leftEnd) || !Number.isFinite(rightStart) || !Number.isFinite(rightEnd)) {
+    return false;
+  }
+  return rangesOverlap(leftStart, leftEnd, rightStart, rightEnd);
 }
 
-function daySort(left: string, right: string): number {
-  const leftIndex = DAY_ORDER.get(left) ?? Number.MAX_SAFE_INTEGER;
-  const rightIndex = DAY_ORDER.get(right) ?? Number.MAX_SAFE_INTEGER;
-  if (leftIndex !== rightIndex) {
-    return leftIndex - rightIndex;
-  }
-  return left.localeCompare(right);
+function slotFacultyIds(slot: TimeSlot): string[] {
+  const ids = [slot.facultyId, ...(slot.assistantFacultyIds ?? [])]
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+  return [...new Set(ids)];
 }
 
-function sectionSort(left: string, right: string): number {
-  return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
-}
-
-function slotSort(left: TimeSlot, right: TimeSlot): number {
-  const dayCompare = daySort(left.day, right.day);
-  if (dayCompare !== 0) {
-    return dayCompare;
+function toUiError(error: unknown): string {
+  if (error instanceof Error) {
+    if (error.message === "Failed to fetch") {
+      return "Cannot reach backend API. Start backend and verify NEXT_PUBLIC_API_BASE_URL.";
+    }
+    return error.message;
   }
-  const timeCompare = parseTimeToMinutes(left.startTime) - parseTimeToMinutes(right.startTime);
-  if (timeCompare !== 0) {
-    return timeCompare;
-  }
-  const sectionCompare = sectionSort(left.section, right.section);
-  if (sectionCompare !== 0) {
-    return sectionCompare;
-  }
-  return (left.batch ?? "").localeCompare(right.batch ?? "", undefined, { numeric: true, sensitivity: "base" });
-}
-
-function applyFilters(params: FilterParams): TimeSlot[] {
-  const {
-    slots,
-    filters,
-    payloadProgramId,
-    payloadTermNumber,
-    fallbackDepartment,
-    facultyById,
-  } = params;
-
-  if (filters.programId !== ALL && payloadProgramId && filters.programId !== payloadProgramId) {
-    return [];
-  }
-
-  if (filters.semester !== ALL && payloadTermNumber !== undefined && Number(filters.semester) !== payloadTermNumber) {
-    return [];
-  }
-
-  const expectedSection = normalize(filters.section === ALL ? "" : filters.section);
-  const expectedRoom = filters.roomId === ALL ? "" : filters.roomId;
-  const expectedFaculty = filters.facultyId === ALL ? "" : filters.facultyId;
-  const expectedDepartment = normalize(filters.department === ALL ? "" : filters.department);
-  const fallbackDepartmentNormalized = normalize(fallbackDepartment);
-
-  return slots
-    .filter((slot) => {
-      if (expectedSection && normalize(slot.section) !== expectedSection) {
-        return false;
-      }
-      if (expectedRoom && slot.roomId !== expectedRoom) {
-        return false;
-      }
-      if (expectedFaculty && slot.facultyId !== expectedFaculty) {
-        return false;
-      }
-      if (expectedDepartment) {
-        const slotFacultyDepartment = normalize(facultyById.get(slot.facultyId)?.department);
-        if (slotFacultyDepartment) {
-          return slotFacultyDepartment === expectedDepartment;
-        }
-        return fallbackDepartmentNormalized === expectedDepartment;
-      }
-      return true;
-    })
-    .sort(slotSort);
-}
-
-function resolveSlotSessionType(
-  slot: TimeSlot,
-  course: Course | undefined,
-): "theory" | "tutorial" | "lab" {
-  if (slot.sessionType) {
-    return slot.sessionType;
-  }
-  return course?.type === "lab" ? "lab" : "theory";
-}
-
-function getCourseCardClass(type: Course["type"] | undefined, sessionType: "theory" | "tutorial" | "lab"): string {
-  if (sessionType === "tutorial") {
-    return "border-blue-300 bg-blue-50 text-blue-900 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-200";
-  }
-  if (type === "lab") {
-    return "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-200";
-  }
-  if (type === "elective") {
-    return "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200";
-  }
-  return "border-blue-300 bg-blue-50 text-blue-900 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-200";
+  return "Unexpected request failure.";
 }
 
 function sanitizeFileName(value: string): string {
@@ -232,1661 +116,1793 @@ function sanitizeFileName(value: string): string {
     .toLowerCase();
 }
 
-function buildFileName(filters: Filters): string {
-  const parts = ["timetable"];
-  if (filters.semester !== ALL) {
-    parts.push(`sem-${filters.semester}`);
+function safeVibrate(pattern: number | number[]): void {
+  if (typeof navigator === "undefined" || typeof navigator.vibrate !== "function") {
+    return;
   }
-  if (filters.section !== ALL) {
-    parts.push(`section-${sanitizeFileName(filters.section)}`);
-  }
-  if (filters.roomId !== ALL) {
-    parts.push(`room-${sanitizeFileName(filters.roomId)}`);
-  }
-  if (filters.facultyId !== ALL) {
-    parts.push(`faculty-${sanitizeFileName(filters.facultyId)}`);
-  }
-  if (filters.department !== ALL) {
-    parts.push(`dept-${sanitizeFileName(filters.department)}`);
-  }
-  return parts.join("_");
+  navigator.vibrate(pattern);
 }
 
-async function exportElementToPng(element: HTMLElement, filename: string): Promise<void> {
-  const canvas = await html2canvas(element, {
-    scale: 2,
-    backgroundColor: "#ffffff",
-    useCORS: true,
+function sectionLabelFromIndex(index: number): string {
+  if (index <= 0) {
+    return `Section ${index}`;
+  }
+  let value = index;
+  let label = "";
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    label = String.fromCharCode(65 + remainder) + label;
+    value = Math.floor((value - 1) / 26);
+  }
+  return label;
+}
+
+function conflictLabel(conflictType: string): string {
+  return conflictType.replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function conflictResolutionDetail(conflict: Conflict): string {
+  const explicitResolution = (conflict.resolution ?? "").trim();
+  if (explicitResolution) {
+    return explicitResolution;
+  }
+  const decisionNote = (conflict.decision_note ?? "").trim();
+  if (decisionNote) {
+    return decisionNote;
+  }
+  if (conflict.resolution_mode === "auto") {
+    return "Resolved by automatic conflict resolver.";
+  }
+  if (conflict.resolution_mode === "manual") {
+    return "Resolved manually by scheduler action.";
+  }
+  return "No resolution notes recorded yet.";
+}
+
+function isLunchReservedWindow(startTime: string, endTime: string): boolean {
+  return overlapsCanonicalLunchWindow(startTime, endTime);
+}
+
+function buildGridRows(slots: TimeSlot[], dailySlots: ProgramDailyTimeSlot[]): WeeklyGridRow[] {
+  const rows = new Map<string, WeeklyGridRow>();
+
+  for (const item of dailySlots) {
+    if (isRemovedLegacySlotRange(item.start_time, item.end_time)) {
+      continue;
+    }
+    const slotIsLunch = isCanonicalLunchRange(item.start_time, item.end_time);
+    if (item.tag === "lunch" && !slotIsLunch) {
+      continue;
+    }
+    if (overlapsCanonicalLunchWindow(item.start_time, item.end_time) && !slotIsLunch) {
+      continue;
+    }
+    const key = `${item.start_time}|${item.end_time}`;
+    rows.set(key, {
+      startTime: item.start_time,
+      endTime: item.end_time,
+      tag: slotIsLunch ? "lunch" : item.tag,
+      label: slotIsLunch ? "Lunch Break" : item.label ?? undefined,
+    });
+  }
+
+  const lunchKey = `${LUNCH_START_TIME}|${LUNCH_END_TIME}`;
+  if (!rows.has(lunchKey)) {
+    rows.set(lunchKey, {
+      startTime: LUNCH_START_TIME,
+      endTime: LUNCH_END_TIME,
+      tag: "lunch",
+      label: "Lunch Break",
+    });
+  }
+
+  for (const slot of slots) {
+    if (isRemovedLegacySlotRange(slot.startTime, slot.endTime)) {
+      continue;
+    }
+    const slotIsLunch = isCanonicalLunchRange(slot.startTime, slot.endTime);
+    if (overlapsCanonicalLunchWindow(slot.startTime, slot.endTime) && !slotIsLunch) {
+      continue;
+    }
+    const key = `${slot.startTime}|${slot.endTime}`;
+    if (!rows.has(key)) {
+      rows.set(key, {
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        tag: slotIsLunch ? "lunch" : "teaching",
+        label: slotIsLunch ? "Lunch Break" : undefined,
+      });
+    }
+  }
+
+  return Array.from(rows.values()).sort((left, right) => {
+    const startDiff = parseTimeToMinutes(left.startTime) - parseTimeToMinutes(right.startTime);
+    if (startDiff !== 0) {
+      return startDiff;
+    }
+    return parseTimeToMinutes(left.endTime) - parseTimeToMinutes(right.endTime);
   });
-  const link = document.createElement("a");
-  link.href = canvas.toDataURL("image/png");
-  link.download = `${filename}.png`;
-  link.click();
 }
 
-async function exportElementToPdf(element: HTMLElement, filename: string): Promise<void> {
-  const canvas = await html2canvas(element, {
-    scale: 2,
-    backgroundColor: "#ffffff",
-    useCORS: true,
-  });
+function buildCellEntries(
+  slots: TimeSlot[],
+  courseById: Map<string, Course>,
+  facultyById: Map<string, Faculty>,
+  roomById: Map<string, Room>,
+): Record<string, WeeklyGridResolvedSlot[]> {
+  const output: Record<string, WeeklyGridResolvedSlot[]> = {};
 
-  const orientation = canvas.width >= canvas.height ? "landscape" : "portrait";
-  const pdf = new jsPDF({ orientation, unit: "pt", format: "a4" });
-  const pageWidth = pdf.internal.pageSize.getWidth();
-  const pageHeight = pdf.internal.pageSize.getHeight();
-  const margin = 24;
-  const printableWidth = pageWidth - margin * 2;
-  const printableHeight = pageHeight - margin * 2;
-
-  const imageData = canvas.toDataURL("image/png");
-  const imageWidth = printableWidth;
-  const imageHeight = (canvas.height * imageWidth) / canvas.width;
-
-  let renderedHeight = 0;
-  pdf.addImage(imageData, "PNG", margin, margin, imageWidth, imageHeight, undefined, "FAST");
-  renderedHeight += printableHeight;
-
-  while (renderedHeight < imageHeight) {
-    pdf.addPage();
-    const offsetY = margin - renderedHeight;
-    pdf.addImage(imageData, "PNG", margin, offsetY, imageWidth, imageHeight, undefined, "FAST");
-    renderedHeight += printableHeight;
+  for (const slot of slots) {
+    const key = `${slot.day}|${slot.startTime}|${slot.endTime}`;
+    if (!output[key]) {
+      output[key] = [];
+    }
+    output[key].push({
+      slot,
+      course: courseById.get(slot.courseId),
+      faculty: facultyById.get(slot.facultyId),
+      room: roomById.get(slot.roomId),
+    });
   }
 
-  pdf.save(`${filename}.pdf`);
+  for (const key of Object.keys(output)) {
+    output[key].sort((left, right) => {
+      const leftCode = left.course?.code ?? left.slot.courseId;
+      const rightCode = right.course?.code ?? right.slot.courseId;
+      return leftCode.localeCompare(rightCode);
+    });
+  }
+
+  return output;
 }
 
-function downloadBlob(contents: BlobPart, mimeType: string, filenameWithExtension: string): void {
-  const blob = new Blob([contents], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filenameWithExtension;
-  anchor.click();
-  URL.revokeObjectURL(url);
+function buildScopedPayload(basePayload: OfficialTimetablePayload, slots: TimeSlot[]): OfficialTimetablePayload {
+  const courseIds = new Set(slots.map((slot) => slot.courseId));
+  const roomIds = new Set(slots.map((slot) => slot.roomId));
+  const facultyIds = new Set<string>();
+  for (const slot of slots) {
+    for (const facultyId of slotFacultyIds(slot)) {
+      facultyIds.add(facultyId);
+    }
+  }
+  return {
+    ...basePayload,
+    timetableData: slots,
+    courseData: basePayload.courseData.filter((item) => courseIds.has(item.id)),
+    roomData: basePayload.roomData.filter((item) => roomIds.has(item.id)),
+    facultyData: basePayload.facultyData.filter((item) => facultyIds.has(item.id)),
+  };
 }
 
-function buildExcelRows(slots: ResolvedSlot[], semester: string): TimetableExcelRow[] {
-  return slots.map((item) => ({
-    day: item.slot.day,
-    start_time: item.slot.startTime,
-    end_time: item.slot.endTime,
-    semester,
-    section: item.slot.section,
-    batch: item.slot.batch ?? "",
-    course_code: item.course?.code ?? item.slot.courseId,
-    course_name: item.course?.name ?? "",
-    course_type:
-      resolveSlotSessionType(item.slot, item.course) === "tutorial"
-        ? "tutorial"
-        : item.course?.type ?? resolveSlotSessionType(item.slot, item.course),
-    faculty_name: item.faculty?.name ?? item.slot.facultyId,
-    faculty_department: item.faculty?.department ?? "",
-    room_name: item.room?.name ?? item.slot.roomId,
-    building: item.room?.building ?? "",
-    student_count: item.slot.studentCount ? String(item.slot.studentCount) : "",
-  }));
+function findAvailableRoomsForSlot(payload: OfficialTimetablePayload, slotId: string): Room[] {
+  const targetSlot = payload.timetableData.find((slot) => slot.id === slotId);
+  if (!targetSlot) {
+    return [];
+  }
+
+  const roomById = new Map(payload.roomData.map((item) => [item.id, item]));
+  const currentRoom = roomById.get(targetSlot.roomId);
+  const studentCount = targetSlot.studentCount ?? 0;
+
+  const sortedRooms = [...payload.roomData].sort((left, right) => {
+    const leftGap = Math.max(0, left.capacity - studentCount);
+    const rightGap = Math.max(0, right.capacity - studentCount);
+    if (leftGap !== rightGap) {
+      return leftGap - rightGap;
+    }
+    return left.name.localeCompare(right.name);
+  });
+
+  const availableRooms: Room[] = [];
+  for (const room of sortedRooms) {
+    if (room.id === targetSlot.roomId) {
+      continue;
+    }
+    if (currentRoom && room.type !== currentRoom.type) {
+      continue;
+    }
+    if (studentCount > 0 && room.capacity < studentCount) {
+      continue;
+    }
+    const roomConflict = payload.timetableData.some((slot) => {
+      if (slot.id === targetSlot.id) {
+        return false;
+      }
+      if (slot.roomId !== room.id) {
+        return false;
+      }
+      return slotOverlaps(slot, targetSlot);
+    });
+    if (!roomConflict) {
+      availableRooms.push(room);
+    }
+  }
+
+  return availableRooms;
+}
+
+function findAlternativeTimeSlots(
+  payload: OfficialTimetablePayload,
+  slotId: string,
+  dailySlots: ProgramDailyTimeSlot[],
+  maxSuggestions = 4,
+): AlternativeSlotSuggestion[] {
+  const targetSlot = payload.timetableData.find((slot) => slot.id === slotId);
+  if (!targetSlot) {
+    return [];
+  }
+
+  const rows = buildGridRows(payload.timetableData, dailySlots).filter((row) => row.tag === "teaching");
+  const suggestions: AlternativeSlotSuggestion[] = [];
+  const targetFacultyIds = slotFacultyIds(targetSlot);
+
+  for (const day of DAY_ORDER) {
+    for (const row of rows) {
+      if (day === targetSlot.day && row.startTime === targetSlot.startTime && row.endTime === targetSlot.endTime) {
+        continue;
+      }
+      const probe: TimeSlot = {
+        ...targetSlot,
+        day,
+        startTime: row.startTime,
+        endTime: row.endTime,
+      };
+
+      const hasBlockingConflict = payload.timetableData.some((other) => {
+        if (other.id === targetSlot.id) {
+          return false;
+        }
+        if (!slotOverlaps(probe, other)) {
+          return false;
+        }
+
+        const sectionConflict = other.section.trim().toLowerCase() === probe.section.trim().toLowerCase();
+        const roomConflict = other.roomId === probe.roomId;
+        const otherFacultyIds = slotFacultyIds(other);
+        const facultyConflict = targetFacultyIds.some((id) => otherFacultyIds.includes(id));
+        return sectionConflict || roomConflict || facultyConflict;
+      });
+
+      if (hasBlockingConflict) {
+        continue;
+      }
+
+      suggestions.push({
+        day,
+        startTime: row.startTime,
+        endTime: row.endTime,
+      });
+
+      if (suggestions.length >= maxSuggestions) {
+        return suggestions;
+      }
+    }
+  }
+
+  return suggestions;
 }
 
 export default function SchedulePage() {
-  const router = useRouter();
-  const { user } = useAuth();
-  const canManage = user?.role === "admin" || user?.role === "scheduler";
-
   const {
     data: officialPayload,
     hasOfficial,
-    isLoading: timetableLoading,
-    error: timetableError,
+    isLoading,
+    error: officialError,
     refresh: refreshOfficial,
   } = useOfficialTimetable();
 
-  const [filters, setFilters] = useState<Filters>({
-    department: ALL,
-    programId: ALL,
-    semester: ALL,
-    section: ALL,
-    roomId: ALL,
-    facultyId: ALL,
-  });
-
-  const [generationMode, setGenerationMode] = useState<ScheduleGenerationMode>("single");
-  const [generationError, setGenerationError] = useState<string | null>(null);
-  const [generationSuccess, setGenerationSuccess] = useState<string | null>(null);
-
-  const [singleGeneration, setSingleGeneration] = useState<GenerateTimetableResponse | null>(null);
-  const [cycleGeneration, setCycleGeneration] = useState<GenerateTimetableCycleResponse | null>(null);
-  const [selectedAlternativeRank, setSelectedAlternativeRank] = useState("1");
-  const [selectedCycleRank, setSelectedCycleRank] = useState("");
-  const [selectedCycleTerm, setSelectedCycleTerm] = useState("");
-  const [persistedDraft, setPersistedDraft] = useState<GeneratedDraftSnapshot | null>(null);
-
   const [programs, setPrograms] = useState<Program[]>([]);
-  const [programTerms, setProgramTerms] = useState<ProgramTerm[]>([]);
-  const [programSections, setProgramSections] = useState<ProgramSection[]>([]);
-  const [programError, setProgramError] = useState<string | null>(null);
+  const [workingPayload, setWorkingPayload] = useState<OfficialTimetablePayload | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
+  const [latestDraftPayload, setLatestDraftPayload] = useState<OfficialTimetablePayload | null>(null);
+  const [latestDraftLabel, setLatestDraftLabel] = useState<string | null>(null);
+  const [isLoadingDraft, setIsLoadingDraft] = useState(false);
+  const [workspaceRefreshNonce, setWorkspaceRefreshNonce] = useState(0);
 
-  const [workingHours, setWorkingHours] = useState<WorkingHoursEntry[]>(DEFAULT_WORKING_HOURS);
-  const [schedulePolicy, setSchedulePolicy] = useState<SchedulePolicyUpdate>(DEFAULT_SCHEDULE_POLICY);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [selectedSemester, setSelectedSemester] = useState<string>("all");
+  const [selectedSection, setSelectedSection] = useState<string>("all");
+  const [selectedFacultyId, setSelectedFacultyId] = useState<string>("all");
+  const [selectedRoomId, setSelectedRoomId] = useState<string>("all");
+  const [publishSemester, setPublishSemester] = useState<string>("all");
+  const [publishSection, setPublishSection] = useState<string>("all");
+  const [publishFacultyId, setPublishFacultyId] = useState<string>("all");
+  const [publishRoomId, setPublishRoomId] = useState<string>("all");
 
-  const [conflicts, setConflicts] = useState<Conflict[]>([]);
-  const [conflictsLoading, setConflictsLoading] = useState(false);
-  const [conflictsError, setConflictsError] = useState<string | null>(null);
-  const [decisionBusyId, setDecisionBusyId] = useState<string | null>(null);
-  const [conflictActionMessage, setConflictActionMessage] = useState<string | null>(null);
-
-  const [versionLabel, setVersionLabel] = useState("");
-  const [publishError, setPublishError] = useState<string | null>(null);
-  const [publishSuccess, setPublishSuccess] = useState<string | null>(null);
-  const [isPublishing, setIsPublishing] = useState(false);
-  const [isPublishConfirmOpen, setIsPublishConfirmOpen] = useState(false);
-  const [isPublishingOffline, setIsPublishingOffline] = useState(false);
-  const [isPublishingOfflineAll, setIsPublishingOfflineAll] = useState(false);
-  const [offlinePublishError, setOfflinePublishError] = useState<string | null>(null);
-  const [offlinePublishSuccess, setOfflinePublishSuccess] = useState<string | null>(null);
+  const [dailySlots, setDailySlots] = useState<ProgramDailyTimeSlot[]>([]);
 
   const [exportFormat, setExportFormat] = useState<ExportFormat>("pdf");
-  const [isExporting, setIsExporting] = useState(false);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [publishLabel, setPublishLabel] = useState("");
+  const [publishScopeMode, setPublishScopeMode] = useState<"all" | "filtered">("all");
 
-  const [alternativesViewerOpen, setAlternativesViewerOpen] = useState(false);
+  const [isApplyingMove, setIsApplyingMove] = useState(false);
+  const [conflictPopup, setConflictPopup] = useState<ConflictPopupState | null>(null);
+  const [undoStack, setUndoStack] = useState<OfficialTimetablePayload[]>([]);
+  const [redoStack, setRedoStack] = useState<OfficialTimetablePayload[]>([]);
 
-  const [facultyMappings, setFacultyMappings] = useState<FacultyCourseSectionMapping[]>([]);
-  const [mappingLoading, setMappingLoading] = useState(false);
-  const [mappingError, setMappingError] = useState<string | null>(null);
+  const [changeRequests, setChangeRequests] = useState<TimetableChangeRequest[]>([]);
+  const [requestsLoading, setRequestsLoading] = useState(false);
+  const [requestDecisionBusyId, setRequestDecisionBusyId] = useState<string | null>(null);
+  const [conflictReview, setConflictReview] = useState<TimetableConflictReview | null>(null);
+  const [isReviewLoading, setIsReviewLoading] = useState(false);
+  const [isResolveAllBusy, setIsResolveAllBusy] = useState(false);
+  const [conflictReviewError, setConflictReviewError] = useState<string | null>(null);
+  const [conflictReviewRefreshNonce, setConflictReviewRefreshNonce] = useState(0);
 
-  const exportRef = useRef<HTMLDivElement>(null);
+  const [isPublishing, setIsPublishing] = useState(false);
 
-  const programById = useMemo(() => new Map(programs.map((program) => [program.id, program])), [programs]);
-
-  const activeSingleAlternative = useMemo(() => {
-    if (!singleGeneration?.alternatives.length) {
-      return null;
-    }
-    const rank = Number(selectedAlternativeRank);
-    if (!Number.isFinite(rank)) {
-      return singleGeneration.alternatives[0];
-    }
-    return singleGeneration.alternatives.find((item) => item.rank === rank) ?? singleGeneration.alternatives[0];
-  }, [selectedAlternativeRank, singleGeneration]);
-
-  const cyclePareto = useMemo(() => cycleGeneration?.pareto_front ?? [], [cycleGeneration?.pareto_front]);
-
-  const activeCycleSolution = useMemo<GeneratedCycleSolution | null>(() => {
-    if (!cyclePareto.length) {
-      return null;
-    }
-    const rank = Number(selectedCycleRank);
-    if (!Number.isFinite(rank)) {
-      return cyclePareto[0];
-    }
-    return cyclePareto.find((item) => item.rank === rank) ?? cyclePareto[0];
-  }, [cyclePareto, selectedCycleRank]);
-
-  const activeCycleTermEntry = useMemo(() => {
-    if (!activeCycleSolution?.terms.length) {
-      return null;
-    }
-    const matched = activeCycleSolution.terms.find((item) => String(item.term_number) === selectedCycleTerm);
-    return matched ?? activeCycleSolution.terms[0];
-  }, [activeCycleSolution, selectedCycleTerm]);
-
-  const activeGeneratedAlternative = useMemo<GeneratedAlternative | null>(() => {
-    if (generationMode === "single") {
-      return activeSingleAlternative;
-    }
-    if (!activeCycleTermEntry) {
-      return null;
-    }
-    return {
-      rank: activeCycleTermEntry.alternative_rank,
-      fitness: activeCycleTermEntry.fitness,
-      hard_conflicts: activeCycleTermEntry.hard_conflicts,
-      soft_penalty: activeCycleTermEntry.soft_penalty,
-      payload: activeCycleTermEntry.payload,
-      workload_gap_suggestions: activeCycleTermEntry.workload_gap_suggestions,
-      occupancy_matrix: activeCycleTermEntry.occupancy_matrix,
-    };
-  }, [activeCycleTermEntry, activeSingleAlternative, generationMode]);
-
-  const activeDraftPayload = activeGeneratedAlternative?.payload ?? persistedDraft?.payload ?? null;
-  const activeDraftHardConflicts = activeGeneratedAlternative?.hard_conflicts ?? persistedDraft?.hard_conflicts ?? null;
-  const activeDraftLabel = activeGeneratedAlternative
-    ? generationMode === "single"
-      ? `Alternative ${activeGeneratedAlternative.rank}`
-      : `Cycle ${activeCycleSolution?.rank ?? "-"} • Semester ${activeCycleTermEntry?.term_number ?? "-"} • Alt ${activeGeneratedAlternative.rank}`
-    : persistedDraft?.label ?? null;
-
-  const showingGenerated = Boolean(activeDraftPayload);
-  const displayPayload = activeDraftPayload ?? officialPayload;
-
-  const courseData = displayPayload.courseData;
-  const roomData = displayPayload.roomData;
-  const facultyData = displayPayload.facultyData;
-  const timetableData = displayPayload.timetableData;
-
-  const courseById = useMemo(() => new Map(courseData.map((course) => [course.id, course])), [courseData]);
-  const roomById = useMemo(() => new Map(roomData.map((room) => [room.id, room])), [roomData]);
-  const facultyById = useMemo(() => new Map(facultyData.map((faculty) => [faculty.id, faculty])), [facultyData]);
-
-  const activeProgram = filters.programId !== ALL ? programById.get(filters.programId) : undefined;
-  const fallbackProgramDepartment = activeProgram?.department ?? programById.get(displayPayload.programId ?? "")?.department;
-
-  const unresolvedConflictCount = conflicts.length;
-  // const resolvedConflictCount = 0; // Deprecated
-  const unresolvedConflicts = conflicts;
-  const unresolvedConflictPreview = useMemo(() => unresolvedConflicts.slice(0, 4), [unresolvedConflicts]);
-
-  const loadGeneratedAlternativesFromCache = (silent = false): boolean => {
-    if (!silent) {
-      setGenerationError(null);
-      setGenerationSuccess(null);
-    }
-
-    const storedResults = loadGeneratedResults();
-    if (storedResults) {
-      setFilters((previous) => ({
-        ...previous,
-        programId:
-          previous.programId === ALL && storedResults.program_id
-            ? storedResults.program_id
-            : previous.programId,
-        semester:
-          previous.semester === ALL && storedResults.term_number
-            ? String(storedResults.term_number)
-            : previous.semester,
-      }));
-
-      if (storedResults.mode === "single" && storedResults.single?.alternatives?.length) {
-        const firstAlternative = storedResults.single.alternatives[0];
-        setGenerationMode("single");
-        setSingleGeneration(storedResults.single);
-        setCycleGeneration(null);
-        setSelectedAlternativeRank(String(firstAlternative.rank));
-        setSelectedCycleRank("");
-        setSelectedCycleTerm("");
-        const snapshot = buildSingleDraftSnapshot({
-          source: "schedule",
-          mode: "single",
-          programId: storedResults.program_id ?? firstAlternative.payload.programId,
-          termNumber: storedResults.term_number ?? firstAlternative.payload.termNumber ?? null,
-          alternative: firstAlternative,
-        });
-        setPersistedDraft(snapshot);
-        saveGeneratedDraft(snapshot);
-        if (!silent) {
-          setGenerationSuccess(`Loaded ${storedResults.single.alternatives.length} generated alternative(s) from Generator.`);
-        }
-        return true;
-      }
-
-      if (storedResults.mode !== "single" && storedResults.cycle?.pareto_front?.length) {
-        const cycleResponse = storedResults.cycle;
-        const pareto = cycleResponse.pareto_front ?? [];
-        const selectedRank = cycleResponse.selected_solution_rank ?? pareto[0]?.rank;
-        const selectedSolution = pareto.find((item) => item.rank === selectedRank) ?? pareto[0];
-        const selectedTerm = selectedSolution?.terms[0];
-
-        setGenerationMode(storedResults.mode);
-        setCycleGeneration(cycleResponse);
-        setSingleGeneration(null);
-        setSelectedCycleRank(selectedSolution ? String(selectedSolution.rank) : "");
-        setSelectedCycleTerm(selectedTerm ? String(selectedTerm.term_number) : "");
-        setSelectedAlternativeRank("1");
-        if (selectedTerm) {
-          const snapshot = buildCycleTermDraftSnapshot({
-            source: "schedule",
-            mode: storedResults.mode,
-            programId: storedResults.program_id ?? selectedTerm.payload.programId,
-            solutionRank: selectedSolution?.rank ?? null,
-            term: selectedTerm,
-          });
-          setPersistedDraft(snapshot);
-          saveGeneratedDraft(snapshot);
-        }
-        if (!silent) {
-          setGenerationSuccess(`Loaded ${pareto.length} cycle solution(s) from Generator.`);
-        }
-        return true;
-      }
-    }
-
-    const storedDraft = loadGeneratedDraft();
-    if (storedDraft) {
-      setGenerationMode(storedDraft.mode === "single" ? "single" : storedDraft.mode);
-      setSingleGeneration(null);
-      setCycleGeneration(null);
-      setSelectedAlternativeRank("1");
-      setSelectedCycleRank("");
-      setSelectedCycleTerm("");
-      setPersistedDraft(storedDraft);
-      if (!silent) {
-        setGenerationSuccess(`Loaded saved draft from previous session (${storedDraft.label}).`);
-      }
-      return true;
-    }
-
-    if (!silent) {
-      setGenerationError("No generated alternatives found. Run generation from the Generator page.");
-    }
-    return false;
-  };
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
 
   useEffect(() => {
-    loadGeneratedAlternativesFromCache();
-  }, []);
-
-  useEffect(() => {
-    let active = true;
     listPrograms()
-      .then((items) => {
-        if (!active) {
-          return;
-        }
-        setPrograms(items);
-        setProgramError(null);
-      })
-      .catch((error) => {
-        if (!active) {
-          return;
-        }
-        const message = error instanceof Error ? error.message : "Unable to load programs";
-        setProgramError(message);
-        setPrograms([]);
-      });
-
-    return () => {
-      active = false;
-    };
+      .then((items) => setPrograms(items))
+      .catch(() => setPrograms([]));
   }, []);
 
   useEffect(() => {
-    let active = true;
-    Promise.allSettled([fetchWorkingHours(), fetchSchedulePolicy()]).then(([workingResult, policyResult]) => {
-      if (!active) {
-        return;
+    const pickLocalSnapshot = () => {
+      const local = loadGeneratedDraft();
+      if (!local) {
+        return false;
       }
-      if (workingResult.status === "fulfilled") {
-        setWorkingHours(workingResult.value.hours);
-      }
-      if (policyResult.status === "fulfilled") {
-        setSchedulePolicy(policyResult.value);
-      }
-      if (workingResult.status !== "fulfilled" || policyResult.status !== "fulfilled") {
-        setSettingsError("Unable to load slot template settings. Schedule data is still available.");
-      } else {
-        setSettingsError(null);
-      }
-    });
+      setLatestDraftPayload(local.payload);
+      setLatestDraftLabel(local.label);
+      return true;
+    };
+
+    let isActive = true;
+    setIsLoadingDraft(true);
+    fetchLatestGeneratedDraftSnapshot()
+      .then((snapshot) => {
+        if (!isActive) {
+          return;
+        }
+        if (!snapshot) {
+          const hasLocal = pickLocalSnapshot();
+          if (!hasLocal) {
+            setLatestDraftPayload(null);
+            setLatestDraftLabel(null);
+          }
+          return;
+        }
+        // Prefer backend snapshot when available so full cycle snapshots are not overridden
+        // by a single-term local draft saved from the generator preview.
+        setLatestDraftPayload(snapshot.payload);
+        setLatestDraftLabel(snapshot.version.label);
+      })
+      .catch(() => {
+        if (!isActive) {
+          return;
+        }
+        const hasLocal = pickLocalSnapshot();
+        if (!hasLocal) {
+          setLatestDraftPayload(null);
+          setLatestDraftLabel(null);
+        }
+      })
+      .finally(() => {
+        if (isActive) {
+          setIsLoadingDraft(false);
+        }
+      });
 
     return () => {
-      active = false;
+      isActive = false;
     };
+  }, [workspaceRefreshNonce]);
+
+  const workspaceSeedPayload = latestDraftPayload ?? officialPayload;
+
+  useEffect(() => {
+    if (!workspaceSeedPayload) {
+      setWorkingPayload(null);
+      setIsDirty(false);
+      setUndoStack([]);
+      setRedoStack([]);
+      setConflictPopup(null);
+      return;
+    }
+    if (!isDirty) {
+      setWorkingPayload(clonePayload(workspaceSeedPayload));
+      setUndoStack([]);
+      setRedoStack([]);
+      setConflictPopup(null);
+    }
+  }, [isDirty, workspaceSeedPayload]);
+
+  const activeProgramId = workingPayload?.programId ?? "";
+
+  useEffect(() => {
+    if (!activeProgramId) {
+      setDailySlots([]);
+      return;
+    }
+    getProgramConstraint(activeProgramId)
+      .then((constraint) => {
+        const sorted = [...(constraint.daily_time_slots ?? [])].sort((left, right) =>
+          parseTimeToMinutes(left.start_time) - parseTimeToMinutes(right.start_time),
+        );
+        setDailySlots(sorted);
+      })
+      .catch(() => setDailySlots([]));
+  }, [activeProgramId]);
+
+  const loadChangeRequests = useCallback(async () => {
+    setRequestsLoading(true);
+    try {
+      const data = await listTimetableChangeRequests();
+      setChangeRequests(data);
+    } catch (err) {
+      setError(toUiError(err));
+    } finally {
+      setRequestsLoading(false);
+    }
   }, []);
 
-  const activeProgramIdForStructure = filters.programId !== ALL ? filters.programId : (displayPayload.programId ?? "");
+  useEffect(() => {
+    void loadChangeRequests();
+  }, [loadChangeRequests]);
 
   useEffect(() => {
-    if (!activeProgramIdForStructure) {
-      setProgramTerms([]);
-      setProgramSections([]);
+    if (!workingPayload) {
+      setConflictReview(null);
+      setConflictReviewError(null);
+      setIsReviewLoading(false);
       return;
     }
-    let active = true;
-    Promise.allSettled([listProgramTerms(activeProgramIdForStructure), listProgramSections(activeProgramIdForStructure)]).then(
-      ([termsResult, sectionsResult]) => {
-        if (!active) {
-          return;
-        }
-        setProgramTerms(
-          termsResult.status === "fulfilled"
-            ? [...termsResult.value].sort((left, right) => left.term_number - right.term_number)
-            : [],
-        );
-        setProgramSections(
-          sectionsResult.status === "fulfilled"
-            ? [...sectionsResult.value].sort((left, right) => sectionSort(left.name, right.name))
-            : [],
-        );
-      },
-    );
+
+    let isActive = true;
+    const timer = window.setTimeout(() => {
+      setIsReviewLoading(true);
+      setConflictReviewError(null);
+      reviewTimetableConflicts(workingPayload)
+        .then((data) => {
+          if (!isActive) {
+            return;
+          }
+          setConflictReview(data);
+        })
+        .catch((err) => {
+          if (!isActive) {
+            return;
+          }
+          setConflictReview(null);
+          setConflictReviewError(toUiError(err));
+        })
+        .finally(() => {
+          if (isActive) {
+            setIsReviewLoading(false);
+          }
+        });
+    }, 250);
 
     return () => {
-      active = false;
+      isActive = false;
+      window.clearTimeout(timer);
     };
-  }, [activeProgramIdForStructure]);
+  }, [conflictReviewRefreshNonce, workingPayload]);
 
-  useEffect(() => {
-    if (!displayPayload.programId) {
-      return;
-    }
-    setFilters((previous) => {
-      if (previous.programId !== ALL) {
-        return previous;
-      }
-      return { ...previous, programId: displayPayload.programId ?? ALL };
-    });
-  }, [displayPayload.programId]);
+  const programById = useMemo(() => new Map(programs.map((item) => [item.id, item])), [programs]);
+  const activeProgram = activeProgramId ? programById.get(activeProgramId) : undefined;
 
-  useEffect(() => {
-    if (!hasOfficial) {
-      setConflicts([]);
-      setConflictsError(null);
-      return;
-    }
-    let active = true;
-    setConflictsLoading(true);
-    fetchTimetableConflicts()
-      .then((report) => {
-        if (!active) {
-          return;
-        }
-        setConflicts(report.conflicts);
-        setConflictsError(null);
-      })
-      .catch((error) => {
-        if (!active) {
-          return;
-        }
-        const message = error instanceof Error ? error.message : "Unable to load conflicts";
-        setConflictsError(message);
-      })
-      .finally(() => {
-        if (!active) {
-          return;
-        }
-        setConflictsLoading(false);
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [hasOfficial]);
-
-  useEffect(() => {
-    if (!hasOfficial) {
-      setFacultyMappings([]);
-      setMappingError(null);
-      return;
-    }
-    let active = true;
-    setMappingLoading(true);
-    fetchOfficialFacultyMappings()
-      .then((items) => {
-        if (!active) {
-          return;
-        }
-        setFacultyMappings(items);
-        setMappingError(null);
-      })
-      .catch((error) => {
-        if (!active) {
-          return;
-        }
-        const message = error instanceof Error ? error.message : "Unable to load faculty-course mapping";
-        setMappingError(message);
-        setFacultyMappings([]);
-      })
-      .finally(() => {
-        if (!active) {
-          return;
-        }
-        setMappingLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [hasOfficial, displayPayload.timetableData.length]);
-
-  useEffect(() => {
-    if (!cyclePareto.length) {
-      setSelectedCycleRank("");
-      setSelectedCycleTerm("");
-      return;
-    }
-    if (!cyclePareto.some((item) => String(item.rank) === selectedCycleRank)) {
-      setSelectedCycleRank(String(cyclePareto[0].rank));
-    }
-  }, [cyclePareto, selectedCycleRank]);
-
-  useEffect(() => {
-    if (!activeCycleSolution?.terms.length) {
-      setSelectedCycleTerm("");
-      return;
-    }
-    if (!activeCycleSolution.terms.some((item) => String(item.term_number) === selectedCycleTerm)) {
-      setSelectedCycleTerm(String(activeCycleSolution.terms[0].term_number));
-    }
-  }, [activeCycleSolution, selectedCycleTerm]);
-
-  useEffect(() => {
-    if (generationMode === "single" && activeSingleAlternative) {
-      const snapshot = buildSingleDraftSnapshot({
-        source: "schedule",
-        mode: "single",
-        programId:
-          activeSingleAlternative.payload.programId ??
-          (filters.programId !== ALL ? filters.programId : undefined),
-        termNumber:
-          activeSingleAlternative.payload.termNumber ??
-          (filters.semester !== ALL ? Number(filters.semester) : null),
-        alternative: activeSingleAlternative,
-      });
-      setPersistedDraft(snapshot);
-      saveGeneratedDraft(snapshot);
-      return;
-    }
-    if (generationMode !== "single" && activeCycleTermEntry) {
-      const snapshot = buildCycleTermDraftSnapshot({
-        source: "schedule",
-        mode: generationMode,
-        programId:
-          activeCycleTermEntry.payload.programId ??
-          (filters.programId !== ALL ? filters.programId : undefined),
-        solutionRank: activeCycleSolution?.rank,
-        term: activeCycleTermEntry,
-      });
-      setPersistedDraft(snapshot);
-      saveGeneratedDraft(snapshot);
-    }
-  }, [
-    activeCycleSolution?.rank,
-    activeCycleTermEntry,
-    activeSingleAlternative,
-    filters.programId,
-    filters.semester,
-    generationMode,
-  ]);
-
-  const departmentOptions = useMemo(() => {
-    const options = new Set<string>();
-    for (const program of programs) {
-      if (program.department.trim()) {
-        options.add(program.department.trim());
-      }
-    }
-    for (const faculty of facultyData) {
-      if (faculty.department.trim()) {
-        options.add(faculty.department.trim());
-      }
-    }
-    if (fallbackProgramDepartment?.trim()) {
-      options.add(fallbackProgramDepartment.trim());
-    }
-    return Array.from(options).sort((left, right) => left.localeCompare(right));
-  }, [programs, facultyData, fallbackProgramDepartment]);
-
-  const visiblePrograms = useMemo(() => {
-    if (filters.department === ALL) {
-      return programs;
-    }
-    const selectedDepartment = normalize(filters.department);
-    return programs.filter((program) => normalize(program.department) === selectedDepartment);
-  }, [filters.department, programs]);
-
-  useEffect(() => {
-    if (filters.programId === ALL) {
-      return;
-    }
-    if (visiblePrograms.some((program) => program.id === filters.programId)) {
-      return;
-    }
-    setFilters((previous) => ({ ...previous, programId: ALL }));
-  }, [filters.programId, visiblePrograms]);
+  const courseById = useMemo(() => new Map((workingPayload?.courseData ?? []).map((item) => [item.id, item])), [workingPayload?.courseData]);
+  const facultyById = useMemo(() => new Map((workingPayload?.facultyData ?? []).map((item) => [item.id, item])), [workingPayload?.facultyData]);
+  const roomById = useMemo(() => new Map((workingPayload?.roomData ?? []).map((item) => [item.id, item])), [workingPayload?.roomData]);
 
   const semesterOptions = useMemo(() => {
-    const options = new Set<string>();
-    if (displayPayload.termNumber !== undefined && displayPayload.termNumber !== null) {
-      options.add(String(displayPayload.termNumber));
-    }
-    for (const term of programTerms) {
-      options.add(String(term.term_number));
-    }
-    for (const section of programSections) {
-      options.add(String(section.term_number));
-    }
-    for (const term of TERM_OPTIONS) {
-      options.add(term);
-    }
-    return Array.from(options).sort((left, right) => Number(left) - Number(right));
-  }, [displayPayload.termNumber, programSections, programTerms]);
+    const values = new Set<number>();
 
-  useEffect(() => {
-    if (filters.semester === ALL) {
-      return;
-    }
-    if (semesterOptions.includes(filters.semester)) {
-      return;
-    }
-    setFilters((previous) => ({ ...previous, semester: ALL }));
-  }, [filters.semester, semesterOptions]);
-
-  const sectionOptions = useMemo(() => {
-    const options = new Set<string>();
-    for (const slot of timetableData) {
-      if (slot.section.trim()) {
-        options.add(slot.section.trim());
+    if (activeProgram && Number.isFinite(activeProgram.duration_years) && activeProgram.duration_years > 0) {
+      const maxSemester = activeProgram.duration_years * 2;
+      for (let semester = 1; semester <= maxSemester; semester += 1) {
+        values.add(semester);
       }
     }
-    for (const section of programSections) {
-      if (filters.semester !== ALL && String(section.term_number) !== filters.semester) {
-        continue;
-      }
-      if (section.name.trim()) {
-        options.add(section.name.trim());
-      }
-    }
-    return Array.from(options).sort(sectionSort);
-  }, [filters.semester, programSections, timetableData]);
 
-  useEffect(() => {
-    if (filters.section === ALL) {
-      return;
-    }
-    if (sectionOptions.includes(filters.section)) {
-      return;
-    }
-    setFilters((previous) => ({ ...previous, section: ALL }));
-  }, [filters.section, sectionOptions]);
-
-  const facultyOptions = useMemo(() => {
-    const selectedDepartment = normalize(filters.department);
-    return [...facultyData]
-      .filter((faculty) => {
-        if (!selectedDepartment) {
-          return true;
+    if (workingPayload) {
+      for (const course of workingPayload.courseData) {
+        const semesterNumber = course.semesterNumber;
+        if (typeof semesterNumber === "number" && Number.isFinite(semesterNumber) && semesterNumber > 0) {
+          values.add(semesterNumber);
         }
-        return normalize(faculty.department) === selectedDepartment;
-      })
-      .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }));
-  }, [facultyData, filters.department]);
+      }
+      for (const slot of workingPayload.timetableData) {
+        const course = courseById.get(slot.courseId);
+        const semesterNumber = typeof course?.semesterNumber === "number" && course.semesterNumber > 0
+          ? course.semesterNumber
+          : (workingPayload.termNumber ?? null);
+        if (typeof semesterNumber === "number" && Number.isFinite(semesterNumber) && semesterNumber > 0) {
+          values.add(semesterNumber);
+        }
+      }
+    }
+
+    return Array.from(values).sort((left, right) => left - right);
+  }, [activeProgram, courseById, workingPayload]);
 
   useEffect(() => {
-    if (filters.facultyId === ALL) {
+    if (selectedSemester === "all") {
       return;
     }
-    if (facultyOptions.some((faculty) => faculty.id === filters.facultyId)) {
+    if (!semesterOptions.includes(Number(selectedSemester))) {
+      setSelectedSemester("all");
+    }
+  }, [selectedSemester, semesterOptions]);
+
+  const facultyOptions = useMemo(
+    () => [...(workingPayload?.facultyData ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
+    [workingPayload?.facultyData],
+  );
+
+  useEffect(() => {
+    if (selectedFacultyId === "all") {
       return;
     }
-    setFilters((previous) => ({ ...previous, facultyId: ALL }));
-  }, [facultyOptions, filters.facultyId]);
+    if (!facultyOptions.some((item) => item.id === selectedFacultyId)) {
+      setSelectedFacultyId("all");
+    }
+  }, [facultyOptions, selectedFacultyId]);
 
   const roomOptions = useMemo(
-    () =>
-      [...roomData].sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" })),
-    [roomData],
+    () => [...(workingPayload?.roomData ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
+    [workingPayload?.roomData],
   );
+
+  const sectionOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const output: string[] = [];
+    const register = (value: string) => {
+      const normalized = value.trim();
+      if (!normalized) {
+        return;
+      }
+      const key = normalized.toUpperCase();
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      output.push(normalized);
+    };
+
+    if (activeProgram && Number.isFinite(activeProgram.sections) && activeProgram.sections > 0) {
+      for (let index = 1; index <= activeProgram.sections; index += 1) {
+        register(sectionLabelFromIndex(index));
+      }
+    }
+
+    if (workingPayload) {
+      for (const slot of workingPayload.timetableData) {
+        register(String(slot.section || ""));
+      }
+    }
+
+    output.sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" }));
+    return output;
+  }, [activeProgram, workingPayload]);
 
   useEffect(() => {
-    if (filters.roomId === ALL) {
+    if (selectedSection === "all") {
       return;
     }
-    if (roomOptions.some((room) => room.id === filters.roomId)) {
+    if (!sectionOptions.some((item) => item.localeCompare(selectedSection, undefined, { sensitivity: "base" }) === 0)) {
+      setSelectedSection("all");
+    }
+  }, [sectionOptions, selectedSection]);
+
+  useEffect(() => {
+    if (selectedRoomId === "all") {
       return;
     }
-    setFilters((previous) => ({ ...previous, roomId: ALL }));
-  }, [filters.roomId, roomOptions]);
+    if (!roomOptions.some((item) => item.id === selectedRoomId)) {
+      setSelectedRoomId("all");
+    }
+  }, [roomOptions, selectedRoomId]);
 
-  const filteredSlots = useMemo(
-    () =>
-      applyFilters({
-        slots: timetableData,
-        filters,
-        payloadProgramId: displayPayload.programId,
-        payloadTermNumber: displayPayload.termNumber,
-        fallbackDepartment: fallbackProgramDepartment,
-        facultyById,
-      }),
-    [
-      displayPayload.programId,
-      displayPayload.termNumber,
-      facultyById,
-      fallbackProgramDepartment,
-      filters,
-      timetableData,
-    ],
+  useEffect(() => {
+    if (publishSemester === "all") {
+      return;
+    }
+    if (!semesterOptions.includes(Number(publishSemester))) {
+      setPublishSemester("all");
+    }
+  }, [publishSemester, semesterOptions]);
+
+  useEffect(() => {
+    if (publishSection === "all") {
+      return;
+    }
+    if (!sectionOptions.some((item) => item.localeCompare(publishSection, undefined, { sensitivity: "base" }) === 0)) {
+      setPublishSection("all");
+    }
+  }, [publishSection, sectionOptions]);
+
+  useEffect(() => {
+    if (publishFacultyId === "all") {
+      return;
+    }
+    if (!facultyOptions.some((item) => item.id === publishFacultyId)) {
+      setPublishFacultyId("all");
+    }
+  }, [facultyOptions, publishFacultyId]);
+
+  useEffect(() => {
+    if (publishRoomId === "all") {
+      return;
+    }
+    if (!roomOptions.some((item) => item.id === publishRoomId)) {
+      setPublishRoomId("all");
+    }
+  }, [publishRoomId, roomOptions]);
+
+  const filteredSlots = useMemo(() => {
+    if (!workingPayload) {
+      return [] as TimeSlot[];
+    }
+    return workingPayload.timetableData.filter((slot) => {
+      const course = courseById.get(slot.courseId);
+      const slotSemester = typeof course?.semesterNumber === "number"
+        ? String(course.semesterNumber)
+        : (workingPayload.termNumber !== null && workingPayload.termNumber !== undefined
+          ? String(workingPayload.termNumber)
+          : null);
+      if (selectedSemester !== "all" && slotSemester !== selectedSemester) {
+        return false;
+      }
+      if (selectedSection !== "all" && slot.section.trim().toUpperCase() !== selectedSection.toUpperCase()) {
+        return false;
+      }
+      if (selectedFacultyId !== "all" && slot.facultyId !== selectedFacultyId && !(slot.assistantFacultyIds ?? []).includes(selectedFacultyId)) {
+        return false;
+      }
+      if (selectedRoomId !== "all" && slot.roomId !== selectedRoomId) {
+        return false;
+      }
+      if (isRemovedLegacySlotRange(slot.startTime, slot.endTime)) {
+        return false;
+      }
+      const slotIsLunch = isCanonicalLunchRange(slot.startTime, slot.endTime);
+      if (overlapsCanonicalLunchWindow(slot.startTime, slot.endTime) && !slotIsLunch) {
+        return false;
+      }
+      return true;
+    });
+  }, [courseById, selectedFacultyId, selectedRoomId, selectedSection, selectedSemester, workingPayload]);
+
+  const formatScopeLabel = useCallback(
+    (semester: string, section: string, facultyId: string, roomId: string): string => {
+      const parts: string[] = [];
+      if (semester !== "all") {
+        parts.push(`Semester ${semester}`);
+      }
+      if (section !== "all") {
+        parts.push(`Section ${section}`);
+      }
+      if (facultyId !== "all") {
+        parts.push(`Faculty ${facultyById.get(facultyId)?.name ?? facultyId}`);
+      }
+      if (roomId !== "all") {
+        parts.push(`Room ${roomById.get(roomId)?.name ?? roomId}`);
+      }
+      return parts.length ? parts.join(" • ") : "All Timetable Slots";
+    },
+    [facultyById, roomById],
   );
 
-  const resolvedSlots = useMemo<ResolvedSlot[]>(() => {
-    return filteredSlots.map((slot) => ({
-      slot,
-      course: courseById.get(slot.courseId),
-      room: roomById.get(slot.roomId),
-      faculty: facultyById.get(slot.facultyId),
-    }));
-  }, [courseById, facultyById, filteredSlots, roomById]);
+  const publishFilteredSlots = useMemo(() => {
+    if (!workingPayload) {
+      return [] as TimeSlot[];
+    }
+    return workingPayload.timetableData.filter((slot) => {
+      const course = courseById.get(slot.courseId);
+      const slotSemester = typeof course?.semesterNumber === "number"
+        ? String(course.semesterNumber)
+        : (workingPayload.termNumber !== null && workingPayload.termNumber !== undefined
+          ? String(workingPayload.termNumber)
+          : null);
+      if (publishSemester !== "all" && slotSemester !== publishSemester) {
+        return false;
+      }
+      if (publishSection !== "all" && slot.section.trim().toUpperCase() !== publishSection.toUpperCase()) {
+        return false;
+      }
+      if (publishFacultyId !== "all" && slot.facultyId !== publishFacultyId && !(slot.assistantFacultyIds ?? []).includes(publishFacultyId)) {
+        return false;
+      }
+      if (publishRoomId !== "all" && slot.roomId !== publishRoomId) {
+        return false;
+      }
+      if (isRemovedLegacySlotRange(slot.startTime, slot.endTime)) {
+        return false;
+      }
+      const slotIsLunch = isCanonicalLunchRange(slot.startTime, slot.endTime);
+      if (overlapsCanonicalLunchWindow(slot.startTime, slot.endTime) && !slotIsLunch) {
+        return false;
+      }
+      return true;
+    });
+  }, [courseById, publishFacultyId, publishRoomId, publishSection, publishSemester, workingPayload]);
 
-  const hasGeneratedButFilteredOut = useMemo(
-    () => showingGenerated && timetableData.length > 0 && resolvedSlots.length === 0,
-    [resolvedSlots.length, showingGenerated, timetableData.length],
+  const viewScopeLabel = useMemo(
+    () => formatScopeLabel(selectedSemester, selectedSection, selectedFacultyId, selectedRoomId),
+    [formatScopeLabel, selectedFacultyId, selectedRoomId, selectedSection, selectedSemester],
   );
+  const publishScopeLabel = useMemo(
+    () => formatScopeLabel(publishSemester, publishSection, publishFacultyId, publishRoomId),
+    [formatScopeLabel, publishFacultyId, publishRoomId, publishSection, publishSemester],
+  );
+
+  const publishSlots = useMemo(() => {
+    if (!workingPayload) {
+      return [] as TimeSlot[];
+    }
+    const sanitize = (slots: TimeSlot[]) =>
+      slots.filter((slot) => {
+        if (isRemovedLegacySlotRange(slot.startTime, slot.endTime)) {
+          return false;
+        }
+        const slotIsLunch = isCanonicalLunchRange(slot.startTime, slot.endTime);
+        if (overlapsCanonicalLunchWindow(slot.startTime, slot.endTime) && !slotIsLunch) {
+          return false;
+        }
+        return true;
+      });
+    if (publishScopeMode === "all") {
+      return sanitize(workingPayload.timetableData);
+    }
+    return sanitize(publishFilteredSlots);
+  }, [publishFilteredSlots, publishScopeMode, workingPayload]);
+
+  const publishPayload = useMemo(() => {
+    if (!workingPayload) {
+      return null;
+    }
+    return buildScopedPayload(workingPayload, publishSlots);
+  }, [publishSlots, workingPayload]);
 
   const days = useMemo(() => {
-    const configured = buildTemplateDays(workingHours);
-    if (configured.length) {
-      return configured;
-    }
-    const fromSlots = Array.from(new Set(resolvedSlots.map((item) => item.slot.day))).sort(daySort);
-    return fromSlots.length ? fromSlots : DAY_SEQUENCE.slice(0, 5);
-  }, [resolvedSlots, workingHours]);
+    const values = new Set(filteredSlots.map((slot) => slot.day));
+    const ordered = DAY_ORDER.filter((day) => values.has(day));
+    return ordered.length ? ordered : DAY_ORDER.slice(0, 5);
+  }, [filteredSlots]);
 
-  const startTimes = useMemo(() => {
-    const configured = buildTemplateTimeSlots(workingHours, schedulePolicy);
-    if (configured.length) {
-      return configured;
-    }
-    const fromSlots = Array.from(new Set(resolvedSlots.map((item) => item.slot.startTime)));
-    return sortTimes(fromSlots);
-  }, [resolvedSlots, schedulePolicy, workingHours]);
+  const rows = useMemo(() => buildGridRows(filteredSlots, dailySlots), [dailySlots, filteredSlots]);
 
-  const cellMap = useMemo(() => {
-    const map = new Map<string, ResolvedSlot[]>();
-    for (const item of resolvedSlots) {
-      const key = `${item.slot.day}|${item.slot.startTime}`;
-      const existing = map.get(key) ?? [];
-      existing.push(item);
-      map.set(key, existing);
-    }
-    for (const values of map.values()) {
-      values.sort((left, right) => slotSort(left.slot, right.slot));
-    }
-    return map;
-  }, [resolvedSlots]);
+  const cellEntries = useMemo(
+    () => buildCellEntries(filteredSlots, courseById, facultyById, roomById),
+    [courseById, facultyById, filteredSlots, roomById],
+  );
 
-  const rowEndByStart = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const item of resolvedSlots) {
-      if (!map.has(item.slot.startTime)) {
-        map.set(item.slot.startTime, item.slot.endTime);
-      }
-    }
-    for (const start of startTimes) {
-      if (map.has(start)) {
-        continue;
-      }
-      const baseMinutes = parseTimeToMinutes(start);
-      if (Number.isFinite(baseMinutes)) {
-        map.set(start, toTimeString(baseMinutes + schedulePolicy.period_minutes));
-      }
-    }
-    return map;
-  }, [resolvedSlots, schedulePolicy.period_minutes, startTimes]);
+  const pendingRequests = useMemo(
+    () => changeRequests.filter((item) => item.status === "pending"),
+    [changeRequests],
+  );
 
-  const statSections = useMemo(() => new Set(resolvedSlots.map((item) => item.slot.section)).size, [resolvedSlots]);
-  const statFaculty = useMemo(() => new Set(resolvedSlots.map((item) => item.slot.facultyId)).size, [resolvedSlots]);
-  const statRooms = useMemo(() => new Set(resolvedSlots.map((item) => item.slot.roomId)).size, [resolvedSlots]);
+  const recentRequests = useMemo(
+    () => [...changeRequests].slice(0, 8),
+    [changeRequests],
+  );
 
-  const handleFilterChange = (field: keyof Filters, value: string) => {
-    setFilters((previous) => ({ ...previous, [field]: value }));
-  };
+  const pendingReviewConflicts = useMemo(
+    () => conflictReview?.pendingConflicts ?? [],
+    [conflictReview?.pendingConflicts],
+  );
+  const autoResolvedReviewConflicts = useMemo(
+    () => conflictReview?.autoResolvedConflicts ?? [],
+    [conflictReview?.autoResolvedConflicts],
+  );
+  const manualResolvedReviewConflicts = useMemo(
+    () => conflictReview?.manuallyResolvedConflicts ?? [],
+    [conflictReview?.manuallyResolvedConflicts],
+  );
+  const resolvedReviewCount = autoResolvedReviewConflicts.length + manualResolvedReviewConflicts.length;
 
-  const clearFilters = () => {
-    setFilters({
-      department: ALL,
-      programId: displayPayload.programId ?? ALL,
-      semester: ALL,
-      section: ALL,
-      roomId: ALL,
-      facultyId: ALL,
-    });
-  };
+  const applyPayload = useCallback(
+    (
+      payload: OfficialTimetablePayload,
+      message: string,
+      options?: { trackHistory?: boolean },
+    ) => {
+      setWorkingPayload((current) => {
+        if (options?.trackHistory !== false && current) {
+          setUndoStack((previous) => [...previous.slice(-(MAX_HISTORY_STEPS - 1)), clonePayload(current)]);
+          setRedoStack([]);
+        }
+        return clonePayload(payload);
+      });
+      setIsDirty(true);
+      setError(null);
+      setConflictPopup(null);
+      setSuccess(message);
+    },
+    [],
+  );
 
-  const refreshConflicts = async () => {
-    if (!hasOfficial) {
-      setConflicts([]);
+  const handleUndo = useCallback(() => {
+    if (!workingPayload || !undoStack.length) {
       return;
     }
-    setConflictsLoading(true);
-    setConflictsError(null);
+    const previousPayload = undoStack[undoStack.length - 1];
+    setUndoStack((previous) => previous.slice(0, -1));
+    setRedoStack((previous) => [...previous.slice(-(MAX_HISTORY_STEPS - 1)), clonePayload(workingPayload)]);
+    setWorkingPayload(clonePayload(previousPayload));
+    setConflictPopup(null);
+    setIsDirty(true);
+    setError(null);
+    setSuccess("Undid last timetable change.");
+    safeVibrate([10, 20, 10]);
+  }, [undoStack, workingPayload]);
+
+  const handleRedo = useCallback(() => {
+    if (!workingPayload || !redoStack.length) {
+      return;
+    }
+    const nextPayload = redoStack[redoStack.length - 1];
+    setRedoStack((previous) => previous.slice(0, -1));
+    setUndoStack((previous) => [...previous.slice(-(MAX_HISTORY_STEPS - 1)), clonePayload(workingPayload)]);
+    setWorkingPayload(clonePayload(nextPayload));
+    setConflictPopup(null);
+    setIsDirty(true);
+    setError(null);
+    setSuccess("Reapplied timetable change.");
+    safeVibrate(18);
+  }, [redoStack, workingPayload]);
+
+  const handleMoveSlot = useCallback(async (
+    params: {
+      slotId: string;
+      targetDay: string;
+      targetStartTime: string;
+      targetEndTime: string;
+      dropClientX?: number;
+      dropClientY?: number;
+    },
+  ) => {
+    if (!workingPayload || isApplyingMove) {
+      return;
+    }
+
+    const sourceSlot = workingPayload.timetableData.find((slot) => slot.id === params.slotId);
+    if (!sourceSlot) {
+      return;
+    }
+
+    if (
+      sourceSlot.day === params.targetDay
+      && sourceSlot.startTime === params.targetStartTime
+      && sourceSlot.endTime === params.targetEndTime
+    ) {
+      return;
+    }
+
+    if (isLunchReservedWindow(params.targetStartTime, params.targetEndTime)) {
+      setError("1:15 PM to 2:05 PM is always reserved as lunch break. Drop the class in another teaching slot.");
+      safeVibrate([30, 20, 30]);
+      return;
+    }
+
+    setIsApplyingMove(true);
+    setError(null);
+    setSuccess(null);
+    setConflictPopup(null);
+
     try {
-      const report = await fetchTimetableConflicts();
-      setConflicts(report.conflicts);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to load conflicts";
-      setConflictsError(message);
+      const candidatePayload = clonePayload(workingPayload);
+      const candidateSlot = candidatePayload.timetableData.find((slot) => slot.id === params.slotId);
+      if (!candidateSlot) {
+        throw new Error("Selected class slot is no longer available.");
+      }
+
+      candidateSlot.day = params.targetDay;
+      candidateSlot.startTime = params.targetStartTime;
+      candidateSlot.endTime = params.targetEndTime;
+      candidateSlot.roomId = sourceSlot.roomId;
+      candidateSlot.facultyId = sourceSlot.facultyId;
+      candidateSlot.section = sourceSlot.section;
+
+      const report = await analyzeTimetableConflicts(candidatePayload);
+      const impacted = report.conflicts.filter(
+        (item) => !item.resolved && item.affected_slots.includes(params.slotId),
+      );
+
+      if (!impacted.length) {
+        applyPayload(candidatePayload, "Class moved successfully.");
+        safeVibrate(16);
+        return;
+      }
+
+      const roomOnly = impacted.every((item) => ROOM_ONLY_CONFLICT_TYPES.has(item.conflict_type));
+      const alternatives = findAlternativeTimeSlots(candidatePayload, params.slotId, dailySlots);
+      const alternativeText = alternatives.length
+        ? ` Suggested free slots: ${alternatives.map((item) => `${item.day} ${item.startTime}-${item.endTime}`).join(" | ")}.`
+        : "";
+      const availableRooms = roomOnly ? findAvailableRoomsForSlot(candidatePayload, params.slotId) : [];
+      const slotConflictTypes = [...new Set(impacted.map((item) => item.conflict_type))];
+
+      const fallbackX = typeof window !== "undefined" ? Math.floor(window.innerWidth * 0.6) : 420;
+      const fallbackY = typeof window !== "undefined" ? Math.floor(window.innerHeight * 0.4) : 240;
+
+      setConflictPopup({
+        payload: candidatePayload,
+        slotId: params.slotId,
+        conflictTypeLabels: slotConflictTypes,
+        availableRooms,
+        selectedRoomId: availableRooms[0]?.id ?? "",
+        anchorX: params.dropClientX ?? fallbackX,
+        anchorY: params.dropClientY ?? fallbackY,
+        message: roomOnly
+          ? (
+              availableRooms.length
+                ? "Room-related conflict detected. Select a free room below to keep this class at the same time."
+                : `Room-related conflict detected, but no free room is currently available.${alternativeText}`
+            )
+          : `Move blocked by scheduling conflicts (faculty/section overlap or restricted constraints).${alternativeText}`,
+      });
+    } catch (err) {
+      setError(toUiError(err));
+      safeVibrate([30, 20, 30]);
     } finally {
-      setConflictsLoading(false);
+      setIsApplyingMove(false);
     }
-  };
+  }, [applyPayload, dailySlots, isApplyingMove, workingPayload]);
 
-  /* 
-  const handleConflictDecision = async (conflictId: string, decision: "yes" | "no") => {
-    // Deprecated in favor of Conflict Dashboard
-  }; 
-  */
-
-  const handleRefreshWorkspace = async () => {
-    await refreshOfficial();
-    await refreshConflicts();
-  };
-
-  const handleUseOfficialView = () => {
-    setSingleGeneration(null);
-    setCycleGeneration(null);
-    setSelectedAlternativeRank("1");
-    setSelectedCycleRank("");
-    setSelectedCycleTerm("");
-    setPersistedDraft(null);
-    clearGeneratedDraft();
-    setGenerationSuccess("Switched to official published timetable view.");
-    setGenerationError(null);
-  };
-
-  const handleReloadGeneratedAlternatives = () => {
-    loadGeneratedAlternativesFromCache();
-  };
-
-  const handleCycleMove = (delta: number) => {
-    if (!cyclePareto.length) {
+  const handleDownload = () => {
+    if (!workingPayload) {
+      setError("No timetable is loaded for download.");
       return;
     }
-    const currentIndex = cyclePareto.findIndex((item) => String(item.rank) === selectedCycleRank);
-    const safeIndex = currentIndex >= 0 ? currentIndex : 0;
-    const nextIndex = (safeIndex + delta + cyclePareto.length) % cyclePareto.length;
-    setSelectedCycleRank(String(cyclePareto[nextIndex].rank));
+    if (!filteredSlots.length) {
+      setError("No slots available in current view to download.");
+      return;
+    }
+
+    const scopeLabel = viewScopeLabel;
+    const filename = `schedule-${sanitizeFileName(scopeLabel)}.${exportFormat}`;
+    const semesterLabel = selectedSemester === "all" ? "All Semesters" : `Semester ${selectedSemester}`;
+    const payload = {
+      filename,
+      title: "TIMETABLE",
+      subtitle: `Generated from ShedForge Schedule Workspace • ${new Date().toLocaleString()}`,
+      viewLabel: "Filtered View",
+      scopeLabel,
+      semesterLabel,
+      sourceLabel: isDirty ? "Draft edits" : "Official timetable",
+      departmentLabel: activeProgram?.department ?? "N/A",
+      programLabel: activeProgram?.name ?? "N/A",
+      slots: filteredSlots,
+      courses: workingPayload.courseData,
+      rooms: workingPayload.roomData,
+      faculty: workingPayload.facultyData,
+    };
+
+    if (exportFormat === "pdf") {
+      downloadTimetablePdf(payload);
+    } else {
+      void downloadTimetableXlsx(payload);
+    }
+    setError(null);
+    setSuccess(`Downloaded ${scopeLabel} timetable as ${exportFormat.toUpperCase()}.`);
   };
 
-  const handlePublish = async (force: boolean = false) => {
-    if (!canManage) {
+  const handlePublishAndDistribute = async (force = false) => {
+    if (!publishPayload) {
+      setError("No timetable available to publish.");
       return;
     }
-    const conflictCount = activeDraftHardConflicts ?? 0;
-    if (!force && showingGenerated && conflictCount > 0) {
-      setIsPublishConfirmOpen(true);
-      return;
-    }
-    const payloadToPublish = activeDraftPayload ?? (hasOfficial ? officialPayload : null);
-    if (!payloadToPublish || !payloadToPublish.timetableData.length) {
-      setPublishError("No timetable payload available for publishing.");
+    if (!publishSlots.length) {
+      setError("No timetable slots in selected publish scope.");
       return;
     }
 
     setIsPublishing(true);
-    setPublishError(null);
-    setPublishSuccess(null);
-    setOfflinePublishError(null);
-    setOfflinePublishSuccess(null);
-
+    setError(null);
+    setSuccess(null);
     try {
-      await publishOfficialTimetable(payloadToPublish, versionLabel, force);
-      const modeLabel = showingGenerated ? "selected generated schedule" : "official schedule";
-      setPublishSuccess(`Published ${modeLabel} successfully.`);
+      if (!force) {
+        const report = await analyzeTimetableConflicts(publishPayload);
+        const hardUnresolved = report.conflicts.filter((item) => !item.resolved && item.severity === "hard");
+        if (hardUnresolved.length) {
+          const topItems = hardUnresolved.slice(0, 3);
+          const detail = topItems
+            .map((item, index) => `${index + 1}. ${item.description || conflictLabel(item.conflict_type)}`)
+            .join("  ");
+          throw new Error(
+            `Cannot publish: ${hardUnresolved.length} unresolved hard conflict(s) remain. ${detail}`,
+          );
+        }
+      }
+
+      await publishOfficialTimetable(publishPayload, publishLabel.trim() || undefined, force);
+      const distribution = await publishTimetableDistribution();
+      if (!force) {
+        const review = await reviewTimetableConflicts(publishPayload);
+        setConflictReview(review);
+      } else {
+        setConflictReviewRefreshNonce((previous) => previous + 1);
+      }
       await refreshOfficial();
-      await refreshConflicts();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to publish timetable";
-      setPublishError(message);
+      await loadChangeRequests();
+      setUndoStack([]);
+      setRedoStack([]);
+      setIsDirty(false);
+      const scopeLabel = publishScopeMode === "all" ? "all timetable slots" : publishScopeLabel;
+      if (force) {
+        setSuccess(
+          `Published anyway for ${scopeLabel} (force mode) and distributed role-wise. Sent ${distribution.sent}, failed ${distribution.failed}, skipped ${distribution.skipped}.`,
+        );
+      } else {
+        setSuccess(
+          `Published ${scopeLabel} and distributed role-wise. Sent ${distribution.sent}, failed ${distribution.failed}, skipped ${distribution.skipped}.`,
+        );
+      }
+    } catch (err) {
+      const base = toUiError(err);
+      try {
+        const review = await reviewTimetableConflicts(publishPayload);
+        setConflictReview(review);
+        const pending = review.pendingConflicts.slice(0, 3);
+        const mismatches = review.constraintMismatches.slice(0, 2);
+        const pendingText = pending.length
+          ? ` Pending: ${pending.map((item, index) => `${index + 1}. ${item.description || conflictLabel(item.conflict_type)}`).join("  ")}`
+          : "";
+        const mismatchText = mismatches.length
+          ? ` Constraint mismatches: ${mismatches.join(" | ")}`
+          : "";
+        setError(`${base}${pendingText}${mismatchText}`);
+      } catch {
+        setError(base);
+      }
     } finally {
       setIsPublishing(false);
-      setIsPublishConfirmOpen(false);
     }
   };
 
-  const handlePublishOffline = async () => {
-    setIsPublishingOffline(true);
-    setOfflinePublishError(null);
-    setOfflinePublishSuccess(null);
-    try {
-      const result = await publishOfflineTimetable({
-        department: filters.department !== ALL ? filters.department : undefined,
-        programId: filters.programId !== ALL ? filters.programId : undefined,
-        termNumber: filters.semester !== ALL ? Number(filters.semester) : undefined,
-        sectionName: filters.section !== ALL ? filters.section : undefined,
-        facultyId: filters.facultyId !== ALL ? filters.facultyId : undefined,
-      });
-      setOfflinePublishSuccess(result.message);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to publish timetable offline";
-      setOfflinePublishError(message);
-    } finally {
-      setIsPublishingOffline(false);
+  const handleApplyConflictResolution = async () => {
+    if (!conflictPopup) {
+      return;
     }
-  };
-
-  const handlePublishOfflineAll = async () => {
-    setIsPublishingOfflineAll(true);
-    setOfflinePublishError(null);
-    setOfflinePublishSuccess(null);
-    try {
-      const result = await publishOfflineTimetableAll();
-      setOfflinePublishSuccess(result.message);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to publish all timetables offline";
-      setOfflinePublishError(message);
-    } finally {
-      setIsPublishingOfflineAll(false);
-    }
-  };
-
-  const handleExport = async () => {
-    setExportError(null);
-    if (!resolvedSlots.length) {
-      setExportError("No records to export for the selected filters.");
+    const nextPayload = clonePayload(conflictPopup.payload);
+    const targetSlot = nextPayload.timetableData.find((slot) => slot.id === conflictPopup.slotId);
+    if (!targetSlot) {
+      setConflictPopup(null);
+      setError("Unable to apply resolution: slot not found.");
+      safeVibrate([30, 20, 30]);
       return;
     }
 
-    const filename = buildFileName(filters);
-    const semesterLabel =
-      filters.semester !== ALL ? filters.semester : displayPayload.termNumber ? String(displayPayload.termNumber) : "All";
+    if (conflictPopup.selectedRoomId) {
+      targetSlot.roomId = conflictPopup.selectedRoomId;
+    }
 
-    setIsExporting(true);
+    setIsApplyingMove(true);
     try {
-      if (exportFormat === "csv") {
-        const normalizedSlots = resolvedSlots.map((item) => ({
-          ...item.slot,
-          batch: item.slot.batch ?? undefined,
-          studentCount: item.slot.studentCount ?? undefined,
-        }));
-        downloadTimetableCsv(filename, normalizedSlots, courseData, roomData, facultyData);
-      } else if (exportFormat === "ics") {
-        const normalizedSlots = resolvedSlots.map((item) => ({
-          ...item.slot,
-          batch: item.slot.batch ?? undefined,
-          studentCount: item.slot.studentCount ?? undefined,
-        }));
-        const icsContent = generateICSContent(normalizedSlots, {
-          courses: courseData,
-          rooms: roomData,
-          faculty: facultyData,
-        });
-        downloadBlob(icsContent, "text/calendar;charset=utf-8", `${filename}.ics`);
-      } else if (exportFormat === "json") {
-        const filteredCourseIds = new Set(resolvedSlots.map((item) => item.slot.courseId));
-        const filteredRoomIds = new Set(resolvedSlots.map((item) => item.slot.roomId));
-        const filteredFacultyIds = new Set(resolvedSlots.map((item) => item.slot.facultyId));
-        const exportJson = {
-          metadata: {
-            exported_at: new Date().toISOString(),
-            format: "json",
-            source: showingGenerated ? "generated-draft" : "official-timetable",
-            scope: {
-              department: filters.department,
-              programId: filters.programId,
-              termNumber: filters.semester === ALL ? null : Number(filters.semester),
-              section: filters.section,
-              roomId: filters.roomId,
-              facultyId: filters.facultyId,
-            },
-            slot_count: resolvedSlots.length,
-          },
-          payload: {
-            programId: displayPayload.programId ?? null,
-            termNumber: displayPayload.termNumber ?? null,
-            facultyData: facultyData.filter((item) => filteredFacultyIds.has(item.id)),
-            courseData: courseData.filter((item) => filteredCourseIds.has(item.id)),
-            roomData: roomData.filter((item) => filteredRoomIds.has(item.id)),
-            timetableData: resolvedSlots.map((item) => item.slot),
-          },
-        };
-        downloadBlob(JSON.stringify(exportJson, null, 2), "application/json;charset=utf-8", `${filename}.json`);
-      } else if (exportFormat === "excel") {
-        const rows = buildExcelRows(resolvedSlots, semesterLabel);
-        const metadata: Array<[string, string]> = [
-          ["Department", filters.department === ALL ? "All" : filters.department],
-          ["Program", filters.programId === ALL ? "All" : (programById.get(filters.programId)?.name ?? filters.programId)],
-          ["Semester", semesterLabel],
-          ["Section", filters.section === ALL ? "All" : filters.section],
-          ["Room", filters.roomId === ALL ? "All" : (roomById.get(filters.roomId)?.name ?? filters.roomId)],
-          ["Faculty", filters.facultyId === ALL ? "All" : (facultyById.get(filters.facultyId)?.name ?? filters.facultyId)],
-          ["Slots Exported", String(resolvedSlots.length)],
-          ["Source", showingGenerated ? "Generated draft" : "Official timetable"],
-        ];
-        downloadTimetableExcel(filename, rows, metadata);
-      } else {
-        if (!exportRef.current) {
-          throw new Error("Unable to access timetable preview for export.");
-        }
-        if (exportFormat === "png") {
-          await exportElementToPng(exportRef.current, filename);
-        } else {
-          await exportElementToPdf(exportRef.current, filename);
-        }
+      const report = await analyzeTimetableConflicts(nextPayload);
+      const unresolved = report.conflicts.filter((item) => !item.resolved && item.affected_slots.includes(conflictPopup.slotId));
+      if (unresolved.length) {
+        throw new Error("Selected resolution still causes conflicts. Try another room or move the class elsewhere.");
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Export failed";
-      setExportError(message);
+      const resolvedRoomName = conflictPopup.availableRooms.find((room) => room.id === conflictPopup.selectedRoomId)?.name;
+      applyPayload(
+        nextPayload,
+        resolvedRoomName
+          ? `Class moved successfully using room ${resolvedRoomName}.`
+          : "Class moved successfully after resolving the conflict.",
+      );
+      safeVibrate([10, 20, 10]);
+    } catch (err) {
+      setError(toUiError(err));
+      safeVibrate([30, 20, 30]);
     } finally {
-      setIsExporting(false);
+      setIsApplyingMove(false);
     }
   };
 
-  return (
-    <div className="mx-auto w-full max-w-[1720px] space-y-6 px-1">
-      <AlertDialog open={isPublishConfirmOpen} onOpenChange={setIsPublishConfirmOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-warning" />
-              Publish with Conflicts?
-            </AlertDialogTitle>
-            <AlertDialogDescription asChild>
-              <div className="space-y-4">
-                <div className="rounded-md border border-warning/30 bg-warning/5 p-3 text-warning-foreground">
-                  <p className="font-medium">Conflicts Detected: {activeDraftHardConflicts}</p>
-                  <p className="text-xs pt-1">
-                    The current draft contains unresolved hard conflicts. Publishing this timetable will make these
-                    conflicts official and visible to faculty and students.
-                  </p>
-                </div>
-                <p>Are you sure you want to proceed with publishing this version?</p>
-              </div>
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={isPublishing}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-warning hover:bg-warning/90 text-warning-foreground"
-              onClick={() => void handlePublish(true)}
-              disabled={isPublishing}
-            >
-              {isPublishing ? "Publishing..." : "Publish Anyway"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+  const handleResolveAllConflicts = useCallback(async () => {
+    if (!workingPayload) {
+      setError("No schedule payload is loaded for conflict resolution.");
+      return;
+    }
 
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold">Schedule Workspace</h1>
-          <p className="text-sm text-muted-foreground">
-            Review generated alternatives, resolve conflicts, and publish from one workspace.
+    setIsResolveAllBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await resolveAllTimetableConflicts({
+        payload: workingPayload,
+        scope: "all",
+        promoteOfficial: true,
+        note: "Bulk auto-resolution from Schedule workspace.",
+      });
+
+      const nextPayload = clonePayload(result.resolvedPayload);
+      setWorkingPayload(nextPayload);
+      setConflictPopup(null);
+      setUndoStack([]);
+      setRedoStack([]);
+      setIsDirty(false);
+      setWorkspaceRefreshNonce((previous) => previous + 1);
+
+      const latestReview = await reviewTimetableConflicts(nextPayload);
+      setConflictReview(latestReview);
+      setConflictReviewError(null);
+      await refreshOfficial();
+      await loadChangeRequests();
+
+      const mismatchText = result.constraintMismatches.length
+        ? ` Constraint mismatches: ${result.constraintMismatches.length}.`
+        : "";
+      const promotedText = result.promotedVersionLabel
+        ? ` Promoted as ${result.promotedVersionLabel}.`
+        : "";
+      setSuccess(
+        `Auto Resolve All completed. Resolved ${result.resolvedCount} conflict(s), remaining ${result.remainingConflicts.length}.${mismatchText}${promotedText}`,
+      );
+    } catch (err) {
+      setError(toUiError(err));
+    } finally {
+      setIsResolveAllBusy(false);
+    }
+  }, [loadChangeRequests, refreshOfficial, workingPayload]);
+
+  const handleDecideRequest = async (requestId: string, decision: "approve" | "reject") => {
+    setRequestDecisionBusyId(requestId);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await decideTimetableChangeRequest(requestId, decision);
+      await loadChangeRequests();
+      await refreshOfficial();
+      setSuccess(result.message);
+    } catch (err) {
+      setError(toUiError(err));
+    } finally {
+      setRequestDecisionBusyId(null);
+    }
+  };
+
+  if (isLoading || (!hasOfficial && isLoadingDraft)) {
+    return (
+      <Card>
+        <CardContent className="py-12 text-center text-sm text-muted-foreground">
+          Loading schedule workspace...
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!workingPayload) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Schedule Workspace</CardTitle>
+          <CardDescription>No official or generated draft timetable is currently available.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm text-muted-foreground">
+          <p>
+            {officialError
+              ?? "Run Generator first. Generated snapshots are auto-saved and become available here even before publish."}
           </p>
-          <div className="flex flex-wrap items-center gap-2 pt-1">
-            <Badge variant={showingGenerated ? "default" : hasOfficial ? "secondary" : "outline"}>
-              {showingGenerated ? "Reviewing generated draft" : hasOfficial ? "Official timetable loaded" : "No official timetable"}
-            </Badge>
-            {activeDraftLabel ? (
-              <Badge variant="outline">
-                {activeDraftLabel}
-              </Badge>
-            ) : null}
-            {activeDraftHardConflicts !== null ? (
-              <Badge variant={activeDraftHardConflicts > 0 ? "destructive" : "outline"}>
-                Hard conflicts: {activeDraftHardConflicts}
-              </Badge>
-            ) : null}
-            {timetableLoading ? <Badge variant="secondary">Refreshing official data...</Badge> : null}
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => void handleRefreshWorkspace()} disabled={timetableLoading || conflictsLoading}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setWorkspaceRefreshNonce((previous) => previous + 1);
+              void refreshOfficial();
+            }}
+          >
             <RefreshCw className="mr-2 h-4 w-4" />
-            Refresh
+            Reload
           </Button>
-          {showingGenerated && hasOfficial ? (
-            <Button variant="outline" onClick={handleUseOfficialView}>
-              Use Official View
-            </Button>
-          ) : null}
-          <Button variant="outline" onClick={() => router.push("/conflicts")}>
-            <AlertTriangle className="mr-2 h-4 w-4" />
-            Conflict Dashboard
-          </Button>
-        </div>
-      </div>
+        </CardContent>
+      </Card>
+    );
+  }
 
-      {generationError ? <p className="text-sm text-destructive">{generationError}</p> : null}
-      {generationSuccess ? <p className="text-sm text-emerald-600">{generationSuccess}</p> : null}
-      {programError ? <p className="text-sm text-destructive">{programError}</p> : null}
-      {settingsError ? <p className="text-sm text-muted-foreground">{settingsError}</p> : null}
-      {timetableError ? <p className="text-sm text-destructive">{timetableError}</p> : null}
-      {conflictsError ? <p className="text-sm text-destructive">{conflictsError}</p> : null}
-      {hasGeneratedButFilteredOut ? (
-        <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-          Generated alternatives are available, but current filters hide all slots. Use `Reset Filters` to view the alternate timetable.
+  return (
+    <>
+      {conflictPopup ? (
+        <div
+          className="fixed z-50 w-[min(92vw,360px)] rounded-xl border bg-background p-4 shadow-2xl"
+          style={{ left: `${conflictPopup.anchorX + 10}px`, top: `${conflictPopup.anchorY + 10}px` }}
+          role="dialog"
+          aria-label="Conflict resolution popup"
+        >
+          <p className="text-sm font-semibold">Conflict detected</p>
+          <p className="mt-1 text-xs text-muted-foreground">{conflictPopup.message}</p>
+          {conflictPopup.conflictTypeLabels.length ? (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {conflictPopup.conflictTypeLabels.map((item) => (
+                <Badge key={item} variant="secondary" className="text-[10px]">
+                  {item}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+          {conflictPopup.availableRooms.length ? (
+            <div className="mt-3 space-y-2">
+              <Label className="text-xs">Alternative Classroom</Label>
+              <Select
+                value={conflictPopup.selectedRoomId}
+                onValueChange={(value) => {
+                  setConflictPopup((current) => (current ? { ...current, selectedRoomId: value } : current));
+                }}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select room" />
+                </SelectTrigger>
+                <SelectContent>
+                  {conflictPopup.availableRooms.map((room) => (
+                    <SelectItem key={room.id} value={room.id}>
+                      {room.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
+          <div className="mt-4 flex items-center justify-end gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setConflictPopup(null);
+                setSuccess("Change ignored. Slot reverted to previous position.");
+              }}
+            >
+              Ignore & Revert
+            </Button>
+            <Button
+              size="sm"
+              disabled={!conflictPopup.availableRooms.length || !conflictPopup.selectedRoomId || isApplyingMove}
+              onClick={() => void handleApplyConflictResolution()}
+            >
+              Apply
+            </Button>
+          </div>
         </div>
       ) : null}
 
-      <div className="grid items-start gap-6 xl:grid-cols-[minmax(340px,380px)_minmax(0,1fr)]">
-        <div className="space-y-6 xl:sticky xl:top-4">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Step 1: Generate In Generator</CardTitle>
-              <CardDescription>
-                Generation settings and algorithm execution are managed only in the Generator workspace.
-                Use this page to load generated alternatives, align them with filters, and publish.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <Button variant="outline" className="w-full" onClick={() => router.push("/generator")}>
-                Open Generator Workspace
-              </Button>
-              <Button variant="outline" className="w-full" onClick={handleReloadGeneratedAlternatives}>
-                <RefreshCw className="mr-2 h-4 w-4" />
-                Reload Generated Alternatives
-              </Button>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Step 2: Review Alternate Timetable</CardTitle>
-              <CardDescription>Inspect generated alternatives and choose the best candidate.</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {generationMode === "single" ? (
-                singleGeneration?.alternatives.length ? (
-                  <div className="space-y-2">
-                    <Label>Alternative</Label>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        onClick={() => setAlternativesViewerOpen(true)}
-                        disabled={!singleGeneration?.alternatives.length}
-                      >
-                        Compare Alternatives ({singleGeneration?.alternatives.length ?? 0})
-                      </Button>
-                      <Select value={selectedAlternativeRank} onValueChange={setSelectedAlternativeRank}>
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {singleGeneration.alternatives.map((alternative) => (
-                            <SelectItem key={alternative.rank} value={String(alternative.rank)}>
-                              Alt {alternative.rank} • Hard {alternative.hard_conflicts} • Score {alternative.fitness.toFixed(1)}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">No generated alternatives loaded. Use the Generator page, then reload here.</p>
-                )
-              ) : cyclePareto.length ? (
-                <div className="space-y-3">
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="space-y-2">
-                      <Label>Pareto solution</Label>
-                      <Select value={selectedCycleRank} onValueChange={setSelectedCycleRank}>
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {cyclePareto.map((solution) => (
-                            <SelectItem key={solution.rank} value={String(solution.rank)}>
-                              Solution {solution.rank} • Hard {solution.hard_conflicts}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="space-y-2">
-                      <Label>Term preview</Label>
-                      <Select value={selectedCycleTerm} onValueChange={setSelectedCycleTerm}>
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {(activeCycleSolution?.terms ?? []).map((term) => (
-                            <SelectItem key={`${term.term_number}-${term.alternative_rank}`} value={String(term.term_number)}>
-                              Semester {term.term_number} • Alt {term.alternative_rank}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button variant="outline" size="icon" onClick={() => handleCycleMove(-1)}>
-                      <ChevronLeft className="h-4 w-4" />
-                    </Button>
-                    <Button variant="outline" size="icon" onClick={() => handleCycleMove(1)}>
-                      <ChevronRight className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">No cycle solutions loaded. Generate from the Generator page, then reload here.</p>
-              )}
-
-              {showingGenerated ? (
-                <div className="rounded-lg border bg-muted/20 p-3 text-sm">
-                  <div className="flex flex-wrap gap-2">
-                    {activeDraftHardConflicts !== null ? (
-                      <Badge variant={activeDraftHardConflicts > 0 ? "destructive" : "outline"}>
-                        Hard conflicts: {activeDraftHardConflicts}
-                      </Badge>
-                    ) : null}
-                    {activeGeneratedAlternative ? (
-                      <>
-                        <Badge variant="outline">Soft penalty: {activeGeneratedAlternative.soft_penalty.toFixed(2)}</Badge>
-                        <Badge variant="outline">Fitness: {activeGeneratedAlternative.fitness.toFixed(2)}</Badge>
-                      </>
-                    ) : (
-                      <Badge variant="outline">Loaded from saved draft cache</Badge>
-                    )}
-                    {activeDraftLabel ? <Badge variant="outline">{activeDraftLabel}</Badge> : null}
-                  </div>
-                </div>
-              ) : null}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Step 3: Resolve & Publish</CardTitle>
-              <CardDescription>Finalize and distribute timetable updates.</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="rounded-lg border bg-muted/20 p-3 space-y-2">
-                <div className="flex items-center justify-between text-sm">
-                  <span>Total Conflicts</span>
-                  <span className="font-semibold">{unresolvedConflictCount}</span>
-                </div>
-                {/* 
-                <div className="flex items-center justify-between text-sm">
-                  <span>Resolved official conflicts</span>
-                  <span className="font-semibold">{resolvedConflictCount}</span>
-                </div> 
-                */}
-                <Button variant="outline" className="w-full" onClick={() => router.push("/conflicts")}>
-                  <AlertTriangle className="mr-2 h-4 w-4" />
-                  Open Conflict Dashboard
-                </Button>
-              </div>
-
-              {unresolvedConflictCount > 0 ? (
-                <div className="space-y-2 rounded-lg border bg-background/40 p-3">
-                  <div className="flex items-center gap-2 text-warning">
-                    <AlertTriangle className="h-4 w-4" />
-                    <p className="text-sm font-semibold">Conflicts Detected</p>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Please use the dedicated Conflict Dashboard to review and resolve {unresolvedConflictCount} issues.
-                  </p>
-                  <Button variant="secondary" className="w-full" onClick={() => router.push("/conflicts")}>
-                    Go to Conflict Dashboard
-                  </Button>
-                </div>
-              ) : hasOfficial ? (
-                <p className="text-xs text-emerald-600">No unresolved official conflicts. Timetable is publish-ready.</p>
-              ) : null}
-
-              <div className="space-y-2">
-                <Label>Version label</Label>
-                <Input value={versionLabel} onChange={(event) => setVersionLabel(event.target.value)} />
-              </div>
-
-              <Button className="w-full" onClick={() => void handlePublish()} disabled={!canManage || isPublishing}>
-                <Upload className="mr-2 h-4 w-4" />
-                {isPublishing ? "Publishing..." : showingGenerated ? "Publish Selected Draft" : "Publish Official"}
-              </Button>
-
-              <div className="grid gap-2 sm:grid-cols-2">
-                <Button variant="outline" onClick={() => void handlePublishOffline()} disabled={isPublishingOffline}>
-                  <Send className="mr-2 h-4 w-4" />
-                  {isPublishingOffline ? "Publishing..." : "Publish Offline"}
-                </Button>
-                <Button variant="outline" onClick={() => void handlePublishOfflineAll()} disabled={isPublishingOfflineAll}>
-                  <Send className="mr-2 h-4 w-4" />
-                  {isPublishingOfflineAll ? "Publishing..." : "Publish All Offline"}
-                </Button>
-              </div>
-
-              {publishError ? <p className="text-sm text-destructive">{publishError}</p> : null}
-              {publishSuccess ? <p className="text-sm text-emerald-600">{publishSuccess}</p> : null}
-              {conflictActionMessage ? <p className="text-sm text-emerald-600">{conflictActionMessage}</p> : null}
-              {offlinePublishError ? <p className="text-sm text-destructive">{offlinePublishError}</p> : null}
-              {offlinePublishSuccess ? <p className="text-sm text-emerald-600">{offlinePublishSuccess}</p> : null}
-            </CardContent>
-          </Card>
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-semibold">Schedule Workspace</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Fast drag-and-drop timetable editing with conflict-aware validation, instant feedback, and role-wise publishing.
+          </p>
         </div>
 
-        <div className="space-y-6">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">View Filters and Export</CardTitle>
-              <CardDescription>
-                Access room, teacher, and section schedules by semester from one panel, then export in PDF, Excel, PNG, CSV, ICS, or JSON.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
-                <div className="space-y-2">
-                  <Label>Department</Label>
-                  <Select value={filters.department} onValueChange={(value) => handleFilterChange("department", value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL}>All departments</SelectItem>
-                      {departmentOptions.map((department) => (
-                        <SelectItem key={department} value={department}>
-                          {department}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {success ? <p className="text-sm text-emerald-600">{success}</p> : null}
 
-                <div className="space-y-2">
-                  <Label>Program</Label>
-                  <Select value={filters.programId} onValueChange={(value) => handleFilterChange("programId", value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL}>All programs</SelectItem>
-                      {visiblePrograms.map((program) => (
-                        <SelectItem key={program.id} value={program.id}>
-                          {program.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>View</CardTitle>
+            <CardDescription>
+              Use these filters only for viewing and downloading the timetable.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+              <div className="space-y-2">
+                <Label>Semester</Label>
+                <Select value={selectedSemester} onValueChange={setSelectedSemester}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All semesters" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All semesters</SelectItem>
+                    {semesterOptions.map((semester) => (
+                      <SelectItem key={semester} value={String(semester)}>
+                        Semester {semester}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Section</Label>
+                <Select value={selectedSection} onValueChange={setSelectedSection}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All sections" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All sections</SelectItem>
+                    {sectionOptions.map((section) => (
+                      <SelectItem key={section} value={section}>
+                        Section {section}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Faculty</Label>
+                <Select value={selectedFacultyId} onValueChange={setSelectedFacultyId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All faculty" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All faculty</SelectItem>
+                    {facultyOptions.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Classroom</Label>
+                <Select value={selectedRoomId} onValueChange={setSelectedRoomId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All classrooms" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All classrooms</SelectItem>
+                    {roomOptions.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Download Format</Label>
+                <Select value={exportFormat} onValueChange={(value) => setExportFormat(value as ExportFormat)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="pdf">PDF</SelectItem>
+                    <SelectItem value="xlsx">XLSX</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Badge variant="outline">{viewScopeLabel}</Badge>
+              <Button variant="outline" onClick={handleDownload} disabled={!filteredSlots.length}>
+                <Download className="mr-2 h-4 w-4" />
+                Download View
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
 
-                <div className="space-y-2">
-                  <Label>Semester</Label>
-                  <Select value={filters.semester} onValueChange={(value) => handleFilterChange("semester", value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL}>All semesters</SelectItem>
-                      {semesterOptions.map((semester) => (
-                        <SelectItem key={semester} value={semester}>
-                          Semester {semester}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Publish</CardTitle>
+            <CardDescription>
+              Configure publish scope filters. You can publish the entire timetable or only the filtered scope.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
+              <div className="space-y-2">
+                <Label>Publish Scope</Label>
+                <Select value={publishScopeMode} onValueChange={(value) => setPublishScopeMode(value as "all" | "filtered")}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All timetable slots</SelectItem>
+                    <SelectItem value="filtered">Filtered slots only</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Semester</Label>
+                <Select value={publishSemester} onValueChange={setPublishSemester}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All semesters" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All semesters</SelectItem>
+                    {semesterOptions.map((semester) => (
+                      <SelectItem key={semester} value={String(semester)}>
+                        Semester {semester}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Section</Label>
+                <Select value={publishSection} onValueChange={setPublishSection}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All sections" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All sections</SelectItem>
+                    {sectionOptions.map((section) => (
+                      <SelectItem key={section} value={section}>
+                        Section {section}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Faculty</Label>
+                <Select value={publishFacultyId} onValueChange={setPublishFacultyId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All faculty" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All faculty</SelectItem>
+                    {facultyOptions.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Classroom</Label>
+                <Select value={publishRoomId} onValueChange={setPublishRoomId}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All classrooms" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All classrooms</SelectItem>
+                    {roomOptions.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Publish Label</Label>
+                <Input
+                  value={publishLabel}
+                  onChange={(event) => setPublishLabel(event.target.value)}
+                  placeholder="Ex: Mid-Semester Revision • Odd Cycle"
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <Badge variant="outline">
+                  Publish Target: {publishScopeMode === "all" ? "All Slots" : `${publishSlots.length} Filtered Slots`}
+                </Badge>
+                <Badge variant="outline">{publishScopeLabel}</Badge>
+              </div>
+              <Button onClick={() => void handlePublishAndDistribute()} disabled={isPublishing || !publishSlots.length}>
+                {isPublishing ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Publishing
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2">
+                    <Send className="h-4 w-4" />
+                    Publish & Distribute
+                  </span>
+                )}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => void handlePublishAndDistribute(true)}
+                disabled={isPublishing || !publishSlots.length}
+              >
+                {isPublishing ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Publishing
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2">
+                    <Send className="h-4 w-4" />
+                    Publish Anyway
+                  </span>
+                )}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
 
-                <div className="space-y-2">
-                  <Label>Section</Label>
-                  <Select value={filters.section} onValueChange={(value) => handleFilterChange("section", value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL}>All sections</SelectItem>
-                      {sectionOptions.map((section) => (
-                        <SelectItem key={section} value={section}>
-                          {section}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+        <Card>
+          <CardHeader>
+            <CardTitle>Editing Controls</CardTitle>
+            <CardDescription>
+              Drag any class slot to a teaching cell. View filters are applied directly to the weekly grid.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" size="sm" onClick={handleUndo} disabled={!undoStack.length}>
+                <Undo2 className="mr-2 h-4 w-4" />
+                Undo
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleRedo} disabled={!redoStack.length}>
+                <Redo2 className="mr-2 h-4 w-4" />
+                Redo
+              </Button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge variant="outline">Slots in view: {filteredSlots.length}</Badge>
+              <Badge variant="outline">Undo: {undoStack.length}</Badge>
+              <Badge variant="outline">Redo: {redoStack.length}</Badge>
+              <Badge variant="outline">
+                Working Mode: {isDirty ? "Draft edits" : hasOfficial ? "Official baseline" : "Generated draft baseline"}
+              </Badge>
+              {!hasOfficial && latestDraftLabel ? (
+                <Badge variant="outline">Draft Source: {latestDraftLabel}</Badge>
+              ) : null}
+              <Badge variant="secondary">Lunch Locked: 1:15 PM - 2:05 PM</Badge>
+              <Badge variant="outline">Program: {activeProgram?.name ?? "N/A"}</Badge>
+            </div>
+          </CardContent>
+        </Card>
 
-                <div className="space-y-2">
-                  <Label>Room</Label>
-                  <Select value={filters.roomId} onValueChange={(value) => handleFilterChange("roomId", value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL}>All rooms</SelectItem>
-                      {roomOptions.map((room) => (
-                        <SelectItem key={room.id} value={room.id}>
-                          {room.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+        <Card className="h-full">
+          <CardHeader>
+            <CardTitle>Weekly Timetable Grid</CardTitle>
+            <CardDescription>
+              Unified timetable view. Use Class, Teacher, or Room filters from the View section.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <WeeklyTimetableGrid
+              days={days}
+              rows={rows}
+              cellEntries={cellEntries}
+              interactive
+              onMoveSlot={(params) => void handleMoveSlot(params)}
+              emptyMessage="No timetable rows available for this filtered view."
+            />
+          </CardContent>
+        </Card>
 
-                <div className="space-y-2">
-                  <Label>Teacher</Label>
-                  <Select value={filters.facultyId} onValueChange={(value) => handleFilterChange("facultyId", value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={ALL}>All teachers</SelectItem>
-                      {facultyOptions.map((faculty) => (
-                        <SelectItem key={faculty.id} value={faculty.id}>
-                          {faculty.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <CardTitle>Conflicts & Resolution</CardTitle>
+                <CardDescription>
+                  Full conflict audit for the active schedule payload, including unresolved, auto-resolved, and manually resolved items.
+                </CardDescription>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setConflictReviewRefreshNonce((previous) => previous + 1)}
+                disabled={isReviewLoading || !workingPayload}
+              >
+                <RefreshCw className={`mr-2 h-4 w-4 ${isReviewLoading ? "animate-spin" : ""}`} />
+                Re-verify
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleResolveAllConflicts()}
+                disabled={isResolveAllBusy || !workingPayload}
+              >
+                {isResolveAllBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
+                Auto Resolve All
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge variant="outline">
+                Payload: {workingPayload ? `${workingPayload.timetableData.length} slots` : "Not loaded"}
+              </Badge>
+              {conflictReview ? <Badge variant="outline">Review Source: {conflictReview.source}</Badge> : null}
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-4">
+              <div className="rounded-md border bg-muted/20 p-3">
+                <p className="text-xs text-muted-foreground">Unresolved conflicts</p>
+                <p className="text-xl font-semibold">{pendingReviewConflicts.length}</p>
+              </div>
+              <div className="rounded-md border bg-muted/20 p-3">
+                <p className="text-xs text-muted-foreground">Resolved conflicts</p>
+                <p className="text-xl font-semibold">{resolvedReviewCount}</p>
+              </div>
+              <div className="rounded-md border bg-muted/20 p-3">
+                <p className="text-xs text-muted-foreground">Auto-resolved</p>
+                <p className="text-xl font-semibold">{autoResolvedReviewConflicts.length}</p>
+              </div>
+              <div className="rounded-md border bg-muted/20 p-3">
+                <p className="text-xs text-muted-foreground">Manually resolved</p>
+                <p className="text-xl font-semibold">{manualResolvedReviewConflicts.length}</p>
+              </div>
+            </div>
+
+            {conflictReviewError ? (
+              <p className="text-sm text-destructive">{conflictReviewError}</p>
+            ) : null}
+
+            {conflictReview?.constraintMismatches?.length ? (
+              <div className="rounded-md border border-amber-300 bg-amber-50 p-3">
+                <p className="text-xs font-semibold text-amber-800">Constraint mismatches detected</p>
+                <ul className="mt-2 space-y-1 text-xs text-amber-900">
+                  {conflictReview.constraintMismatches.slice(0, 8).map((item, index) => (
+                    <li key={`${item}-${index}`}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+              <div className="space-y-3">
+                <p className="text-sm font-medium">Unresolved Conflicts</p>
+                {!workingPayload ? (
+                  <div className="rounded-md border p-4 text-sm text-muted-foreground">
+                    No schedule payload loaded yet. Generate and save a timetable first, then re-verify conflicts.
+                  </div>
+                ) : isReviewLoading ? (
+                  <div className="rounded-md border p-4 text-sm text-muted-foreground">Analyzing conflicts...</div>
+                ) : pendingReviewConflicts.length ? (
+                  pendingReviewConflicts.map((conflict, index) => (
+                    <div key={`${conflict.id}-${index}`} className="rounded-lg border p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-sm font-semibold">{conflictLabel(conflict.conflict_type)}</p>
+                        <Badge variant={conflict.severity === "hard" ? "outline" : "secondary"}>
+                          {conflict.severity === "hard" ? "Hard" : "Soft"}
+                        </Badge>
+                      </div>
+                      <p className="mt-2 text-xs text-muted-foreground">{conflict.description || "No description provided."}</p>
+                      {conflict.affected_slots.length ? (
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Affected slots: {conflict.affected_slots.join(", ")}
+                        </p>
+                      ) : null}
+                    </div>
+                  ))
+                ) : (
+                  <div className="rounded-md border border-emerald-300 bg-emerald-50 p-4 text-sm text-emerald-700">
+                    No unresolved conflicts for the current schedule payload.
+                  </div>
+                )}
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-[1fr_180px_auto]">
-                <div className="space-y-2">
-                  <Label>Export format</Label>
-                  <Select value={exportFormat} onValueChange={(value: ExportFormat) => setExportFormat(value)}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="pdf">PDF</SelectItem>
-                      <SelectItem value="excel">Excel (.xls)</SelectItem>
-                      <SelectItem value="png">PNG</SelectItem>
-                      <SelectItem value="csv">CSV</SelectItem>
-                      <SelectItem value="ics">ICS (.ics)</SelectItem>
-                      <SelectItem value="json">JSON</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex items-end">
-                  <Button variant="outline" className="w-full" onClick={clearFilters}>
-                    Reset Filters
-                  </Button>
-                </div>
-                <div className="flex items-end">
-                  <Button className="w-full" onClick={() => void handleExport()} disabled={isExporting}>
-                    <Download className="mr-2 h-4 w-4" />
-                    {isExporting ? "Preparing..." : "Download"}
-                  </Button>
-                </div>
-              </div>
+              <div className="space-y-3">
+                <p className="text-sm font-medium">Resolved Conflicts</p>
 
-              <div className="flex flex-wrap gap-2">
-                <Badge variant="outline">Rows: {resolvedSlots.length}</Badge>
-                <Badge variant="outline">Sections: {statSections}</Badge>
-                <Badge variant="outline">Teachers: {statFaculty}</Badge>
-                <Badge variant="outline">Rooms: {statRooms}</Badge>
-                <Badge variant="outline">Source: {showingGenerated ? "Generated draft" : "Official"}</Badge>
-              </div>
-              {exportError ? <p className="text-sm text-destructive">{exportError}</p> : null}
-            </CardContent>
-          </Card>
-
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm font-medium">Visible Slots</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <p className="text-2xl font-semibold">{resolvedSlots.length}</p>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm font-medium">Conflict Status</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-center gap-2">
-                  {unresolvedConflictCount > 0 ? (
-                    <AlertTriangle className="h-4 w-4 text-destructive" />
-                  ) : (
-                    <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-                  )}
-                  <p className="text-sm">{unresolvedConflictCount > 0 ? `${unresolvedConflictCount} unresolved` : "No unresolved conflicts"}</p>
-                </div>
-                {conflictsLoading ? <p className="text-xs text-muted-foreground mt-1">Refreshing...</p> : null}
-              </CardContent>
-            </Card>
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm font-medium">Preview Mode</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm font-medium">{showingGenerated ? "Generated Draft" : "Official Published"}</p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  {showingGenerated
-                    ? "Review before publishing."
-                    : "Create alternatives in Generator, then reload them here."}
-                </p>
-              </CardContent>
-            </Card>
-          </div>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Faculty to Course-Section Mapping</CardTitle>
-              <CardDescription>Official published assignment map of faculty to courses, sections, and slots.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {mappingLoading ? (
-                <p className="text-sm text-muted-foreground">Loading faculty mapping...</p>
-              ) : mappingError ? (
-                <p className="text-sm text-destructive">{mappingError}</p>
-              ) : !facultyMappings.length ? (
-                <p className="text-sm text-muted-foreground">No official faculty mapping available.</p>
-              ) : (
-                <div className="space-y-4">
-                  {facultyMappings.map((mapping) => (
-                    <div key={mapping.faculty_id} className="rounded-lg border bg-background/40 p-4">
-                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-                        <div>
-                          <p className="text-sm font-semibold">{mapping.faculty_name}</p>
-                          <p className="text-xs text-muted-foreground">{mapping.faculty_email}</p>
+                <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Automatic Resolver</p>
+                  {!workingPayload ? (
+                    <p className="text-xs text-muted-foreground">Load a timetable payload to see resolver history.</p>
+                  ) : autoResolvedReviewConflicts.length ? (
+                    <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
+                      {autoResolvedReviewConflicts.map((conflict, index) => (
+                        <div key={`${conflict.id}-${index}`} className="rounded-md border bg-background p-2 text-xs">
+                          <p className="font-medium">{conflictLabel(conflict.conflict_type)}</p>
+                          <p className="mt-1 text-muted-foreground">{conflict.description || "No description provided."}</p>
+                          <p className="mt-1 text-emerald-700">{conflictResolutionDetail(conflict)}</p>
                         </div>
-                        <Badge variant="secondary">{mapping.total_assigned_hours.toFixed(2)}h/week</Badge>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">No auto-resolved conflicts reported for this payload.</p>
+                  )}
+                </div>
+
+                <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Manual Actions</p>
+                  {!workingPayload ? (
+                    <p className="text-xs text-muted-foreground">Load a timetable payload to see manual resolutions.</p>
+                  ) : manualResolvedReviewConflicts.length ? (
+                    <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
+                      {manualResolvedReviewConflicts.map((conflict, index) => (
+                        <div key={`${conflict.id}-${index}`} className="rounded-md border bg-background p-2 text-xs">
+                          <p className="font-medium">{conflictLabel(conflict.conflict_type)}</p>
+                          <p className="mt-1 text-muted-foreground">{conflict.description || "No description provided."}</p>
+                          <p className="mt-1 text-indigo-700">{conflictResolutionDetail(conflict)}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">No manually resolved conflicts recorded yet.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Sparkles className="h-5 w-5" />
+              Change Requests
+            </CardTitle>
+            <CardDescription>
+              Student proposals go to faculty for approval. Faculty proposals go to class representative approval.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge variant="outline">Pending: {pendingRequests.length}</Badge>
+              <Badge variant="outline">Total: {changeRequests.length}</Badge>
+              <Button variant="outline" size="sm" onClick={() => void loadChangeRequests()} disabled={requestsLoading}>
+                <RefreshCw className={`mr-2 h-4 w-4 ${requestsLoading ? "animate-spin" : ""}`} />
+                Refresh Requests
+              </Button>
+            </div>
+
+            {pendingRequests.length ? (
+              <div className="space-y-3">
+                {pendingRequests.map((item) => (
+                  <div key={item.id} className="rounded-lg border p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-sm font-semibold">Request {item.id.slice(0, 8)}</p>
+                      <Badge variant="outline">Pending Approval</Badge>
+                    </div>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      {item.requestedByRole} requested slot <span className="font-mono">{item.slotId}</span> to
+                      {" "}{item.proposal.day} {item.proposal.startTime}-{item.proposal.endTime}
+                      {item.proposal.requestKind ? ` • ${item.proposal.requestKind.replaceAll("_", " ")}` : ""}
+                      {item.proposal.roomId ? ` • room ${item.proposal.roomId}` : ""}
+                      {item.proposal.facultyId ? ` • teacher ${item.proposal.facultyId}` : ""}
+                      {item.proposal.section ? ` • section ${item.proposal.section}` : ""}.
+                    </p>
+                    {item.requestNote ? (
+                      <p className="mt-1 text-xs text-muted-foreground">Note: {item.requestNote}</p>
+                    ) : null}
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        onClick={() => void handleDecideRequest(item.id, "approve")}
+                        disabled={requestDecisionBusyId === item.id}
+                      >
+                        {requestDecisionBusyId === item.id ? (
+                          <span className="flex items-center gap-2">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            Applying
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-2">
+                            <CheckCircle2 className="h-4 w-4" />
+                            Approve & Apply
+                          </span>
+                        )}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleDecideRequest(item.id, "reject")}
+                        disabled={requestDecisionBusyId === item.id}
+                      >
+                        Reject
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">No pending change requests.</p>
+            )}
+
+            {recentRequests.length ? (
+              <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+                <p className="text-sm font-medium">Recent Requests</p>
+                <div className="max-h-52 space-y-2 overflow-y-auto">
+                  {recentRequests.map((item) => (
+                    <div key={item.id} className="rounded-md border bg-background p-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="font-medium">{item.id.slice(0, 8)}</p>
+                        <Badge variant={item.status === "applied" ? "default" : "secondary"}>{item.status}</Badge>
                       </div>
-                      <div className="mt-3 overflow-x-auto">
-                        <table className="min-w-full text-sm">
-                          <thead>
-                            <tr className="text-left text-muted-foreground">
-                              <th className="px-2 py-1 font-medium">Course</th>
-                              <th className="px-2 py-1 font-medium">Section</th>
-                              <th className="px-2 py-1 font-medium">Day</th>
-                              <th className="px-2 py-1 font-medium">Time</th>
-                              <th className="px-2 py-1 font-medium">Room</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {mapping.assignments.map((assignment, index) => (
-                              <tr key={`${mapping.faculty_id}-${assignment.course_id}-${assignment.day}-${assignment.startTime}-${index}`}>
-                                <td className="px-2 py-1">{assignment.course_code}</td>
-                                <td className="px-2 py-1">
-                                  {assignment.section}
-                                  {assignment.batch ? `-${assignment.batch}` : ""}
-                                </td>
-                                <td className="px-2 py-1">{assignment.day}</td>
-                                <td className="px-2 py-1">
-                                  {assignment.startTime} - {assignment.endTime}
-                                </td>
-                                <td className="px-2 py-1">{assignment.room_name}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
+                      <p className="mt-1 text-muted-foreground">
+                        {item.requestedByRole}
+                        {" -> "}
+                        {item.approverRole ?? "approver"}
+                        {" • "}
+                        {item.proposal.day} {item.proposal.startTime}-{item.proposal.endTime}
+                        {item.proposal.requestKind ? ` • ${item.proposal.requestKind.replaceAll("_", " ")}` : ""}
+                      </p>
                     </div>
                   ))}
                 </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <div ref={exportRef}>
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Weekly Timetable Grid</CardTitle>
-                <CardDescription>Filtered preview of the currently selected schedule.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                {!startTimes.length || !days.length ? (
-                  <p className="text-sm text-muted-foreground">No timetable data available for the selected view.</p>
-                ) : (
-                  <div className="overflow-auto rounded-md border">
-                    <table className="min-w-[1120px] w-full table-fixed border-collapse text-sm">
-                      <thead>
-                        <tr className="bg-muted/60">
-                          <th className="sticky left-0 top-0 z-20 border-b bg-muted/60 px-3 py-2 text-left font-semibold">Time</th>
-                          {days.map((day) => (
-                            <th key={day} className="border-b px-3 py-2 text-center font-semibold">
-                              {day}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {startTimes.map((startTime) => {
-                          const endTime = rowEndByStart.get(startTime) ?? startTime;
-                          return (
-                            <tr key={startTime}>
-                              <th className="sticky left-0 z-10 border-b bg-background px-3 py-3 text-left align-top font-medium text-muted-foreground">
-                                {startTime} - {endTime}
-                              </th>
-                              {days.map((day) => {
-                                const key = `${day}|${startTime}`;
-                                const entries = cellMap.get(key) ?? [];
-                                return (
-                                  <td key={key} className="border-b px-2 py-2 align-top">
-                                    {entries.length === 0 ? (
-                                      <div className="min-h-[3.25rem] rounded-md border border-dashed border-muted/40 bg-muted/10" />
-                                    ) : (
-                                      <div className="space-y-2">
-                                        {entries.map((item) => (
-                                          <div
-                                            key={item.slot.id}
-                                            className={`min-h-[3.25rem] rounded-md border px-2 py-1 ${getCourseCardClass(
-                                              item.course?.type,
-                                              resolveSlotSessionType(item.slot, item.course),
-                                            )}`}
-                                          >
-                                            <p className="text-xs font-semibold">
-                                              {item.course?.code ?? item.slot.courseId}
-                                              {resolveSlotSessionType(item.slot, item.course) === "tutorial" ? " (Tutorial)" : ""}
-                                              {" • "}
-                                              {item.slot.section}
-                                            </p>
-                                            <p className="text-xs">{item.course?.name ?? "Unknown course"}</p>
-                                            <p className="text-xs opacity-80">
-                                              {item.faculty?.name ?? item.slot.facultyId} • {item.room?.name ?? item.slot.roomId}
-                                              {item.slot.batch ? ` • Batch ${item.slot.batch}` : ""}
-                                            </p>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    )}
-                                  </td>
-                                );
-                              })}
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-                <div className="mt-4 flex flex-wrap gap-3 text-xs text-muted-foreground">
-                  <div className="flex items-center gap-2">
-                    <span className="inline-block h-3 w-3 rounded border border-blue-300 bg-blue-50 dark:border-blue-800 dark:bg-blue-950/30" /> Theory / Tutorial
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="inline-block h-3 w-3 rounded border border-emerald-300 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30" /> Lab
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="inline-block h-3 w-3 rounded border border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30" /> Elective
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-        </div>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
       </div>
-      <AlternativesViewer
-        isOpen={alternativesViewerOpen}
-        onOpenChange={setAlternativesViewerOpen}
-        alternatives={singleGeneration?.alternatives ?? []}
-        currentRank={activeGeneratedAlternative?.rank ?? 0}
-        onSelect={(alt) => {
-          setSelectedAlternativeRank(String(alt.rank));
-          setAlternativesViewerOpen(false);
-        }}
-        bestFitness={singleGeneration?.alternatives ? Math.max(...singleGeneration.alternatives.map(a => a.fitness)) : undefined}
-      />
-    </div>
+    </>
   );
 }

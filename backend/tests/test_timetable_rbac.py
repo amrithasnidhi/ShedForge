@@ -192,7 +192,7 @@ def test_official_timetable_is_scoped_for_student_and_faculty(client):
         json=payload,
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert publish_response.status_code == 200
+    assert publish_response.status_code == 200, publish_response.text
 
     faculty_view = client.get(
         "/api/timetable/official",
@@ -409,3 +409,151 @@ def test_published_timetable_is_isolated_per_temporary_teacher_and_student_accou
     ).json()
     assert {slot["section"] for slot in student_b_view["timetableData"]} == {"B"}
     assert {slot["facultyId"] for slot in student_b_view["timetableData"]} == {faculty_two_id}
+
+
+def test_faculty_scope_and_mapping_include_assistant_assignments(client):
+    admin_payload = {
+        "name": "Admin User",
+        "email": "admin-assist-scope@example.com",
+        "password": "password123",
+        "role": "admin",
+        "department": "Administration",
+    }
+    primary_faculty_payload = {
+        "name": "Primary Faculty",
+        "email": "primary-assist-scope@example.com",
+        "password": "password123",
+        "role": "faculty",
+        "department": "CSE",
+    }
+    assistant_faculty_payload = {
+        "name": "Assistant Faculty",
+        "email": "assistant-assist-scope@example.com",
+        "password": "password123",
+        "role": "faculty",
+        "department": "CSE",
+    }
+
+    register_user(client, admin_payload)
+    register_user(client, primary_faculty_payload)
+    register_user(client, assistant_faculty_payload)
+
+    admin_token = login_user(client, admin_payload["email"], admin_payload["password"], "admin")
+    primary_token = login_user(client, primary_faculty_payload["email"], primary_faculty_payload["password"], "faculty")
+    assistant_token = login_user(client, assistant_faculty_payload["email"], assistant_faculty_payload["password"], "faculty")
+
+    primary_profile = client.get(
+        "/api/faculty/me",
+        headers={"Authorization": f"Bearer {primary_token}"},
+    )
+    assistant_profile = client.get(
+        "/api/faculty/me",
+        headers={"Authorization": f"Bearer {assistant_token}"},
+    )
+    assert primary_profile.status_code == 200
+    assert assistant_profile.status_code == 200
+    primary_id = primary_profile.json()["id"]
+    assistant_id = assistant_profile.json()["id"]
+
+    payload = {
+        "facultyData": [
+            {
+                "id": primary_id,
+                "name": "Primary Faculty",
+                "department": "CSE",
+                "workloadHours": 0,
+                "maxHours": 20,
+                "availability": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+                "email": primary_faculty_payload["email"],
+            },
+            {
+                "id": assistant_id,
+                "name": "Assistant Faculty",
+                "department": "CSE",
+                "workloadHours": 0,
+                "maxHours": 20,
+                "availability": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+                "email": assistant_faculty_payload["email"],
+            },
+        ],
+        "courseData": [
+            {
+                "id": "c-lab-assist",
+                "code": "CSLAB201",
+                "name": "Systems Lab",
+                "type": "lab",
+                "credits": 1,
+                "facultyId": primary_id,
+                "duration": 1,
+                "hoursPerWeek": 2,
+                "theoryHours": 0,
+                "tutorialHours": 0,
+                "labHours": 2,
+            },
+        ],
+        "roomData": [
+            {
+                "id": "r-lab-assist",
+                "name": "Lab A",
+                "capacity": 60,
+                "type": "lab",
+                "building": "Main",
+            },
+        ],
+        "timetableData": [
+            {
+                "id": "slot-assist-1",
+                "day": "Wednesday",
+                "startTime": "08:50",
+                "endTime": "09:40",
+                "courseId": "c-lab-assist",
+                "roomId": "r-lab-assist",
+                "facultyId": primary_id,
+                "assistantFacultyIds": [assistant_id],
+                "section": "A",
+                "batch": "B1",
+                "studentCount": 30,
+                "sessionType": "lab",
+            },
+            {
+                "id": "slot-assist-2",
+                "day": "Wednesday",
+                "startTime": "09:40",
+                "endTime": "10:30",
+                "courseId": "c-lab-assist",
+                "roomId": "r-lab-assist",
+                "facultyId": primary_id,
+                "assistantFacultyIds": [assistant_id],
+                "section": "A",
+                "batch": "B1",
+                "studentCount": 30,
+                "sessionType": "lab",
+            },
+        ],
+    }
+
+    publish_response = client.put(
+        "/api/timetable/official",
+        json=payload,
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert publish_response.status_code == 200, publish_response.text
+
+    assistant_view = client.get(
+        "/api/timetable/official",
+        headers={"Authorization": f"Bearer {assistant_token}"},
+    )
+    assert assistant_view.status_code == 200
+    assistant_slots = assistant_view.json()["timetableData"]
+    assert len(assistant_slots) == 2
+    assert {slot["id"] for slot in assistant_slots} == {"slot-assist-1", "slot-assist-2"}
+
+    assistant_mapping_response = client.get(
+        "/api/timetable/official/faculty-mapping",
+        headers={"Authorization": f"Bearer {assistant_token}"},
+    )
+    assert assistant_mapping_response.status_code == 200
+    assistant_mapping = assistant_mapping_response.json()
+    assert len(assistant_mapping) == 1
+    assert assistant_mapping[0]["faculty_id"] == assistant_id
+    assert all(item["assignmentRole"] == "assistant" for item in assistant_mapping[0]["assignments"])

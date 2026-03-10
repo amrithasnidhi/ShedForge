@@ -1,419 +1,410 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, Search, FileImage, FileText, CalendarCheck, FileSpreadsheet } from "lucide-react";
-import html2canvas from "html2canvas";
-import jsPDF from "jspdf";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import {
-    DropdownMenu,
-    DropdownMenuContent,
-    DropdownMenuItem,
-    DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { generateICSContent } from "@/lib/ics";
-import { useOfficialTimetable } from "@/hooks/use-official-timetable";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { ArrowRightLeft, RefreshCw, School } from "lucide-react";
+
 import { useAuth } from "@/components/auth-provider";
+import { WeeklyTimetableGrid } from "@/components/timetable/weekly-timetable-grid";
 import {
-    DEFAULT_SCHEDULE_POLICY,
-    DEFAULT_WORKING_HOURS,
-    fetchSchedulePolicy,
-    fetchWorkingHours,
-    type SchedulePolicyUpdate,
-    type WorkingHoursEntry,
-} from "@/lib/settings-api";
-import { buildTemplateDays, buildTemplateTimeSlots, sortTimes } from "@/lib/schedule-template";
-import { downloadTimetableCsv } from "@/lib/timetable-csv";
-import { useSelectedSection } from "@/hooks/use-selected-section";
+  buildWeeklyGridCellEntries,
+  buildWeeklyGridDays,
+  buildWeeklyGridRows,
+} from "@/components/timetable/weekly-grid-utils";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useOfficialTimetable } from "@/hooks/use-official-timetable";
+import { getProgramConstraint, type ProgramDailyTimeSlot } from "@/lib/constraints-api";
+import { parseTimeToMinutes } from "@/lib/schedule-template";
+import { listTimetableChangeRequests } from "@/lib/timetable-api";
+import type { TimetableChangeRequest } from "@/lib/timetable-types";
 
-const FALLBACK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+const FEED_REFRESH_MS = 30_000;
 
-function getCourseColor(type: string, sessionType?: string): string {
-    if (sessionType === "tutorial") {
-        return "bg-primary/10 border-primary/30 text-primary";
-    }
-    switch (type) {
-        case "theory":
-            return "bg-primary/10 border-primary/30 text-primary";
-        case "lab":
-            return "bg-accent/20 border-accent/40 text-accent-foreground";
-        case "elective":
-            return "bg-chart-4/20 border-chart-4/40 text-foreground";
-        default:
-            return "bg-muted";
-    }
+function toLocalDate(value: string | null | undefined): string {
+  if (!value) {
+    return "—";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString();
 }
 
-function resolveSessionType(slot: { sessionType?: "theory" | "tutorial" | "lab" }, courseType?: string): "theory" | "tutorial" | "lab" {
-    if (slot.sessionType) {
-        return slot.sessionType;
-    }
-    return courseType === "lab" ? "lab" : "theory";
-}
+export default function StudentTimetablePage() {
+  const { user } = useAuth();
+  const { data: timetablePayload, hasOfficial, isLoading, error, refresh } = useOfficialTimetable();
+  const { timetableData, courseData, roomData, facultyData } = timetablePayload;
 
-export default function MyTimetablePage() {
-    const { user } = useAuth();
-    const { data: timetablePayload } = useOfficialTimetable();
-    const { timetableData, courseData, roomData, facultyData } = timetablePayload;
-    const [searchTerm, setSearchTerm] = useState("");
-    const [selectedSemester, setSelectedSemester] = useState<string>("all");
-    const scheduleRef = useRef<HTMLDivElement>(null);
-    const [workingHours, setWorkingHours] = useState<WorkingHoursEntry[]>(DEFAULT_WORKING_HOURS);
-    const [schedulePolicy, setSchedulePolicy] = useState<SchedulePolicyUpdate>(DEFAULT_SCHEDULE_POLICY);
+  const [selectedSection, setSelectedSection] = useState("");
+  const [selectedSemester, setSelectedSemester] = useState<string>("all");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [dailySlots, setDailySlots] = useState<ProgramDailyTimeSlot[]>([]);
+  const [requestFeed, setRequestFeed] = useState<TimetableChangeRequest[]>([]);
+  const [feedError, setFeedError] = useState<string | null>(null);
+  const [isRefreshingFeed, setIsRefreshingFeed] = useState(false);
 
+  const sectionOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        timetableData
+          .map((slot) => slot.section?.trim())
+          .filter((item): item is string => Boolean(item)),
+      ),
+    ).sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" }));
+  }, [timetableData]);
+
+  useEffect(() => {
     const profileSection = (user?.section_name ?? "").trim();
-    const availableSections = useMemo(() => {
-        if (profileSection) {
-            return [profileSection];
-        }
-        return timetableData.map((slot) => slot.section);
-    }, [profileSection, timetableData]);
-    const { selectedSection, setSelectedSection, sectionOptions } = useSelectedSection(availableSections);
+    if (profileSection && sectionOptions.includes(profileSection)) {
+      setSelectedSection(profileSection);
+      return;
+    }
+    if (sectionOptions.length && !sectionOptions.includes(selectedSection)) {
+      setSelectedSection(sectionOptions[0]);
+      return;
+    }
+    if (!sectionOptions.length) {
+      setSelectedSection("");
+    }
+  }, [sectionOptions, selectedSection, user?.section_name]);
 
-    const studentTimetable = useMemo(() => {
-        const effectiveSection = (selectedSection || profileSection).trim();
-        if (!effectiveSection) {
-            return timetableData;
-        }
-        const normalizedSection = effectiveSection.toUpperCase();
-        return timetableData.filter((slot) => slot.section.trim().toUpperCase() === normalizedSection);
-    }, [profileSection, selectedSection, timetableData]);
+  const semesterOptions = useMemo(() => {
+    const courseById = new Map(courseData.map((item) => [item.id, item]));
+    const values = new Set<number>();
+    for (const slot of timetableData) {
+      if (selectedSection && slot.section !== selectedSection) {
+        continue;
+      }
+      const semester = courseById.get(slot.courseId)?.semesterNumber;
+      if (typeof semester === "number" && Number.isFinite(semester)) {
+        values.add(semester);
+      }
+    }
+    return Array.from(values).sort((left, right) => left - right);
+  }, [courseData, selectedSection, timetableData]);
 
-    const semesterOptions = useMemo(() => {
-        const options = new Set<number>();
-        for (const course of courseData) {
-            if (typeof course.semesterNumber === "number" && Number.isFinite(course.semesterNumber)) {
-                options.add(course.semesterNumber);
-            }
-        }
-        if (typeof timetablePayload.termNumber === "number" && Number.isFinite(timetablePayload.termNumber)) {
-            options.add(timetablePayload.termNumber);
-        }
-        return Array.from(options).sort((left, right) => left - right);
-    }, [courseData, timetablePayload.termNumber]);
+  useEffect(() => {
+    if (!semesterOptions.length) {
+      setSelectedSemester("all");
+      return;
+    }
+    setSelectedSemester((previous) => {
+      if (previous !== "all" && semesterOptions.includes(Number(previous))) {
+        return previous;
+      }
+      return String(semesterOptions[0]);
+    });
+  }, [semesterOptions]);
 
-    useEffect(() => {
-        if (!semesterOptions.length) {
-            setSelectedSemester("all");
-            return;
+  useEffect(() => {
+    let isActive = true;
+    const programId = timetablePayload.programId;
+    if (!programId) {
+      setDailySlots([]);
+      return () => {
+        isActive = false;
+      };
+    }
+    getProgramConstraint(programId)
+      .then((constraint) => {
+        if (!isActive) {
+          return;
         }
-        const defaultSemester = timetablePayload.termNumber ? String(timetablePayload.termNumber) : String(semesterOptions[0]);
-        setSelectedSemester((previous) => {
-            if (previous !== "all" && semesterOptions.includes(Number(previous))) {
-                return previous;
-            }
-            return defaultSemester;
-        });
-    }, [semesterOptions, timetablePayload.termNumber]);
-
-    const filteredTimetable = useMemo(() => {
-        if (selectedSemester === "all") {
-            return studentTimetable;
+        setDailySlots(
+          [...(constraint.daily_time_slots ?? [])].sort((left, right) =>
+            parseTimeToMinutes(left.start_time) - parseTimeToMinutes(right.start_time),
+          ),
+        );
+      })
+      .catch(() => {
+        if (!isActive) {
+          return;
         }
-        const targetSemester = Number(selectedSemester);
-        return studentTimetable.filter((slot) => {
-            const course = courseData.find((item) => item.id === slot.courseId);
-            const slotSemester =
-                typeof course?.semesterNumber === "number" ? course.semesterNumber : timetablePayload.termNumber ?? null;
-            return slotSemester === targetSemester;
-        });
-    }, [courseData, selectedSemester, studentTimetable, timetablePayload.termNumber]);
-
-    useEffect(() => {
-        let isActive = true;
-        Promise.allSettled([fetchWorkingHours(), fetchSchedulePolicy()]).then(([hoursResult, policyResult]) => {
-            if (!isActive) return;
-            if (hoursResult.status === "fulfilled") {
-                setWorkingHours(hoursResult.value.hours);
-            }
-            if (policyResult.status === "fulfilled") {
-                setSchedulePolicy(policyResult.value);
-            }
-        });
-        return () => {
-            isActive = false;
-        };
-    }, []);
-
-    const days = useMemo(() => {
-        const configured = buildTemplateDays(workingHours);
-        if (configured.length > 0) {
-            return configured;
-        }
-        const fromData = Array.from(new Set(filteredTimetable.map((slot) => slot.day)));
-        return fromData.length > 0 ? fromData : FALLBACK_DAYS;
-    }, [filteredTimetable, workingHours]);
-
-    const timeSlots = useMemo(() => {
-        const configured = buildTemplateTimeSlots(workingHours, schedulePolicy);
-        if (configured.length > 0) {
-            return configured;
-        }
-        return sortTimes(Array.from(new Set(filteredTimetable.map((slot) => slot.startTime))));
-    }, [filteredTimetable, schedulePolicy, workingHours]);
-
-    const handleExportICS = () => {
-        const icsContent = generateICSContent(filteredTimetable, {
-            courses: courseData,
-            rooms: roomData,
-            faculty: facultyData,
-        });
-        const blob = new Blob([icsContent], { type: "text/calendar" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "my-timetable.ics";
-        a.click();
-        URL.revokeObjectURL(url);
+        setDailySlots([]);
+      });
+    return () => {
+      isActive = false;
     };
+  }, [timetablePayload.programId]);
 
-    const handleExportCSV = () => {
-        downloadTimetableCsv("my-timetable.csv", filteredTimetable, courseData, roomData, facultyData);
-    };
+  const filteredSlots = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase();
+    const courseById = new Map(courseData.map((item) => [item.id, item]));
+    const roomById = new Map(roomData.map((item) => [item.id, item]));
+    const facultyById = new Map(facultyData.map((item) => [item.id, item]));
 
-    const handleExportPNG = async () => {
-        if (!scheduleRef.current) return;
+    return timetableData.filter((slot) => {
+      if (selectedSection && slot.section !== selectedSection) {
+        return false;
+      }
+      const course = courseById.get(slot.courseId);
+      if (selectedSemester !== "all" && course?.semesterNumber !== Number(selectedSemester)) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      const room = roomById.get(slot.roomId);
+      const faculty = facultyById.get(slot.facultyId);
+      return [
+        course?.code ?? "",
+        course?.name ?? "",
+        slot.section ?? "",
+        room?.name ?? "",
+        faculty?.name ?? "",
+      ].some((item) => item.toLowerCase().includes(query));
+    });
+  }, [courseData, facultyData, roomData, searchTerm, selectedSection, selectedSemester, timetableData]);
 
-        try {
-            const canvas = await html2canvas(scheduleRef.current, {
-                scale: 2,
-                backgroundColor: "white",
-            });
+  const courseById = useMemo(() => new Map(courseData.map((item) => [item.id, item])), [courseData]);
+  const roomById = useMemo(() => new Map(roomData.map((item) => [item.id, item])), [roomData]);
+  const facultyById = useMemo(() => new Map(facultyData.map((item) => [item.id, item])), [facultyData]);
 
-            const url = canvas.toDataURL("image/png");
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "my-timetable.png";
-            a.click();
-        } catch (error) {
-            console.error("Error exporting PNG:", error);
-        }
-    };
+  const gridRows = useMemo(() => buildWeeklyGridRows(filteredSlots, dailySlots), [dailySlots, filteredSlots]);
+  const gridDays = useMemo(() => buildWeeklyGridDays(filteredSlots), [filteredSlots]);
+  const cellEntries = useMemo(
+    () => buildWeeklyGridCellEntries(filteredSlots, courseById, facultyById, roomById),
+    [courseById, facultyById, filteredSlots, roomById],
+  );
 
-    const handleExportPDF = async () => {
-        if (!scheduleRef.current) return;
+  const totalHours = useMemo(() => {
+    const totalMinutes = filteredSlots.reduce((sum, slot) => {
+      return sum + (parseTimeToMinutes(slot.endTime) - parseTimeToMinutes(slot.startTime));
+    }, 0);
+    return Math.max(0, Number((totalMinutes / 60).toFixed(1)));
+  }, [filteredSlots]);
 
-        try {
-            const canvas = await html2canvas(scheduleRef.current, {
-                scale: 2,
-                backgroundColor: "white",
-            });
+  const practicalSessions = useMemo(() => {
+    return filteredSlots.filter((slot) => slot.sessionType === "lab").length;
+  }, [filteredSlots]);
 
-            const imgData = canvas.toDataURL("image/png");
-            const pdf = new jsPDF({
-                orientation: "landscape",
-                unit: "mm",
-                format: "a4",
-            });
+  const loadChangeRequests = useCallback(async () => {
+    setIsRefreshingFeed(true);
+    try {
+      const rows = await listTimetableChangeRequests({ mine: true });
+      setRequestFeed(
+        [...rows]
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+          .slice(0, 12),
+      );
+      setFeedError(null);
+    } catch (loadError) {
+      setFeedError(loadError instanceof Error ? loadError.message : "Unable to load change requests");
+    } finally {
+      setIsRefreshingFeed(false);
+    }
+  }, []);
 
-            const imgWidth = 297;
-            const imgHeight = (canvas.height * imgWidth) / canvas.width;
+  useEffect(() => {
+    void loadChangeRequests();
+    const interval = window.setInterval(() => {
+      void refresh();
+      void loadChangeRequests();
+    }, FEED_REFRESH_MS);
+    return () => window.clearInterval(interval);
+  }, [loadChangeRequests, refresh]);
 
-            pdf.addImage(imgData, "PNG", 0, 0, imgWidth, imgHeight);
-            pdf.save("my-timetable.pdf");
-        } catch (error) {
-            console.error("Error exporting PDF:", error);
-        }
-    };
-
-    const getSlotForDayTime = (day: string, time: string) => {
-        return filteredTimetable.find((slot) => {
-            if (slot.day !== day || slot.startTime !== time) return false;
-
-            // Simple search filter
-            if (searchTerm) {
-                const course = courseData.find(c => c.id === slot.courseId);
-                return course?.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                    course?.code.toLowerCase().includes(searchTerm.toLowerCase());
-            }
-            return true;
-        });
-    };
-
-    return (
-        <div className="space-y-6">
-            {/* Header */}
-            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                    <h1 className="text-2xl font-semibold text-foreground">My Timetable</h1>
-                    <p className="text-sm text-muted-foreground mt-1">
-                        {selectedSection ? `Section ${selectedSection}` : user?.department ?? "Current Schedule"}
-                        {selectedSemester !== "all" ? ` - Semester ${selectedSemester}` : ""}
-                    </p>
-                </div>
-
-                <div className="flex items-center gap-2">
-                    <Select
-                        value={selectedSection}
-                        onValueChange={setSelectedSection}
-                        disabled={!sectionOptions.length}
-                    >
-                        <SelectTrigger className="w-[160px]">
-                            <SelectValue/>
-                        </SelectTrigger>
-                        <SelectContent>
-                            {sectionOptions.map((section) => (
-                                <SelectItem key={section} value={section}>
-                                    Section {section}
-                                </SelectItem>
-                            ))}
-                        </SelectContent>
-                    </Select>
-                    <Select value={selectedSemester} onValueChange={setSelectedSemester}>
-                        <SelectTrigger className="w-[170px]">
-                            <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                            <SelectItem value="all">All Semesters</SelectItem>
-                            {semesterOptions.map((semester) => (
-                                <SelectItem key={semester} value={String(semester)}>
-                                    Semester {semester}
-                                </SelectItem>
-                            ))}
-                        </SelectContent>
-                    </Select>
-                    <div className="relative">
-                        <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                        <Input
-                            type="search"
-                           
-                            className="pl-8 w-[200px]"
-                            value={searchTerm}
-                            onChange={(e) => setSearchTerm(e.target.value)}
-                        />
-                    </div>
-
-                    <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                            <Button variant="outline">
-                                <Download className="h-4 w-4 mr-2" />
-                                Download
-                            </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={handleExportPNG}>
-                                <FileImage className="h-4 w-4 mr-2" />
-                                Save as PNG
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={handleExportPDF}>
-                                <FileText className="h-4 w-4 mr-2" />
-                                Save as PDF
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={handleExportICS}>
-                                <CalendarCheck className="h-4 w-4 mr-2" />
-                                Save as .ics
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={handleExportCSV}>
-                                <FileSpreadsheet className="h-4 w-4 mr-2" />
-                                Save as CSV
-                            </DropdownMenuItem>
-                        </DropdownMenuContent>
-                    </DropdownMenu>
-                </div>
-            </div>
-
-            {/* Timetable Grid */}
-            <div ref={scheduleRef}>
-                <Card>
-                    <CardHeader>
-                        <CardTitle className="text-lg">Weekly Schedule</CardTitle>
-                        <CardDescription>
-                            {selectedSemester !== "all"
-                                ? `Semester ${selectedSemester}`
-                                : timetablePayload.termNumber
-                                  ? `Term ${timetablePayload.termNumber}`
-                                  : "Published semester schedule"}
-                        </CardDescription>
-                    </CardHeader>
-                    <CardContent className="overflow-x-auto">
-                        <div className="min-w-[900px]">
-                            <div className="grid gap-2" style={{ gridTemplateColumns: `100px repeat(${days.length}, 1fr)` }}>
-                                {/* Header row */}
-                                <div className="p-3 font-medium text-sm text-muted-foreground" />
-                                {days.map((day) => (
-                                    <div
-                                        key={day}
-                                        className="p-3 text-center font-semibold text-sm bg-muted rounded-lg"
-                                    >
-                                        {day}
-                                    </div>
-                                ))}
-
-                                {/* Time rows */}
-                                {timeSlots.map((time) => (
-                                    <div key={`row-${time}`} className="contents">
-                                        <div className="p-3 text-sm text-muted-foreground font-medium text-right flex items-center justify-end">
-                                            {time}
-                                        </div>
-                                        {days.map((day) => {
-                                            const slot = getSlotForDayTime(day, time);
-                                            if (slot) {
-                                                const course = courseData.find((c) => c.id === slot.courseId);
-                                                const room = roomData.find((r) => r.id === slot.roomId);
-                                                const faculty = facultyData.find((f) => f.id === slot.facultyId);
-                                                const sessionType = resolveSessionType(slot, course?.type);
-                                                return (
-                                                    <TooltipProvider key={`${day}-${time}`}>
-                                                        <Tooltip>
-                                                            <TooltipTrigger asChild>
-                                                                <div
-                                                                    className={`p-3 rounded-lg border-2 text-sm cursor-pointer hover:shadow-md transition-shadow ${getCourseColor(
-                                                                        course?.type || "",
-                                                                        sessionType,
-                                                                    )}`}
-                                                                >
-                                                                    <p className="font-semibold truncate">
-                                                                        {course?.code}
-                                                                        {sessionType === "tutorial" ? " (Tutorial)" : ""}
-                                                                    </p>
-                                                                    <p className="text-xs truncate mt-1 opacity-80">{room?.name}</p>
-                                                                </div>
-                                                            </TooltipTrigger>
-                                                            <TooltipContent className="max-w-xs" side="top">
-                                                                <div className="space-y-2">
-                                                                    <div>
-                                                                        <p className="font-semibold text-base">{course?.name}</p>
-                                                                        <p className="text-sm text-muted-foreground">{course?.code}</p>
-                                                                    </div>
-                                                                    <div className="space-y-1 text-sm">
-                                                                        <p>
-                                                                            <span className="font-medium">Instructor:</span> {faculty?.name}
-                                                                        </p>
-                                                                        <p>
-                                                                            <span className="font-medium">Room:</span> {room?.name}, {room?.building}
-                                                                        </p>
-                                                                        <p>
-                                                                            <span className="font-medium">Type:</span>{" "}
-                                                                            <Badge variant="outline" className="ml-1">
-                                                                                {sessionType === "tutorial" ? "tutorial" : course?.type}
-                                                                            </Badge>
-                                                                        </p>
-                                                                    </div>
-                                                                </div>
-                                                            </TooltipContent>
-                                                        </Tooltip>
-                                                    </TooltipProvider>
-                                                );
-                                            }
-                                            return (
-                                                <div
-                                                    key={`${day}-${time}`}
-                                                    className="p-3 rounded-lg bg-muted/30 border-2 border-transparent hover:border-muted transition-colors"
-                                                />
-                                            );
-                                        })}
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    </CardContent>
-                </Card>
-            </div>
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Student Weekly Timetable</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {user?.name ?? "Student"} • {selectedSection ? `Section ${selectedSection}` : "No section selected"}
+          </p>
         </div>
-    );
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="w-[180px] space-y-1">
+            <Label>Section</Label>
+            <Select value={selectedSection} onValueChange={setSelectedSection} disabled={!sectionOptions.length}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select section" />
+              </SelectTrigger>
+              <SelectContent>
+                {sectionOptions.map((section) => (
+                  <SelectItem key={section} value={section}>
+                    {section}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="w-[180px] space-y-1">
+            <Label>Semester</Label>
+            <Select value={selectedSemester} onValueChange={setSelectedSemester}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All semesters</SelectItem>
+                {semesterOptions.map((semester) => (
+                  <SelectItem key={semester} value={String(semester)}>
+                    Semester {semester}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="w-[280px] space-y-1">
+            <Label>Search</Label>
+            <Input
+              placeholder="Course, faculty or room..."
+              value={searchTerm}
+              onChange={(event) => setSearchTerm(event.target.value)}
+            />
+          </div>
+          <Button
+            variant="outline"
+            className="h-10 bg-transparent"
+            onClick={() => {
+              void refresh();
+              void loadChangeRequests();
+            }}
+            disabled={isRefreshingFeed}
+          >
+            <RefreshCw className={`mr-2 h-4 w-4 ${isRefreshingFeed ? "animate-spin" : ""}`} />
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Card>
+          <CardContent className="pt-5">
+            <p className="text-sm text-muted-foreground">Total Sessions</p>
+            <p className="mt-1 text-3xl font-semibold">{filteredSlots.length}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-5">
+            <p className="text-sm text-muted-foreground">Weekly Hours</p>
+            <p className="mt-1 text-3xl font-semibold">{totalHours}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-5">
+            <p className="text-sm text-muted-foreground">Practical Sessions</p>
+            <p className="mt-1 text-3xl font-semibold">{practicalSessions}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-5">
+            <p className="text-sm text-muted-foreground">Faculty Count</p>
+            <p className="mt-1 text-3xl font-semibold">
+              {new Set(filteredSlots.map((slot) => slot.facultyId)).size}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-[2.2fr_1fr]">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg">Weekly Timetable Grid</CardTitle>
+            <CardDescription>Read-friendly timetable with teaching blocks, breaks, and lunch slots.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <WeeklyTimetableGrid
+              days={gridDays}
+              rows={gridRows}
+              cellEntries={cellEntries}
+              emptyMessage="No timetable entries are available for this filter."
+            />
+            <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+              <Badge variant="outline">Blue: Theory / Tutorial</Badge>
+              <Badge variant="outline">Green: Lab / Practical</Badge>
+              <Badge variant="outline">Amber: Elective / Lunch</Badge>
+              <Badge variant="outline">Gray: Break / Blocked</Badge>
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="space-y-6">
+          <Card>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-2">
+                <CardTitle className="text-base">Timetable Change Notifications</CardTitle>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => void loadChangeRequests()}
+                  disabled={isRefreshingFeed}
+                >
+                  <RefreshCw className={`h-4 w-4 ${isRefreshingFeed ? "animate-spin" : ""}`} />
+                </Button>
+              </div>
+              <CardDescription>Track your requested changes and approval results.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {feedError ? <p className="text-xs text-destructive">{feedError}</p> : null}
+              {!requestFeed.length ? (
+                <p className="text-sm text-muted-foreground">No timetable change notifications yet.</p>
+              ) : (
+                requestFeed.slice(0, 6).map((request) => (
+                  <div key={request.id} className="rounded-md border p-3 text-xs">
+                    <p className="font-medium">
+                      {request.proposal.day} {request.proposal.startTime}-{request.proposal.endTime}
+                    </p>
+                    <p className="text-muted-foreground">Slot {request.slotId}</p>
+                    <div className="mt-1 flex items-center justify-between gap-2">
+                      <Badge variant={request.status === "applied" ? "default" : "secondary"}>
+                        {request.status}
+                      </Badge>
+                      <span className="text-muted-foreground">{toLocalDate(request.updatedAt ?? request.createdAt)}</span>
+                    </div>
+                    {request.resolutionNote ? (
+                      <p className="mt-2 text-muted-foreground">{request.resolutionNote}</p>
+                    ) : null}
+                  </div>
+                ))
+              )}
+            </CardContent>
+          </Card>
+
+          <Card className="border-dashed">
+            <CardContent className="pt-5">
+              <p className="text-sm font-medium">Need a timetable change?</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Propose a change request. Faculty/CR approval flow is handled automatically.
+              </p>
+              <Button asChild className="mt-3 w-full">
+                <Link href="/timetable-collaboration">
+                  <ArrowRightLeft className="mr-2 h-4 w-4" />
+                  Open Change Request Desk
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="border-dashed">
+            <CardContent className="pt-5 text-sm text-muted-foreground">
+              <p className="flex items-center gap-2 font-medium text-foreground">
+                <School className="h-4 w-4 text-primary" />
+                Live Update Sync
+              </p>
+              <p className="mt-1">
+                This page auto-refreshes timetable and change status every 30 seconds.
+              </p>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+
+      {!hasOfficial && !isLoading ? (
+        <Card>
+          <CardContent className="py-6 text-sm text-muted-foreground">
+            No published timetable is available yet.
+          </CardContent>
+        </Card>
+      ) : null}
+    </div>
+  );
 }

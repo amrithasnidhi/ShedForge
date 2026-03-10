@@ -1,4 +1,6 @@
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const TIMETABLE_UPDATED_EVENT = "shedforge:timetable-updated";
+const TIMETABLE_UPDATED_STORAGE_KEY = "shedforge.timetable.updated_at";
 
 function getAuthHeaders(): HeadersInit {
   if (typeof window === "undefined") {
@@ -23,6 +25,19 @@ async function handleResponse<T>(response: Response, errorMessage: string): Prom
     throw new Error(detail);
   }
   return response.json() as Promise<T>;
+}
+
+function notifyTimetableUpdated(reason: "leave_swap_accept"): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const detail = { reason, at: new Date().toISOString() };
+  window.dispatchEvent(new CustomEvent(TIMETABLE_UPDATED_EVENT, { detail }));
+  try {
+    localStorage.setItem(TIMETABLE_UPDATED_STORAGE_KEY, JSON.stringify(detail));
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
 export type LeaveStatus = "pending" | "approved" | "rejected";
@@ -111,6 +126,11 @@ export interface LeaveSubstituteOfferRespond {
   response_note?: string;
 }
 
+export interface LeaveSwapOfferCreate {
+  slot_id: string;
+  substitute_faculty_id: string;
+}
+
 export interface SubstituteSuggestion {
   faculty_id: string;
   name: string;
@@ -179,16 +199,32 @@ export async function assignLeaveSubstitute(
 
 export async function listSubstituteOffers(
   status?: LeaveSubstituteOfferStatus,
+  options: { scope?: "received" | "sent" | "all" } = {},
 ): Promise<LeaveSubstituteOffer[]> {
   const search = new URLSearchParams();
   if (status) {
     search.set("status", status);
+  }
+  if (options.scope) {
+    search.set("scope", options.scope);
   }
   const suffix = search.toString() ? `?${search.toString()}` : "";
   const response = await fetch(`${API_BASE_URL}/api/leaves/substitute-offers${suffix}`, {
     headers: getAuthHeaders(),
   });
   return handleResponse<LeaveSubstituteOffer[]>(response, "Unable to load substitute offers");
+}
+
+export async function createLeaveSwapOffer(
+  leaveId: string,
+  payload: LeaveSwapOfferCreate,
+): Promise<LeaveSubstituteOffer> {
+  const response = await fetch(`${API_BASE_URL}/api/leaves/${leaveId}/swap-offers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<LeaveSubstituteOffer>(response, "Unable to create swap request");
 }
 
 export async function respondToSubstituteOffer(
@@ -200,5 +236,9 @@ export async function respondToSubstituteOffer(
     headers: { "Content-Type": "application/json", ...getAuthHeaders() },
     body: JSON.stringify(payload),
   });
-  return handleResponse<LeaveSubstituteOffer>(response, "Unable to respond to substitute offer");
+  const result = await handleResponse<LeaveSubstituteOffer>(response, "Unable to respond to substitute offer");
+  if (payload.decision === "accept") {
+    notifyTimetableUpdated("leave_swap_accept");
+  }
+  return result;
 }

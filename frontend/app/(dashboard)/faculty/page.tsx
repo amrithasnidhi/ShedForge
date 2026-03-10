@@ -24,9 +24,11 @@ import {
     createFaculty,
     deleteFaculty,
     listFaculty,
+    listPrograms,
     updateFaculty,
     type Faculty,
     type FacultyUpdate,
+    type Program,
 } from "@/lib/academic-api";
 
 export default function FacultyPage() {
@@ -34,12 +36,15 @@ export default function FacultyPage() {
     const canManage = user?.role === "admin" || user?.role === "scheduler";
     const [searchQuery, setSearchQuery] = useState("");
     const [departmentFilter, setDepartmentFilter] = useState("all");
+    const [selectedProgramId, setSelectedProgramId] = useState<string>("all");
+    const [programs, setPrograms] = useState<Program[]>([]);
     const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
     const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
     const [faculty, setFaculty] = useState<Faculty[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [formValues, setFormValues] = useState({
+        program_id: "inherit",
         name: "",
         designation: "",
         email: "",
@@ -59,7 +64,7 @@ export default function FacultyPage() {
     useEffect(() => {
         const loadFaculty = async () => {
             try {
-                const data = await listFaculty();
+                const data = await listFaculty(selectedProgramId === "all" ? undefined : selectedProgramId);
                 setFaculty(data);
             } catch (err) {
                 const message = err instanceof Error ? err.message : "Unable to load faculty";
@@ -69,12 +74,28 @@ export default function FacultyPage() {
             }
         };
         void loadFaculty();
+    }, [selectedProgramId]);
+
+    useEffect(() => {
+        const loadPrograms = async () => {
+            try {
+                const data = await listPrograms();
+                setPrograms(data);
+            } catch {
+                setPrograms([]);
+            }
+        };
+        void loadPrograms();
     }, []);
 
     const handleAddFaculty = async () => {
         setError(null);
         try {
             const created = await createFaculty({
+                program_id:
+                    formValues.program_id === "inherit"
+                        ? (selectedProgramId === "all" ? undefined : selectedProgramId)
+                        : formValues.program_id,
                 name: formValues.name,
                 designation: formValues.designation || "Faculty",
                 email: formValues.email,
@@ -84,6 +105,7 @@ export default function FacultyPage() {
             setFaculty((prev) => [...prev, created]);
             setIsAddDialogOpen(false);
             setFormValues({
+                program_id: "inherit",
                 name: "",
                 designation: "",
                 email: "",
@@ -175,6 +197,29 @@ export default function FacultyPage() {
                                     </DialogDescription>
                                 </DialogHeader>
                                 <div className="grid gap-4 py-4">
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="faculty-program">Associated Program</Label>
+                                        <Select
+                                            value={formValues.program_id}
+                                            onValueChange={(value) =>
+                                                setFormValues((prev) => ({ ...prev, program_id: value }))
+                                            }
+                                        >
+                                            <SelectTrigger id="faculty-program">
+                                                <SelectValue placeholder="Select a program" />
+                                            </SelectTrigger>
+                                            <SelectContent>
+                                                <SelectItem value="inherit">
+                                                    Use selected page filter
+                                                </SelectItem>
+                                                {programs.map((program) => (
+                                                    <SelectItem key={program.id} value={program.id}>
+                                                        {program.code} - {program.name}
+                                                    </SelectItem>
+                                                ))}
+                                            </SelectContent>
+                                        </Select>
+                                    </div>
                                     <div className="grid gap-2">
                                         <Label htmlFor="name">Full Name</Label>
                                         <Input
@@ -399,6 +444,19 @@ export default function FacultyPage() {
                                 {departments.map((dept) => (
                                     <SelectItem key={dept} value={dept}>
                                         {dept}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                        <Select value={selectedProgramId} onValueChange={setSelectedProgramId}>
+                            <SelectTrigger className="w-full sm:w-[260px]">
+                                <SelectValue placeholder="Program" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="all">All Programs</SelectItem>
+                                {programs.map((program) => (
+                                    <SelectItem key={program.id} value={program.id}>
+                                        {program.code} - {program.name}
                                     </SelectItem>
                                 ))}
                             </SelectContent>

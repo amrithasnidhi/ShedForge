@@ -5,7 +5,6 @@ import Link from "next/link";
 import {
   LayoutDashboard,
   Calendar,
-  AlertTriangle,
   BarChart3,
   Settings,
   LogOut,
@@ -66,6 +65,11 @@ const academicDataItems = [
     icon: BookOpen,
   },
   {
+    title: "Electives",
+    href: "/electives",
+    icon: BookOpen,
+  },
+  {
     title: "Rooms",
     href: "/rooms",
     icon: DoorOpen,
@@ -89,14 +93,9 @@ const schedulingItems = [
     icon: Calendar,
   },
   {
-    title: "Conflicts",
-    href: "/conflicts",
-    icon: AlertTriangle,
-  },
-  {
-    title: "Leave Mgmt",
-    href: "/leave-management",
-    icon: FileText,
+    title: "Timetable Hub",
+    href: "/timetable-collaboration",
+    icon: Calendar,
   },
 ];
 
@@ -153,6 +152,11 @@ const studentNavItems = [
     icon: Calendar,
   },
   {
+    title: "Timetable Hub",
+    href: "/timetable-collaboration",
+    icon: Calendar,
+  },
+  {
     title: "Issues",
     href: "/issues",
     icon: MessageSquareWarning,
@@ -183,6 +187,11 @@ const facultyNavItems = [
   {
     title: "My Schedule",
     href: "/my-schedule",
+    icon: Calendar,
+  },
+  {
+    title: "Timetable Hub",
+    href: "/timetable-collaboration",
     icon: Calendar,
   },
   {

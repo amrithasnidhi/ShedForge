@@ -57,6 +57,13 @@ export interface SmtpConfigurationStatus {
   from_name: string;
   use_tls: boolean;
   use_ssl: boolean;
+  backup_configured?: boolean;
+  backup_host?: string | null;
+  backup_port?: number;
+  notification_prefer_backup?: boolean;
+  retry_attempts?: number;
+  retry_backoff_seconds?: number;
+  rate_limit_cooldown_seconds?: number;
   timeout_seconds: number;
 }
 

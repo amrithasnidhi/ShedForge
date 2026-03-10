@@ -5,6 +5,7 @@ __pycache__/
 
 # Node
 node_modules/
+node_modules_corrupt_backup_*/
 
 # OS
 .DS_Store
@@ -17,6 +18,8 @@ node_modules/
 .env
 backend/.env
 frontend/.env.local
+backend/.ga_hyperparameter_cache.json
+backend/.generation_jobs_store.json
 
 # Generated backups
 database/backups/shedforge-backup-*.json

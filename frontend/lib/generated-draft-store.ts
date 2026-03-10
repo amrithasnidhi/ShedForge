@@ -14,6 +14,7 @@ export interface GeneratedDraftSnapshot {
   term_number?: number;
   label: string;
   hard_conflicts: number;
+  soft_penalty?: number | null;
   fitness?: number | null;
   payload: OfficialTimetablePayload;
 }
@@ -46,6 +47,12 @@ function isGeneratedDraftSnapshot(value: unknown): value is GeneratedDraftSnapsh
     return false;
   }
   if (!isNumber(value.hard_conflicts)) {
+    return false;
+  }
+  if (value.soft_penalty !== undefined && value.soft_penalty !== null && !isNumber(value.soft_penalty)) {
+    return false;
+  }
+  if (value.fitness !== undefined && value.fitness !== null && !isNumber(value.fitness)) {
     return false;
   }
   if (!isObject(value.payload)) {
@@ -109,6 +116,7 @@ export function buildSingleDraftSnapshot(params: {
     term_number: termNumber ?? alternative.payload.termNumber,
     label: mode === "single" ? `Alternative ${alternative.rank}` : `${mode.toUpperCase()} cycle alt ${alternative.rank}`,
     hard_conflicts: alternative.hard_conflicts,
+    soft_penalty: alternative.soft_penalty,
     fitness: alternative.fitness,
     payload: alternative.payload,
   };
@@ -131,6 +139,7 @@ export function buildCycleTermDraftSnapshot(params: {
     term_number: term.term_number,
     label: `Cycle solution ${solutionRank ?? "-"} • Semester ${term.term_number} • Alt ${term.alternative_rank}`,
     hard_conflicts: term.hard_conflicts,
+    soft_penalty: term.soft_penalty,
     fitness: term.fitness,
     payload: term.payload,
   };

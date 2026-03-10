@@ -1,0 +1,53 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "sample_count": 8,
+  "budget_avg_ms": 800.0,
+  "budget_p95_ms": 1500.0,
+  "endpoints": [
+    {
+      "endpoint": "/api/health/live",
+      "samples_ms": [
+        4.6,
+        1.56,
+        1.3,
+        1.48,
+        1.3,
+        1.26,
+        1.24,
+        1.19
+      ],
+      "avg_ms": 1.74,
+      "p95_ms": 4.6,
+      "max_ms": 4.6,
+      "skipped": false,
+      "skip_reason": null
+    },
+    {
+      "endpoint": "/api/health/ready",
+      "samples_ms": [
+        2.23,
+        1.97,
+        1.9,
+        1.85,
+        2.13,
+        1.86,
+        1.94,
+        2.38
+      ],
+      "avg_ms": 2.03,
+      "p95_ms": 2.38,
+      "max_ms": 2.38,
+      "skipped": false,
+      "skip_reason": null
+    },
+    {
+      "endpoint": "/api/system/analytics",
+      "samples_ms": [],
+      "avg_ms": 0.0,
+      "p95_ms": 0.0,
+      "max_ms": 0.0,
+      "skipped": true,
+      "skip_reason": "401 {\"detail\":\"Not authenticated\"}"
+    }
+  ]
+}

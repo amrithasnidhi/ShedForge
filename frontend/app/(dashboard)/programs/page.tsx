@@ -101,6 +101,12 @@ export default function ProgramsPage() {
         duration_years: 4,
         sections: 1,
         total_students: 0,
+        default_section_capacity: 60,
+        home_building: "",
+        course_mapping_enabled: true,
+        faculty_mapping_enabled: true,
+        student_mapping_enabled: true,
+        room_mapping_enabled: true,
     });
     const [editFormValues, setEditFormValues] = useState<ProgramCreate>({
         name: "",
@@ -110,6 +116,12 @@ export default function ProgramsPage() {
         duration_years: 4,
         sections: 1,
         total_students: 0,
+        default_section_capacity: 60,
+        home_building: "",
+        course_mapping_enabled: true,
+        faculty_mapping_enabled: true,
+        student_mapping_enabled: true,
+        room_mapping_enabled: true,
     });
 
     const [termForm, setTermForm] = useState<ProgramTermCreate>({
@@ -187,7 +199,10 @@ export default function ProgramsPage() {
     const handleAddProgram = async () => {
         setError(null);
         try {
-            const created = await createProgram(formValues);
+            const created = await createProgram({
+                ...formValues,
+                home_building: formValues.home_building?.trim() ? formValues.home_building.trim() : null,
+            });
             setPrograms((prev) => [...prev, created]);
             setIsAddDialogOpen(false);
             setFormValues({
@@ -198,6 +213,12 @@ export default function ProgramsPage() {
                 duration_years: 4,
                 sections: 1,
                 total_students: 0,
+                default_section_capacity: 60,
+                home_building: "",
+                course_mapping_enabled: true,
+                faculty_mapping_enabled: true,
+                student_mapping_enabled: true,
+                room_mapping_enabled: true,
             });
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to create program";
@@ -229,6 +250,12 @@ export default function ProgramsPage() {
             duration_years: program.duration_years,
             sections: program.sections,
             total_students: program.total_students,
+            default_section_capacity: program.default_section_capacity,
+            home_building: program.home_building ?? "",
+            course_mapping_enabled: program.course_mapping_enabled,
+            faculty_mapping_enabled: program.faculty_mapping_enabled,
+            student_mapping_enabled: program.student_mapping_enabled,
+            room_mapping_enabled: program.room_mapping_enabled,
         });
         setIsEditDialogOpen(true);
     };
@@ -239,7 +266,10 @@ export default function ProgramsPage() {
         }
         setError(null);
         try {
-            const updated = await updateProgram(editProgram.id, editFormValues);
+            const updated = await updateProgram(editProgram.id, {
+                ...editFormValues,
+                home_building: editFormValues.home_building?.trim() ? editFormValues.home_building.trim() : null,
+            });
             setPrograms((prev) => prev.map((program) => (program.id === updated.id ? updated : program)));
             setIsEditDialogOpen(false);
             setEditProgram(null);
@@ -693,6 +723,98 @@ export default function ProgramsPage() {
                                             }
                                         />
                                     </div>
+                                    <div className="grid grid-cols-4 items-center gap-4">
+                                        <Label htmlFor="defaultCapacity" className="text-right">
+                                            Default Section Capacity
+                                        </Label>
+                                        <Input
+                                            id="defaultCapacity"
+                                            type="number"
+                                            className="col-span-3"
+                                            value={formValues.default_section_capacity}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({
+                                                    ...prev,
+                                                    default_section_capacity: Number(event.target.value),
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-4 items-center gap-4">
+                                        <Label htmlFor="homeBuilding" className="text-right">
+                                            Home Building
+                                        </Label>
+                                        <Input
+                                            id="homeBuilding"
+                                            className="col-span-3"
+                                            value={formValues.home_building ?? ""}
+                                            onChange={(event) =>
+                                                setFormValues((prev) => ({
+                                                    ...prev,
+                                                    home_building: event.target.value,
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-1 gap-3 rounded-md border p-3">
+                                        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                            Mapping Controls
+                                        </p>
+                                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="map-courses"
+                                                    checked={formValues.course_mapping_enabled}
+                                                    onCheckedChange={(checked) =>
+                                                        setFormValues((prev) => ({
+                                                            ...prev,
+                                                            course_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="map-courses">Program to Courses</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="map-faculty"
+                                                    checked={formValues.faculty_mapping_enabled}
+                                                    onCheckedChange={(checked) =>
+                                                        setFormValues((prev) => ({
+                                                            ...prev,
+                                                            faculty_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="map-faculty">Program to Faculty</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="map-students"
+                                                    checked={formValues.student_mapping_enabled}
+                                                    onCheckedChange={(checked) =>
+                                                        setFormValues((prev) => ({
+                                                            ...prev,
+                                                            student_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="map-students">Program to Students</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="map-rooms"
+                                                    checked={formValues.room_mapping_enabled}
+                                                    onCheckedChange={(checked) =>
+                                                        setFormValues((prev) => ({
+                                                            ...prev,
+                                                            room_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="map-rooms">Program to Rooms</Label>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                                 <DialogFooter>
                                     <Button type="button" onClick={handleAddProgram}>
@@ -821,6 +943,98 @@ export default function ProgramsPage() {
                                             }
                                         />
                                     </div>
+                                    <div className="grid grid-cols-4 items-center gap-4">
+                                        <Label htmlFor="edit-defaultCapacity" className="text-right">
+                                            Default Section Capacity
+                                        </Label>
+                                        <Input
+                                            id="edit-defaultCapacity"
+                                            type="number"
+                                            className="col-span-3"
+                                            value={editFormValues.default_section_capacity}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({
+                                                    ...prev,
+                                                    default_section_capacity: Number(event.target.value),
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-4 items-center gap-4">
+                                        <Label htmlFor="edit-homeBuilding" className="text-right">
+                                            Home Building
+                                        </Label>
+                                        <Input
+                                            id="edit-homeBuilding"
+                                            className="col-span-3"
+                                            value={editFormValues.home_building ?? ""}
+                                            onChange={(event) =>
+                                                setEditFormValues((prev) => ({
+                                                    ...prev,
+                                                    home_building: event.target.value,
+                                                }))
+                                            }
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-1 gap-3 rounded-md border p-3">
+                                        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                            Mapping Controls
+                                        </p>
+                                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="edit-map-courses"
+                                                    checked={Boolean(editFormValues.course_mapping_enabled)}
+                                                    onCheckedChange={(checked) =>
+                                                        setEditFormValues((prev) => ({
+                                                            ...prev,
+                                                            course_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="edit-map-courses">Program to Courses</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="edit-map-faculty"
+                                                    checked={Boolean(editFormValues.faculty_mapping_enabled)}
+                                                    onCheckedChange={(checked) =>
+                                                        setEditFormValues((prev) => ({
+                                                            ...prev,
+                                                            faculty_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="edit-map-faculty">Program to Faculty</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="edit-map-students"
+                                                    checked={Boolean(editFormValues.student_mapping_enabled)}
+                                                    onCheckedChange={(checked) =>
+                                                        setEditFormValues((prev) => ({
+                                                            ...prev,
+                                                            student_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="edit-map-students">Program to Students</Label>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Checkbox
+                                                    id="edit-map-rooms"
+                                                    checked={Boolean(editFormValues.room_mapping_enabled)}
+                                                    onCheckedChange={(checked) =>
+                                                        setEditFormValues((prev) => ({
+                                                            ...prev,
+                                                            room_mapping_enabled: Boolean(checked),
+                                                        }))
+                                                    }
+                                                />
+                                                <Label htmlFor="edit-map-rooms">Program to Rooms</Label>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                                 <DialogFooter>
                                     <Button variant="outline" onClick={() => setIsEditDialogOpen(false)}>
@@ -884,6 +1098,17 @@ export default function ProgramsPage() {
                         onChange={(e) => setSearchTerm(e.target.value)}
                     />
                 </div>
+                <div className="hidden items-center gap-1 text-xs text-muted-foreground md:flex">
+                    <span>Mapping:</span>
+                    <Badge variant="outline">C</Badge>
+                    <span>Courses</span>
+                    <Badge variant="outline">F</Badge>
+                    <span>Faculty</span>
+                    <Badge variant="outline">S</Badge>
+                    <span>Students</span>
+                    <Badge variant="outline">R</Badge>
+                    <span>Rooms</span>
+                </div>
             </div>
 
             <div className="border rounded-lg">
@@ -895,19 +1120,21 @@ export default function ProgramsPage() {
                             <TableHead>Department</TableHead>
                             <TableHead>Sections</TableHead>
                             <TableHead>Students</TableHead>
+                            <TableHead>Home Building</TableHead>
+                            <TableHead>Mapping</TableHead>
                             <TableHead className="w-[80px]"></TableHead>
                         </TableRow>
                     </TableHeader>
                     <TableBody>
                         {isLoading ? (
                             <TableRow>
-                                <TableCell colSpan={6} className="text-center text-sm text-muted-foreground">
+                                <TableCell colSpan={8} className="text-center text-sm text-muted-foreground">
                                     Loading programs...
                                 </TableCell>
                             </TableRow>
                         ) : filteredPrograms.length === 0 ? (
                             <TableRow>
-                                <TableCell colSpan={6} className="text-center text-sm text-muted-foreground">
+                                <TableCell colSpan={8} className="text-center text-sm text-muted-foreground">
                                     No programs found.
                                 </TableCell>
                             </TableRow>
@@ -936,6 +1163,15 @@ export default function ProgramsPage() {
                                         <div className="flex items-center gap-2">
                                             <Users className="h-3 w-3 text-muted-foreground" />
                                             <span>{program.total_students}</span>
+                                        </div>
+                                    </TableCell>
+                                    <TableCell>{program.home_building || "-"}</TableCell>
+                                    <TableCell>
+                                        <div className="flex flex-wrap gap-1">
+                                            <Badge variant={program.course_mapping_enabled ? "default" : "outline"}>C</Badge>
+                                            <Badge variant={program.faculty_mapping_enabled ? "default" : "outline"}>F</Badge>
+                                            <Badge variant={program.student_mapping_enabled ? "default" : "outline"}>S</Badge>
+                                            <Badge variant={program.room_mapping_enabled ? "default" : "outline"}>R</Badge>
                                         </div>
                                     </TableCell>
                                     <TableCell>

@@ -23,6 +23,14 @@ export function ThemeToggle() {
   const activeTheme = mounted ? theme : "system";
   const Icon = activeTheme === "light" ? Sun : activeTheme === "dark" ? Moon : Laptop;
 
+  if (!mounted) {
+    return (
+      <Button variant="outline" size="icon" aria-label="Change theme">
+        <Laptop className="h-4 w-4" />
+      </Button>
+    );
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>

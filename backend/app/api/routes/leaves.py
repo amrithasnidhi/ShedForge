@@ -2,7 +2,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, require_roles
@@ -19,6 +19,7 @@ from app.schemas.leave import (
     LeaveRequestCreate,
     LeaveRequestOut,
     LeaveRequestStatusUpdate,
+    LeaveSwapOfferCreate,
     LeaveSubstituteAssignmentCreate,
     LeaveSubstituteAssignmentOut,
     LeaveSubstituteOfferOut,
@@ -291,6 +292,17 @@ def _find_slot(payload: OfficialTimetablePayload, slot_id: str):
         if slot.id == slot_id:
             return slot
     return None
+
+
+def _prune_primary_from_slot_assistants(slot: object, primary_faculty_id: str) -> None:
+    raw_assistants = getattr(slot, "assistant_faculty_ids", None)
+    if not isinstance(raw_assistants, list):
+        return
+    slot.assistant_faculty_ids = [
+        str(item).strip()
+        for item in raw_assistants
+        if str(item).strip() and str(item).strip() != primary_faculty_id
+    ]
 
 
 def _build_assignment_out(
@@ -662,6 +674,7 @@ def _reschedule_slot_for_leave(
             slot.endTime = _minutes_to_hhmm(end_minute)
             slot.roomId = selected_room.id
             slot.facultyId = request.faculty_id
+            _prune_primary_from_slot_assistants(slot, request.faculty_id)
             return {
                 "slot_id": slot.id,
                 "section": slot.section,
@@ -1258,10 +1271,204 @@ def finalize_expired_substitute_offers(
     return summary
 
 
+@router.post(
+    "/leaves/{leave_id}/swap-offers",
+    response_model=LeaveSubstituteOfferOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_leave_swap_offer(
+    leave_id: str,
+    payload: LeaveSwapOfferCreate,
+    current_user: User = Depends(require_roles(UserRole.faculty, UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> LeaveSubstituteOfferOut:
+    request = db.get(LeaveRequest, leave_id)
+    if request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Leave request not found")
+    if not request.faculty_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Leave request is not linked to a faculty profile")
+
+    if current_user.role == UserRole.faculty:
+        faculty = _get_faculty_for_user(db, current_user)
+        if faculty is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Faculty profile not linked")
+        if request.user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only create swap requests for your own leave")
+
+    substitute = db.get(Faculty, payload.substitute_faculty_id)
+    if substitute is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Substitute faculty not found")
+    if substitute.id == request.faculty_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Substitute faculty must be different from leave faculty")
+
+    official, timetable_payload = _load_official_payload(db)
+    if official is None or timetable_payload is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Official timetable not available")
+
+    slot = _find_slot(timetable_payload, payload.slot_id)
+    if slot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timetable slot not found")
+    if slot.facultyId != request.faculty_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected slot does not belong to leave faculty")
+
+    leave_day = request.leave_date.strftime("%A")
+    if slot.day != leave_day:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Selected slot is not on leave day ({leave_day})",
+        )
+
+    same_section_same_day = any(
+        other.id != slot.id
+        and other.day == slot.day
+        and other.section == slot.section
+        and other.facultyId == substitute.id
+        and other.courseId != slot.courseId
+        for other in timetable_payload.timetable_data
+    )
+    if not same_section_same_day:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected faculty must already teach the same section on the same day for class swap workflow",
+        )
+
+    course_by_id = {item.id: item for item in timetable_payload.course_data}
+    course = course_by_id.get(slot.courseId)
+    if course is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Course data for selected slot is missing")
+
+    faculty_by_id = {
+        item.id: item
+        for item in db.execute(select(Faculty)).scalars()
+    }
+    leave_faculty = faculty_by_id.get(request.faculty_id)
+    approved_leave_faculty_ids = set(
+        db.execute(
+            select(LeaveRequest.faculty_id).where(
+                LeaveRequest.leave_date == request.leave_date,
+                LeaveRequest.status == LeaveStatus.approved,
+                LeaveRequest.id != request.id,
+                LeaveRequest.faculty_id.is_not(None),
+            )
+        ).scalars()
+    )
+    eligible = _eligible_substitute_candidates_for_slot(
+        request=request,
+        slot=slot,
+        course_code=course.code.strip().upper(),
+        leave_faculty=leave_faculty,
+        payload=timetable_payload,
+        faculty_by_id=faculty_by_id,
+        approved_leave_faculty_ids=approved_leave_faculty_ids,
+        minutes_cache={},
+    )
+    if all(item.id != substitute.id for item in eligible):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected faculty is not currently eligible for this slot (availability/workload overlap).",
+        )
+
+    now = _utc_now()
+    if request.status == LeaveStatus.pending:
+        request.status = LeaveStatus.approved
+        request.reviewed_by_id = current_user.id
+        request.reviewed_at = now
+        if not request.admin_comment:
+            request.admin_comment = "Auto-approved via faculty class swap workflow."
+
+    for stale in db.execute(
+        select(LeaveSubstituteOffer).where(
+            LeaveSubstituteOffer.leave_request_id == request.id,
+            LeaveSubstituteOffer.slot_id == slot.id,
+            LeaveSubstituteOffer.status == LeaveSubstituteOfferStatus.pending,
+        )
+    ).scalars():
+        stale.status = LeaveSubstituteOfferStatus.cancelled
+        stale.responded_at = now
+        stale.response_note = "Replaced by a newer class swap request."
+
+    existing_offer = db.execute(
+        select(LeaveSubstituteOffer).where(
+            LeaveSubstituteOffer.leave_request_id == request.id,
+            LeaveSubstituteOffer.slot_id == slot.id,
+            LeaveSubstituteOffer.substitute_faculty_id == substitute.id,
+        )
+    ).scalar_one_or_none()
+
+    if existing_offer is None:
+        existing_offer = LeaveSubstituteOffer(
+            leave_request_id=request.id,
+            slot_id=slot.id,
+            substitute_faculty_id=substitute.id,
+            offered_by_id=current_user.id,
+            status=LeaveSubstituteOfferStatus.pending,
+            expires_at=now + timedelta(minutes=OFFER_EXPIRY_MINUTES),
+        )
+        db.add(existing_offer)
+    else:
+        existing_offer.offered_by_id = current_user.id
+        existing_offer.status = LeaveSubstituteOfferStatus.pending
+        existing_offer.expires_at = now + timedelta(minutes=OFFER_EXPIRY_MINUTES)
+        existing_offer.responded_at = None
+        existing_offer.response_note = None
+
+    substitute_user = db.execute(
+        select(User).where(
+            User.role == UserRole.faculty,
+            func.lower(User.email) == substitute.email.lower(),
+        )
+    ).scalar_one_or_none()
+    if substitute_user is not None:
+        notify_users(
+            db,
+            user_ids=[substitute_user.id],
+            title="Class Swap Request",
+            message=(
+                f"You received a class swap request for {course.code} on {slot.day} "
+                f"{slot.startTime}-{slot.endTime} (Section {slot.section})."
+            ),
+            notification_type=NotificationType.workflow,
+            deliver_email=True,
+        )
+
+    notify_users(
+        db,
+        user_ids=[request.user_id],
+        title="Swap Request Sent",
+        message=(
+            f"Swap request sent to {substitute.name} for {course.code} on {slot.day} "
+            f"{slot.startTime}-{slot.endTime} (Section {slot.section})."
+        ),
+        notification_type=NotificationType.workflow,
+        deliver_email=True,
+    )
+
+    log_activity(
+        db,
+        user=current_user,
+        action="leave.swap.offer.create",
+        entity_type="leave_request",
+        entity_id=request.id,
+        details={
+            "slot_id": slot.id,
+            "substitute_faculty_id": substitute.id,
+            "substitute_faculty_email": substitute.email,
+            "leave_date": request.leave_date.isoformat(),
+            "section": slot.section,
+            "auto_approved": request.status == LeaveStatus.approved,
+        },
+    )
+
+    db.commit()
+    refreshed = db.get(LeaveSubstituteOffer, existing_offer.id)
+    return _hydrate_substitute_offers(db, [refreshed])[0]
+
+
 @router.get("/leaves/substitute-offers", response_model=list[LeaveSubstituteOfferOut])
 def list_substitute_offers(
     offer_status: LeaveSubstituteOfferStatus | None = Query(default=None, alias="status"),
     leave_id: str | None = Query(default=None),
+    scope: str = Query(default="received", pattern="^(received|sent|all)$"),
     current_user: User = Depends(require_roles(UserRole.faculty, UserRole.admin, UserRole.scheduler)),
     db: Session = Depends(get_db),
 ) -> list[LeaveSubstituteOfferOut]:
@@ -1271,7 +1478,17 @@ def list_substitute_offers(
         faculty = _get_faculty_for_user(db, current_user)
         if faculty is None:
             return []
-        query = query.where(LeaveSubstituteOffer.substitute_faculty_id == faculty.id)
+        if scope == "sent":
+            query = query.where(LeaveSubstituteOffer.offered_by_id == current_user.id)
+        elif scope == "all":
+            query = query.where(
+                or_(
+                    LeaveSubstituteOffer.substitute_faculty_id == faculty.id,
+                    LeaveSubstituteOffer.offered_by_id == current_user.id,
+                )
+            )
+        else:
+            query = query.where(LeaveSubstituteOffer.substitute_faculty_id == faculty.id)
     elif leave_id:
         query = query.where(LeaveSubstituteOffer.leave_request_id == leave_id)
 
@@ -1401,6 +1618,7 @@ def respond_to_substitute_offer(
         )
 
     slot.facultyId = faculty.id
+    _prune_primary_from_slot_assistants(slot, faculty.id)
     _ensure_faculty_in_payload(timetable_payload, faculty)
 
     offer.status = LeaveSubstituteOfferStatus.accepted

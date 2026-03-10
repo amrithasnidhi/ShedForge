@@ -122,18 +122,29 @@ export interface GeneratedAlternative {
   occupancy_matrix?: OccupancyMatrix | null;
 }
 
+export interface AutoResolvedConflictEntry {
+  conflict_id: string;
+  conflict_type: string;
+  description: string;
+  resolution: string;
+  resolved: boolean;
+}
+
 export interface GenerateTimetableResponse {
   alternatives: GeneratedAlternative[];
   settings_used: Omit<GenerationSettings, "id">;
   runtime_ms: number;
   published_version_label?: string | null;
   publish_warning?: string | null;
+  auto_saved_version_label?: string | null;
+  auto_resolved_conflicts?: AutoResolvedConflictEntry[];
 }
 
 export interface GeneratedCycleTermResult {
   term_number: number;
   generation: GenerateTimetableResponse;
   published_version_label?: string | null;
+  auto_saved_version_label?: string | null;
 }
 
 export interface GeneratedCycleSolutionTerm {
@@ -166,6 +177,47 @@ export interface GenerateTimetableCycleResponse {
   results: GeneratedCycleTermResult[];
   pareto_front?: GeneratedCycleSolution[];
   selected_solution_rank?: number | null;
+}
+
+export type GenerationJobKind = "single" | "cycle";
+export type GenerationJobStatus = "queued" | "running" | "succeeded" | "failed";
+export type GenerationJobEventLevel = "info" | "success" | "warn" | "error";
+
+export interface GenerationJobAccepted {
+  job_id: string;
+  kind: GenerationJobKind;
+  status: GenerationJobStatus;
+  created_at: string;
+}
+
+export interface GenerationJobEvent {
+  id: number;
+  at: string;
+  stage: string;
+  level: GenerationJobEventLevel;
+  message: string;
+  progress_percent?: number | null;
+  metrics: Record<string, unknown>;
+  latest_generation?: GenerateTimetableResponse | null;
+}
+
+export interface GenerationJobStatusResponse {
+  job_id: string;
+  kind: GenerationJobKind;
+  status: GenerationJobStatus;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at: string;
+  progress_percent?: number | null;
+  stage?: string | null;
+  message?: string | null;
+  events: GenerationJobEvent[];
+  last_event_id: number;
+  latest_generation?: GenerateTimetableResponse | null;
+  result?: GenerateTimetableResponse | GenerateTimetableCycleResponse | null;
+  error_message?: string | null;
+  next_poll_after_ms?: number;
 }
 
 export type ReevaluationStatus = "pending" | "resolved" | "dismissed";
@@ -257,6 +309,41 @@ export async function generateTimetableCycle(
     body: JSON.stringify(payload),
   });
   return handleResponse<GenerateTimetableCycleResponse>(response, "Unable to generate timetable cycle");
+}
+
+export async function startLiveTimetableGeneration(payload: GenerateTimetableRequest): Promise<GenerationJobAccepted> {
+  const response = await fetch(`${API_BASE_URL}/api/timetable/generate/live`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<GenerationJobAccepted>(response, "Unable to start live timetable generation");
+}
+
+export async function startLiveTimetableCycleGeneration(
+  payload: GenerateTimetableCycleRequest,
+): Promise<GenerationJobAccepted> {
+  const response = await fetch(`${API_BASE_URL}/api/timetable/generate-cycle/live`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<GenerationJobAccepted>(response, "Unable to start live cycle generation");
+}
+
+export async function getGenerationJobStatus(
+  jobId: string,
+  options: { since_event_id?: number } = {},
+): Promise<GenerationJobStatusResponse> {
+  const search = new URLSearchParams();
+  if (typeof options.since_event_id === "number" && options.since_event_id > 0) {
+    search.set("since_event_id", String(Math.trunc(options.since_event_id)));
+  }
+  const response = await fetch(
+    `${API_BASE_URL}/api/timetable/generation-jobs/${encodeURIComponent(jobId)}${search.toString() ? `?${search.toString()}` : ""}`,
+    { headers: getAuthHeaders() },
+  );
+  return handleResponse<GenerationJobStatusResponse>(response, "Unable to fetch generation job status");
 }
 
 export async function listReevaluationEvents(

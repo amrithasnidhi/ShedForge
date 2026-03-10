@@ -24,8 +24,10 @@ import { useAuth } from "@/components/auth-provider";
 import {
     createRoom,
     deleteRoom,
+    listPrograms,
     listRooms,
     updateRoom,
+    type Program,
     type Room,
     type RoomType,
     type RoomUpdate,
@@ -36,6 +38,8 @@ export default function RoomsPage() {
     const canManage = user?.role === "admin" || user?.role === "scheduler";
     const [searchQuery, setSearchQuery] = useState("");
     const [buildingFilter, setBuildingFilter] = useState("all");
+    const [selectedProgramId, setSelectedProgramId] = useState<string>("all");
+    const [programs, setPrograms] = useState<Program[]>([]);
     const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
     const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
     const [rooms, setRooms] = useState<Room[]>([]);
@@ -62,7 +66,7 @@ export default function RoomsPage() {
     useEffect(() => {
         const loadRooms = async () => {
             try {
-                const data = await listRooms();
+                const data = await listRooms(selectedProgramId === "all" ? undefined : selectedProgramId);
                 setRooms(data);
             } catch (err) {
                 const message = err instanceof Error ? err.message : "Unable to load rooms";
@@ -72,12 +76,27 @@ export default function RoomsPage() {
             }
         };
         void loadRooms();
+    }, [selectedProgramId]);
+
+    useEffect(() => {
+        const loadPrograms = async () => {
+            try {
+                const data = await listPrograms();
+                setPrograms(data);
+            } catch {
+                setPrograms([]);
+            }
+        };
+        void loadPrograms();
     }, []);
 
     const handleAddRoom = async () => {
         setError(null);
         try {
-            const created = await createRoom(formValues);
+            const created = await createRoom({
+                ...formValues,
+                program_id: selectedProgramId === "all" ? undefined : selectedProgramId,
+            });
             setRooms((prev) => [...prev, created]);
             setIsAddDialogOpen(false);
             setFormValues({
@@ -428,6 +447,19 @@ export default function RoomsPage() {
                                 {buildings.map((building) => (
                                     <SelectItem key={building} value={building}>
                                         {building}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                        <Select value={selectedProgramId} onValueChange={setSelectedProgramId}>
+                            <SelectTrigger className="w-full sm:w-[260px]">
+                                <SelectValue placeholder="Program" />
+                            </SelectTrigger>
+                            <SelectContent>
+                                <SelectItem value="all">All Programs</SelectItem>
+                                {programs.map((program) => (
+                                    <SelectItem key={program.id} value={program.id}>
+                                        {program.code} - {program.name}
                                     </SelectItem>
                                 ))}
                             </SelectContent>

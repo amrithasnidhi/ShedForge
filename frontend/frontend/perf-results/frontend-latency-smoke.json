@@ -1,0 +1,47 @@
+{
+  "baseUrl": "http://127.0.0.1:3000",
+  "samples": 5,
+  "avgBudgetMs": 1200,
+  "p95BudgetMs": 2500,
+  "routes": [
+    {
+      "route": "/",
+      "samplesMs": [
+        32.62,
+        4.53,
+        2.1,
+        2.11,
+        1.57
+      ],
+      "avgMs": 8.59,
+      "p95Ms": 32.62,
+      "maxMs": 32.62
+    },
+    {
+      "route": "/dashboard",
+      "samplesMs": [
+        1.75,
+        1.61,
+        1.43,
+        1.59,
+        1.65
+      ],
+      "avgMs": 1.61,
+      "p95Ms": 1.75,
+      "maxMs": 1.75
+    },
+    {
+      "route": "/schedule",
+      "samplesMs": [
+        1.27,
+        1.04,
+        1.02,
+        1.04,
+        0.94
+      ],
+      "avgMs": 1.06,
+      "p95Ms": 1.27,
+      "maxMs": 1.27
+    }
+  ]
+}

@@ -32,6 +32,7 @@ class AvailabilityWindow(BaseModel):
 
 
 class RoomBase(BaseModel):
+    program_id: str | None = Field(default=None, min_length=1, max_length=36)
     name: str = Field(min_length=1, max_length=100)
     building: str = Field(min_length=1, max_length=200)
     capacity: int = Field(ge=1, le=1000)
@@ -46,6 +47,7 @@ class RoomCreate(RoomBase):
 
 
 class RoomUpdate(BaseModel):
+    program_id: str | None = Field(default=None, min_length=1, max_length=36)
     name: str | None = Field(default=None, min_length=1, max_length=100)
     building: str | None = Field(default=None, min_length=1, max_length=200)
     capacity: int | None = Field(default=None, ge=1, le=1000)

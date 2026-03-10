@@ -17,9 +17,6 @@ DAY_VALUES = {
 }
 
 TIME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-MANDATORY_LUNCH_BREAK_NAME = "Lunch Break"
-MANDATORY_LUNCH_START = "13:15"
-MANDATORY_LUNCH_END = "14:05"
 
 
 def parse_time_to_minutes(value: str) -> int:
@@ -113,44 +110,19 @@ class SchedulePolicyUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_breaks(self) -> "SchedulePolicyUpdate":
-        mandatory_start = parse_time_to_minutes(MANDATORY_LUNCH_START)
-        mandatory_end = parse_time_to_minutes(MANDATORY_LUNCH_END)
-
-        normalized_breaks: list[BreakWindowEntry] = []
-        for item in self.breaks:
-            if item.name.strip().lower() == MANDATORY_LUNCH_BREAK_NAME.lower():
-                normalized_breaks.append(
-                    BreakWindowEntry(
-                        name=MANDATORY_LUNCH_BREAK_NAME,
-                        start_time=MANDATORY_LUNCH_START,
-                        end_time=MANDATORY_LUNCH_END,
-                    )
-                )
-            else:
-                normalized_breaks.append(item)
-        self.breaks = normalized_breaks
+        self.breaks = [
+            BreakWindowEntry(
+                name=item.name.strip(),
+                start_time=item.start_time,
+                end_time=item.end_time,
+            )
+            for item in self.breaks
+        ]
 
         windows = sorted(
             ((parse_time_to_minutes(item.start_time), parse_time_to_minutes(item.end_time), item.name) for item in self.breaks),
             key=lambda item: item[0],
         )
-
-        lunch_covered = any(start <= mandatory_start and end >= mandatory_end for start, end, _ in windows)
-        if not lunch_covered:
-            self.breaks.append(
-                BreakWindowEntry(
-                    name=MANDATORY_LUNCH_BREAK_NAME,
-                    start_time=MANDATORY_LUNCH_START,
-                    end_time=MANDATORY_LUNCH_END,
-                )
-            )
-            windows = sorted(
-                (
-                    (parse_time_to_minutes(item.start_time), parse_time_to_minutes(item.end_time), item.name)
-                    for item in self.breaks
-                ),
-                key=lambda item: item[0],
-            )
 
         for index, (_, _, name) in enumerate(windows):
             for _, _, other_name in windows[index + 1 :]:
@@ -234,11 +206,7 @@ DEFAULT_SCHEDULE_POLICY = SchedulePolicyUpdate(
     lab_contiguous_slots=2,
     breaks=[
         BreakWindowEntry(name="Short Break", start_time="10:30", end_time="10:45"),
-        BreakWindowEntry(
-            name=MANDATORY_LUNCH_BREAK_NAME,
-            start_time=MANDATORY_LUNCH_START,
-            end_time=MANDATORY_LUNCH_END,
-        ),
+        BreakWindowEntry(name="Lunch Break", start_time="13:15", end_time="14:05"),
     ],
 )
 

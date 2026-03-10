@@ -86,13 +86,39 @@ class OperationsSnapshotOut(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class AnalyticsScopeOut(BaseModel):
+    mode: str
+    program_id: str | None = Field(default=None, alias="programId")
+    program_code: str | None = Field(default=None, alias="programCode")
+    program_name: str | None = Field(default=None, alias="programName")
+    timetable_scoped: bool = Field(alias="timetableScoped")
+    timetable_scope_note: str = Field(alias="timetableScopeNote")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class MetricDefinitionOut(BaseModel):
+    key: str
+    label: str
+    definition: str
+    formula: str
+    numerator: float
+    denominator: float
+    unit: str
+    computed_value: float = Field(alias="computedValue")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class SystemAnalyticsOut(BaseModel):
     generated_at: str = Field(alias="generatedAt")
+    scope: AnalyticsScopeOut
     inventory: ResourceInventoryOut
     timetable: TimetableSnapshotOut
     utilization: UtilizationSnapshotOut
     capacity: CapacitySnapshotOut
     activity: ActivityAnalyticsOut
     operations: OperationsSnapshotOut
+    metric_definitions: list[MetricDefinitionOut] = Field(default_factory=list, alias="metricDefinitions")
 
     model_config = ConfigDict(populate_by_name=True)

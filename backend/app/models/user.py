@@ -24,8 +24,12 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[UserRole] = mapped_column(SAEnum(UserRole, name="user_role"), nullable=False)
+    program_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     department: Mapped[str | None] = mapped_column(String(200), nullable=True)
     section_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    semester_number: Mapped[int | None] = mapped_column(nullable=True)
+    batch_year: Mapped[int | None] = mapped_column(nullable=True)
+    roll_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

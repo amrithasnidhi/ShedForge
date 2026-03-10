@@ -145,7 +145,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (storedUser) {
-            setUser(JSON.parse(storedUser));
+            try {
+                setUser(JSON.parse(storedUser));
+            } catch {
+                localStorage.removeItem("user");
+            }
         }
         markActivity();
         scheduleSessionTimers(token);
@@ -156,16 +160,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                     headers: { Authorization: `Bearer ${token}` },
                 });
                 if (!response.ok) {
-                    throw new Error("Session invalid");
+                    if (response.status === 401 || response.status === 403) {
+                        clearTimers();
+                        setUser(null);
+                        localStorage.removeItem("user");
+                        localStorage.removeItem("token");
+                        localStorage.removeItem("lastActivity");
+                        return;
+                    }
+                    throw new Error(`Session validation failed (${response.status})`);
                 }
                 const data: User = await response.json();
                 setUser(data);
                 localStorage.setItem("user", JSON.stringify(data));
             } catch (error) {
-                console.error("Session validation failed:", error);
-                setUser(null);
-                localStorage.removeItem("user");
-                localStorage.removeItem("token");
+                // Keep local session on transient API/network failures (e.g., backend restart).
+                // Session is already invalidated above for explicit 401/403 responses.
+                if (error instanceof TypeError && error.message === "Failed to fetch") {
+                    console.warn("Session validation skipped: backend unreachable.");
+                } else {
+                    console.warn("Session validation skipped:", error);
+                }
             } finally {
                 setIsLoading(false);
             }

@@ -103,18 +103,47 @@ export interface OperationsSnapshot {
   feedbackByStatus: LabeledCount[];
 }
 
+export interface AnalyticsScope {
+  mode: string;
+  programId?: string | null;
+  programCode?: string | null;
+  programName?: string | null;
+  timetableScoped: boolean;
+  timetableScopeNote: string;
+}
+
+export interface MetricDefinition {
+  key: string;
+  label: string;
+  definition: string;
+  formula: string;
+  numerator: number;
+  denominator: number;
+  unit: string;
+  computedValue: number;
+}
+
 export interface SystemAnalyticsPayload {
   generatedAt: string;
+  scope: AnalyticsScope;
   inventory: ResourceInventory;
   timetable: TimetableSnapshot;
   utilization: UtilizationSnapshot;
   capacity: CapacitySnapshot;
   activity: ActivityAnalytics;
   operations: OperationsSnapshot;
+  metricDefinitions: MetricDefinition[];
 }
 
-export async function fetchSystemAnalytics(days = 14): Promise<SystemAnalyticsPayload> {
-  const response = await fetch(`${API_BASE_URL}/api/system/analytics?days=${encodeURIComponent(String(days))}`, {
+export async function fetchSystemAnalytics(
+  days = 14,
+  options?: { programId?: string | null },
+): Promise<SystemAnalyticsPayload> {
+  const params = new URLSearchParams({ days: String(days) });
+  if (options?.programId) {
+    params.set("programId", options.programId);
+  }
+  const response = await fetch(`${API_BASE_URL}/api/system/analytics?${params.toString()}`, {
     headers: getAuthHeaders(),
   });
   return parseOrThrow<SystemAnalyticsPayload>(response, "Unable to load system analytics");

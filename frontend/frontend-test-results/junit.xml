@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="3" failures="0" errors="0" time="1.215">
+  <testsuite name="Smoke Test" errors="0" failures="0" skipped="0" timestamp="2026-03-10T15:49:08" time="0.581" tests="1">
+    <testcase classname="Smoke Test renders a button correctly" name="Smoke Test renders a button correctly" time="0.062">
+    </testcase>
+  </testsuite>
+  <testsuite name="UI Components" errors="0" failures="0" skipped="0" timestamp="2026-03-10T15:49:08" time="0.122" tests="2">
+    <testcase classname="UI Components Input renders correctly" name="UI Components Input renders correctly" time="0.006">
+    </testcase>
+    <testcase classname="UI Components Card renders content correctly" name="UI Components Card renders content correctly" time="0.004">
+    </testcase>
+  </testsuite>
+</testsuites>

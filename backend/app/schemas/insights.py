@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.timetable import OfficialTimetablePayload
+
 
 class TimetableConflict(BaseModel):
     id: str
@@ -21,6 +23,12 @@ class TimetableConflict(BaseModel):
     affected_slots: list[str] = Field(default_factory=list, alias="affectedSlots")
     resolution: str
     resolved: bool = False
+    decision: Literal["yes", "no"] | None = None
+    resolution_mode: Literal["auto", "manual", "ignored", "pending"] | None = Field(
+        default=None,
+        alias="resolutionMode",
+    )
+    decision_note: str | None = Field(default=None, alias="decisionNote")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -87,5 +95,45 @@ class TimetableAnalytics(BaseModel):
     workload_chart_data: list[WorkloadChartEntry] = Field(default_factory=list, alias="workloadChartData")
     daily_workload_data: list[DailyWorkloadEntry] = Field(default_factory=list, alias="dailyWorkloadData")
     performance_trend_data: list[PerformanceTrendEntry] = Field(default_factory=list, alias="performanceTrendData")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TimetableConflictReviewIn(BaseModel):
+    payload: OfficialTimetablePayload | None = None
+
+
+class TimetableConflictReviewOut(BaseModel):
+    source: Literal["official", "provided"]
+    auto_resolved_conflicts: list[TimetableConflict] = Field(default_factory=list, alias="autoResolvedConflicts")
+    manually_resolved_conflicts: list[TimetableConflict] = Field(default_factory=list, alias="manuallyResolvedConflicts")
+    ignored_conflicts: list[TimetableConflict] = Field(default_factory=list, alias="ignoredConflicts")
+    pending_conflicts: list[TimetableConflict] = Field(default_factory=list, alias="pendingConflicts")
+    unresolved_required_count: int = Field(alias="unresolvedRequiredCount")
+    unresolved_hard_count: int = Field(alias="unresolvedHardCount")
+    constraint_mismatches: list[str] = Field(default_factory=list, alias="constraintMismatches")
+    can_publish: bool = Field(alias="canPublish")
+    can_publish_anyway: bool = Field(default=True, alias="canPublishAnyway")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TimetableConflictResolveAllIn(BaseModel):
+    payload: OfficialTimetablePayload | None = None
+    scope: Literal["hard", "all"] = "hard"
+    promote_official: bool | None = Field(default=None, alias="promoteOfficial")
+    note: str | None = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TimetableConflictResolveAllOut(BaseModel):
+    source: Literal["official", "provided"]
+    resolved_payload: OfficialTimetablePayload = Field(alias="resolvedPayload")
+    resolved_count: int = Field(alias="resolvedCount")
+    remaining_conflicts: list[TimetableConflict] = Field(default_factory=list, alias="remainingConflicts")
+    auto_resolved_conflicts: list[TimetableConflict] = Field(default_factory=list, alias="autoResolvedConflicts")
+    constraint_mismatches: list[str] = Field(default_factory=list, alias="constraintMismatches")
+    promoted_version_label: str | None = Field(default=None, alias="promotedVersionLabel")
 
     model_config = ConfigDict(populate_by_name=True)

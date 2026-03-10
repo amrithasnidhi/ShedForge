@@ -1,14 +1,20 @@
 from collections import defaultdict
+from collections.abc import Callable
+from datetime import datetime, timezone
 import logging
+import threading
 from time import perf_counter
+import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, require_roles
+from app.db.session import SessionLocal
 from app.models.faculty import Faculty
 from app.models.institution_settings import InstitutionSettings
 from app.models.notification import NotificationType
+from app.models.program_constraint import ProgramConstraint
 from app.models.program_structure import ProgramTerm
 from app.models.timetable import OfficialTimetable
 from app.models.timetable_generation import (
@@ -16,15 +22,19 @@ from app.models.timetable_generation import (
     TimetableGenerationSettings,
     TimetableSlotLock,
 )
+from app.models.timetable_conflict_decision import ConflictDecision, TimetableConflictDecision
 from app.models.timetable_version import TimetableVersion
 from app.models.user import User, UserRole
 from app.schemas.generator import (
+    AutoResolvedConflictEntry,
     FacultyWorkloadBridgeSuggestion,
     FacultyWorkloadGapSuggestion,
     GenerateTimetableRequest,
     GenerateTimetableCycleRequest,
     GenerateTimetableCycleResponse,
     GenerateTimetableResponse,
+    GenerationJobAccepted,
+    GenerationJobStatusOut,
     GeneratedCycleSolution,
     GeneratedCycleSolutionTerm,
     GeneratedCycleTermResult,
@@ -38,9 +48,11 @@ from app.schemas.generator import (
     SlotLockCreate,
     SlotLockOut,
 )
+from app.schemas.timetable import OfficialTimetablePayload
 from app.schemas.settings import DEFAULT_ACADEMIC_CYCLE, parse_time_to_minutes
 from app.services.audit import log_activity
 from app.services.evolution_scheduler import EvolutionaryScheduler
+from app.services.generation_jobs import generation_job_store
 from app.services.notifications import notify_all_users
 from app.services.reevaluation import (
     list_reevaluation_events,
@@ -52,8 +64,43 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _slot_assistant_faculty_ids(slot: object) -> tuple[str, ...]:
+    raw = getattr(slot, "assistant_faculty_ids", None)
+    if raw is None:
+        raw = getattr(slot, "assistantFacultyIds", None)
+    if not isinstance(raw, list):
+        return tuple()
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in raw:
+        faculty_id = str(item or "").strip()
+        if not faculty_id or faculty_id in seen:
+            continue
+        seen.add(faculty_id)
+        ordered.append(faculty_id)
+    return tuple(ordered)
+
+
+def _dedupe_auto_resolved_conflicts(
+    entries: list[AutoResolvedConflictEntry],
+    *,
+    limit: int = 200,
+) -> list[AutoResolvedConflictEntry]:
+    unique: list[AutoResolvedConflictEntry] = []
+    seen_ids: set[str] = set()
+    for entry in entries:
+        conflict_id = entry.conflict_id.strip()
+        if not conflict_id or conflict_id in seen_ids:
+            continue
+        seen_ids.add(conflict_id)
+        unique.append(entry)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
 def default_generation_settings() -> GenerationSettingsBase:
-    return GenerationSettingsBase()
+    return GenerationSettingsBase(solver_strategy="hybrid")
 
 
 def load_generation_settings(db: Session) -> GenerationSettingsOut:
@@ -92,26 +139,380 @@ def _next_version_label(db: Session) -> str:
     return f"v{next_index}"
 
 
+def _timestamped_generation_label(*, prefix: str, program_id: str, term_number: int) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    suffix = uuid.uuid4().hex[:6]
+    compact_program = "".join(ch for ch in program_id if ch.isalnum())[:10] or "program"
+    return f"{prefix}-{compact_program}-t{term_number}-{ts}-{suffix}"
+
+
+def _persist_generated_snapshot_version(
+    *,
+    db: Session,
+    current_user: User,
+    generation: GenerateTimetableResponse,
+    label_prefix: str = "gen",
+    cycle: str | None = None,
+    term_number: int | None = None,
+) -> str:
+    best = generation.alternatives[0]
+    resolved_term = term_number or (best.payload.term_number or 0)
+    label = _timestamped_generation_label(
+        prefix=label_prefix,
+        program_id=best.payload.program_id,
+        term_number=resolved_term,
+    )
+    summary = {
+        "program_id": best.payload.program_id,
+        "term_number": resolved_term,
+        "slots": len(best.payload.timetable_data),
+        "conflicts": best.hard_conflicts,
+        "source": "generator-auto-save",
+        "cycle": cycle,
+        "auto_saved": True,
+    }
+    db.add(
+        TimetableVersion(
+            label=label,
+            payload=best.payload.model_dump(by_alias=True),
+            summary=summary,
+            created_by_id=current_user.id,
+        )
+    )
+    generation.auto_saved_version_label = label
+    return label
+
+
+def _timestamped_cycle_bundle_label(*, program_id: str, cycle: str, term_numbers: list[int]) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    suffix = uuid.uuid4().hex[:6]
+    compact_program = "".join(ch for ch in program_id if ch.isalnum())[:10] or "program"
+    terms = "-".join(str(item) for item in sorted(set(term_numbers))) or "none"
+    return f"cyclegen-{compact_program}-cycle-{cycle}-{terms}-{ts}-{suffix}"
+
+
+def _build_cycle_combined_payload(
+    *,
+    terms: list[GeneratedCycleSolutionTerm],
+) -> OfficialTimetablePayload:
+    if not terms:
+        raise ValueError("Cannot build combined cycle payload without term solutions")
+
+    ordered_terms = sorted(terms, key=lambda item: item.term_number)
+    base_program_id = ordered_terms[0].payload.program_id
+
+    faculty_by_id: dict[str, object] = {}
+    course_by_id: dict[str, object] = {}
+    room_by_id: dict[str, object] = {}
+    merged_slots: list[dict] = []
+
+    for term in ordered_terms:
+        payload = term.payload
+        for faculty in payload.faculty_data:
+            faculty_by_id.setdefault(faculty.id, faculty)
+        for course in payload.course_data:
+            course_by_id.setdefault(course.id, course)
+        for room in payload.room_data:
+            room_by_id.setdefault(room.id, room)
+
+        for slot in payload.timetable_data:
+            slot_dict = slot.model_dump(by_alias=True)
+            # Keep slot IDs unique when aggregating multiple semesters into one cycle snapshot.
+            slot_dict["id"] = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"cycle:{base_program_id}:{term.term_number}:{slot.id}",
+                )
+            )
+            merged_slots.append(slot_dict)
+
+    return OfficialTimetablePayload(
+        programId=base_program_id,
+        termNumber=None,
+        facultyData=[item.model_dump(by_alias=True) for item in faculty_by_id.values()],
+        courseData=[item.model_dump(by_alias=True) for item in course_by_id.values()],
+        roomData=[item.model_dump(by_alias=True) for item in room_by_id.values()],
+        timetableData=merged_slots,
+    )
+
+
+def _persist_cycle_combined_snapshot_version(
+    *,
+    db: Session,
+    current_user: User,
+    cycle: str,
+    terms: list[GeneratedCycleSolutionTerm],
+    selected_solution_rank: int,
+    state_metrics: dict,
+) -> str:
+    combined_payload = _build_cycle_combined_payload(terms=terms)
+    label = _timestamped_cycle_bundle_label(
+        program_id=combined_payload.program_id or "program",
+        cycle=cycle,
+        term_numbers=[item.term_number for item in terms],
+    )
+    summary = {
+        "program_id": combined_payload.program_id,
+        "term_number": None,
+        "term_numbers": [item.term_number for item in terms],
+        "slots": len(combined_payload.timetable_data),
+        "conflicts": sum(item.hard_conflicts for item in terms),
+        "source": "generation-cycle-bundle",
+        "cycle": cycle,
+        "auto_saved": True,
+        "combined_cycle_snapshot": True,
+        "solution_rank": selected_solution_rank,
+        "resource_penalty": state_metrics.get("resource_penalty"),
+        "faculty_preference_penalty": state_metrics.get("faculty_preference_penalty"),
+        "workload_gap_penalty": state_metrics.get("workload_gap_penalty"),
+    }
+    db.add(
+        TimetableVersion(
+            label=label,
+            payload=combined_payload.model_dump(by_alias=True),
+            summary=summary,
+            created_by_id=current_user.id,
+        )
+    )
+    return label
+
+
+def _upsert_auto_resolved_conflict(
+    *,
+    db: Session,
+    conflict: object,
+    current_user: User,
+    resolution_message: str,
+    run_label: str,
+) -> None:
+    decision = db.execute(
+        select(TimetableConflictDecision).where(TimetableConflictDecision.conflict_id == conflict.id)
+    ).scalar_one_or_none()
+    if decision is None:
+        decision = TimetableConflictDecision(conflict_id=conflict.id, decision=ConflictDecision.yes, resolved=True)
+        db.add(decision)
+    snapshot = conflict.model_dump(by_alias=True)
+    snapshot["resolved"] = True
+    snapshot["resolution"] = resolution_message
+    decision.decision = ConflictDecision.yes
+    decision.resolved = True
+    decision.note = f"[Auto-Resolved {run_label}] {resolution_message}"
+    decision.decided_by_id = current_user.id
+    decision.conflict_snapshot = snapshot
+
+
+def _conflict_resolution_priority(conflict: object) -> tuple[int, int, int, str]:
+    severity_rank = {
+        "high": 0,
+        "medium": 1,
+        "low": 2,
+    }
+    type_rank = {
+        "section-overlap": 0,
+        "faculty-overlap": 1,
+        "room-overlap": 2,
+        "elective-overlap": 3,
+        "capacity": 4,
+        "availability": 5,
+        "course-faculty-inconsistency": 6,
+    }
+    severity = str(getattr(conflict, "severity", "low") or "low").strip().lower()
+    conflict_type = str(getattr(conflict, "type", "") or "").strip()
+    affected_slots = list(getattr(conflict, "affected_slots", []) or [])
+    return (
+        severity_rank.get(severity, 3),
+        type_rank.get(conflict_type, 99),
+        -len(affected_slots),
+        str(getattr(conflict, "id", "") or ""),
+    )
+
+
+def _payload_assignment_signature(payload: object) -> tuple[tuple[str, str, str, str, str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                slot.id,
+                slot.day,
+                slot.startTime,
+                slot.endTime,
+                slot.roomId,
+                slot.facultyId,
+                ",".join(sorted(_slot_assistant_faculty_ids(slot))),
+            )
+            for slot in payload.timetable_data
+        )
+    )
+
+
+def _auto_resolve_generation_conflicts(
+    *,
+    db: Session,
+    generation: GenerateTimetableResponse,
+    current_user: User,
+    run_label: str,
+) -> list[AutoResolvedConflictEntry]:
+    if not generation.alternatives:
+        return []
+
+    from app.api.routes import timetable as timetable_routes
+    from app.schemas.timetable import OfficialTimetablePayload
+
+    resolution_log: list[AutoResolvedConflictEntry] = []
+    for alternative in generation.alternatives:
+        original_hard_conflicts = alternative.hard_conflicts
+        resolved_any = False
+        working_payload = OfficialTimetablePayload.model_validate(alternative.payload.model_dump(by_alias=True))
+        max_rounds = min(120, max(20, len(working_payload.timetable_data) * 2))
+        round_index = 0
+        visited_signatures: set[tuple[tuple[str, str, str, str, str, str, str], ...]] = {
+            _payload_assignment_signature(working_payload)
+        }
+        while round_index < max_rounds:
+            round_index += 1
+            conflicts = timetable_routes._build_conflicts(working_payload, db)
+            if not conflicts:
+                break
+
+            ordered_conflicts = sorted(conflicts, key=_conflict_resolution_priority)
+            best_candidate: dict | None = None
+            for conflict in ordered_conflicts:
+                candidate_payload = OfficialTimetablePayload.model_validate(working_payload.model_dump(by_alias=True))
+                resolved_payload, resolution_message = timetable_routes._apply_best_effort_resolution(
+                    payload=candidate_payload,
+                    conflict=conflict,
+                    db=db,
+                )
+                if resolved_payload is None:
+                    continue
+
+                post_conflicts = timetable_routes._build_conflicts(resolved_payload, db)
+                if len(post_conflicts) > len(conflicts):
+                    continue
+
+                candidate_signature = _payload_assignment_signature(resolved_payload)
+                if candidate_signature in visited_signatures:
+                    continue
+
+                conflict_resolved = not any(item.id == conflict.id for item in post_conflicts)
+                improvement = len(conflicts) - len(post_conflicts)
+                if improvement <= 0 and not conflict_resolved:
+                    continue
+
+                candidate_score = (
+                    -improvement,
+                    0 if conflict_resolved else 1,
+                    len(post_conflicts),
+                    _conflict_resolution_priority(conflict),
+                )
+                if best_candidate is None or candidate_score < best_candidate["score"]:
+                    best_candidate = {
+                        "score": candidate_score,
+                        "payload": resolved_payload,
+                        "signature": candidate_signature,
+                        "conflict": conflict,
+                        "message": resolution_message,
+                        "conflict_resolved": conflict_resolved,
+                    }
+
+            if best_candidate is None:
+                break
+
+            working_payload = best_candidate["payload"]
+            visited_signatures.add(best_candidate["signature"])
+            if best_candidate["conflict_resolved"]:
+                resolved_any = True
+                resolved_conflict = best_candidate["conflict"]
+                resolution_message = best_candidate["message"]
+                log_entry = AutoResolvedConflictEntry(
+                    conflict_id=resolved_conflict.id,
+                    conflict_type=resolved_conflict.type,
+                    description=resolved_conflict.description,
+                    resolution=resolution_message,
+                    resolved=True,
+                )
+                resolution_log.append(log_entry)
+                _upsert_auto_resolved_conflict(
+                    db=db,
+                    conflict=resolved_conflict,
+                    current_user=current_user,
+                    resolution_message=resolution_message,
+                    run_label=run_label,
+                )
+
+        final_conflicts = timetable_routes._build_conflicts(working_payload, db)
+        alternative.payload = working_payload
+        detected_hard_conflicts = len(final_conflicts)
+        if resolved_any or detected_hard_conflicts > 0:
+            alternative.hard_conflicts = detected_hard_conflicts
+        else:
+            alternative.hard_conflicts = original_hard_conflicts
+
+    unique_log = _dedupe_auto_resolved_conflicts(resolution_log, limit=200)
+    generation.auto_resolved_conflicts = unique_log
+    return unique_log
+
+
 def _run_generation(
     *,
     db: Session,
     settings: GenerationSettingsBase,
     payload: GenerateTimetableRequest,
     reserved_resource_slots: list[dict] | None = None,
+    progress_reporter: Callable[[dict], None] | None = None,
 ) -> GenerateTimetableResponse:
     tuned_settings = _runtime_tuned_settings(settings)
+    cache_scope = "cycle" if reserved_resource_slots is not None else "single"
     scheduler = EvolutionaryScheduler(
         db=db,
         program_id=payload.program_id,
         term_number=payload.term_number,
         settings=tuned_settings,
         reserved_resource_slots=reserved_resource_slots,
+        progress_reporter=progress_reporter,
+        hyperparameter_cache_scope=cache_scope,
     )
     return scheduler.run(payload)
 
 
+def _run_generation_with_optional_progress(
+    *,
+    db: Session,
+    settings: GenerationSettingsBase,
+    payload: GenerateTimetableRequest,
+    reserved_resource_slots: list[dict] | None = None,
+    progress_reporter: Callable[[dict], None] | None = None,
+) -> GenerateTimetableResponse:
+    if progress_reporter is None:
+        return _run_generation(
+            db=db,
+            settings=settings,
+            payload=payload,
+            reserved_resource_slots=reserved_resource_slots,
+        )
+    return _run_generation(
+        db=db,
+        settings=settings,
+        payload=payload,
+        reserved_resource_slots=reserved_resource_slots,
+        progress_reporter=progress_reporter,
+    )
+
+
 def _runtime_tuned_settings(settings: GenerationSettingsBase) -> GenerationSettingsBase:
     tuned = GenerationSettingsBase.model_validate(settings.model_dump())
+    automatic_baseline = default_generation_settings()
+
+    # Hyperparameters are fully automatic at runtime; user-provided knobs are ignored.
+    tuned.population_size = automatic_baseline.population_size
+    tuned.generations = automatic_baseline.generations
+    tuned.mutation_rate = automatic_baseline.mutation_rate
+    tuned.crossover_rate = automatic_baseline.crossover_rate
+    tuned.elite_count = automatic_baseline.elite_count
+    tuned.tournament_size = automatic_baseline.tournament_size
+    tuned.stagnation_limit = automatic_baseline.stagnation_limit
+    tuned.annealing_iterations = automatic_baseline.annealing_iterations
+    tuned.annealing_initial_temperature = automatic_baseline.annealing_initial_temperature
+    tuned.annealing_cooling_rate = automatic_baseline.annealing_cooling_rate
 
     # Keep generation responsive for interactive admin workflows.
     tuned.population_size = min(tuned.population_size, 90)
@@ -278,6 +679,20 @@ def _build_reserved_slots_from_payload(payload: object) -> list[dict]:
                 "faculty_id": slot.facultyId,
             }
         )
+        seen: set[str] = set()
+        for assistant_id in _slot_assistant_faculty_ids(slot):
+            if assistant_id == slot.facultyId or assistant_id in seen:
+                continue
+            seen.add(assistant_id)
+            slots.append(
+                {
+                    "day": slot.day,
+                    "start_time": slot.startTime,
+                    "end_time": slot.endTime,
+                    "room_id": None,
+                    "faculty_id": assistant_id,
+                }
+            )
     return slots
 
 
@@ -292,8 +707,11 @@ def _is_no_feasible_placement_error(exc: HTTPException) -> bool:
     return "No feasible placement options" in str(detail)
 
 
-def _load_faculty_map(db: Session) -> dict[str, Faculty]:
-    return {item.id: item for item in db.execute(select(Faculty)).scalars().all()}
+def _load_faculty_map(db: Session, *, program_id: str | None = None) -> dict[str, Faculty]:
+    statement = select(Faculty)
+    if program_id:
+        statement = statement.where(Faculty.program_id == program_id)
+    return {item.id: item for item in db.execute(statement).scalars().all()}
 
 
 def _resolve_preferred_codes_for_term(faculty: Faculty, term_number: int | None = None) -> set[str]:
@@ -313,9 +731,17 @@ def _resolve_preferred_codes_for_term(faculty: Faculty, term_number: int | None 
     return preferred
 
 
-def _load_faculty_preference_map(db: Session, term_number: int | None = None) -> dict[str, set[str]]:
+def _load_faculty_preference_map(
+    db: Session,
+    term_number: int | None = None,
+    *,
+    program_id: str | None = None,
+) -> dict[str, set[str]]:
     preference_map: dict[str, set[str]] = {}
-    faculty_rows = list(db.execute(select(Faculty)).scalars())
+    statement = select(Faculty)
+    if program_id:
+        statement = statement.where(Faculty.program_id == program_id)
+    faculty_rows = list(db.execute(statement).scalars())
     for faculty in faculty_rows:
         normalized = _resolve_preferred_codes_for_term(faculty, term_number)
         if normalized:
@@ -340,12 +766,26 @@ def _faculty_preference_penalty(payload: object, faculty_preference_map: dict[st
     return penalty
 
 
-def _faculty_target_hours(faculty: Faculty) -> float:
+def _faculty_target_hours(faculty: Faculty, minimum_hours_per_week: float = 0.0) -> float:
     if faculty.workload_hours > 0:
-        return float(faculty.workload_hours)
+        return float(max(faculty.workload_hours, minimum_hours_per_week))
     if faculty.max_hours > 0:
-        return float(faculty.max_hours)
-    return 0.0
+        return float(max(faculty.max_hours, minimum_hours_per_week))
+    return float(max(0.0, minimum_hours_per_week))
+
+
+def _load_program_faculty_min_hours(db: Session, program_id: str) -> float:
+    row = (
+        db.execute(
+            select(ProgramConstraint.faculty_min_hours_per_week).where(
+                ProgramConstraint.program_id == program_id
+            )
+        )
+        .scalar_one_or_none()
+    )
+    if row is None:
+        return 0.0
+    return float(max(0, int(row)))
 
 
 def _time_ranges_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
@@ -356,6 +796,7 @@ def _build_workload_gap_suggestions(
     *,
     term_payloads: list[tuple[int, object]],
     faculty_map: dict[str, Faculty],
+    minimum_hours_per_week: float = 0.0,
     max_faculty: int = 10,
     max_bridges: int = 6,
 ) -> list[FacultyWorkloadGapSuggestion]:
@@ -431,7 +872,7 @@ def _build_workload_gap_suggestions(
 
     suggestions: list[FacultyWorkloadGapSuggestion] = []
     for faculty in faculty_map.values():
-        target_hours = _faculty_target_hours(faculty)
+        target_hours = _faculty_target_hours(faculty, minimum_hours_per_week)
         if target_hours <= 0:
             continue
 
@@ -541,6 +982,7 @@ def _workload_gap_penalty(
     *,
     term_payloads: list[tuple[int, object]],
     faculty_map: dict[str, Faculty],
+    minimum_hours_per_week: float = 0.0,
 ) -> float:
     if not term_payloads or not faculty_map:
         return 0.0
@@ -556,7 +998,7 @@ def _workload_gap_penalty(
 
     total_gap_hours = 0.0
     for faculty in faculty_map.values():
-        target_hours = _faculty_target_hours(faculty)
+        target_hours = _faculty_target_hours(faculty, minimum_hours_per_week)
         if target_hours <= 0:
             continue
         assigned_hours = assigned_minutes_by_faculty.get(faculty.id, 0) / 60.0
@@ -598,11 +1040,13 @@ def _attach_workload_gap_suggestions(
     generation: GenerateTimetableResponse,
     term_number: int,
     faculty_map: dict[str, Faculty],
+    minimum_hours_per_week: float = 0.0,
 ) -> None:
     for alternative in generation.alternatives:
         alternative.workload_gap_suggestions = _build_workload_gap_suggestions(
             term_payloads=[(term_number, alternative.payload)],
             faculty_map=faculty_map,
+            minimum_hours_per_week=minimum_hours_per_week,
         )
 
 
@@ -613,7 +1057,16 @@ def _cross_term_resource_overlap_count(terms: list[GeneratedCycleSolutionTerm]) 
     for term in terms:
         for slot in term.payload.timetable_data:
             room_usage[(slot.day, slot.startTime, slot.endTime, slot.roomId)] += 1
-            faculty_usage[(slot.day, slot.startTime, slot.endTime, slot.facultyId)] += 1
+            seen_faculty_ids: set[str] = set()
+            primary_faculty_id = str(slot.facultyId or "").strip()
+            if primary_faculty_id:
+                seen_faculty_ids.add(primary_faculty_id)
+                faculty_usage[(slot.day, slot.startTime, slot.endTime, primary_faculty_id)] += 1
+            for assistant_id in _slot_assistant_faculty_ids(slot):
+                if assistant_id in seen_faculty_ids:
+                    continue
+                seen_faculty_ids.add(assistant_id)
+                faculty_usage[(slot.day, slot.startTime, slot.endTime, assistant_id)] += 1
 
     room_overlap = sum(max(0, count - 1) for count in room_usage.values())
     faculty_overlap = sum(max(0, count - 1) for count in faculty_usage.values())
@@ -623,10 +1076,12 @@ def _cross_term_resource_overlap_count(terms: list[GeneratedCycleSolutionTerm]) 
 def _dominates(left: dict, right: dict) -> bool:
     return (
         left["resource_penalty"] <= right["resource_penalty"]
+        and left["hard_conflicts"] <= right["hard_conflicts"]
         and left["faculty_preference_penalty"] <= right["faculty_preference_penalty"]
         and left["workload_gap_penalty"] <= right["workload_gap_penalty"]
         and (
             left["resource_penalty"] < right["resource_penalty"]
+            or left["hard_conflicts"] < right["hard_conflicts"]
             or left["faculty_preference_penalty"] < right["faculty_preference_penalty"]
             or left["workload_gap_penalty"] < right["workload_gap_penalty"]
         )
@@ -652,9 +1107,9 @@ def _pareto_prune(states: list[dict], *, limit: int) -> list[dict]:
     frontier.sort(
         key=lambda item: (
             item["resource_penalty"],
+            item["hard_conflicts"],
             item["faculty_preference_penalty"],
             item["workload_gap_penalty"],
-            item["hard_conflicts"],
             item["soft_penalty"],
             item["runtime_ms"],
         )
@@ -732,12 +1187,13 @@ def delete_slot_lock(
     db.commit()
 
 
-@router.post("/timetable/generate", response_model=GenerateTimetableResponse)
-def generate_timetable(
+def _generate_timetable_impl(
+    *,
     payload: GenerateTimetableRequest,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
-    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks | None,
+    current_user: User,
+    db: Session,
+    progress_reporter: Callable[[dict], None] | None = None,
 ) -> GenerateTimetableResponse:
     started = perf_counter()
     logger.info(
@@ -749,40 +1205,97 @@ def generate_timetable(
         payload.persist_official,
     )
     try:
+        did_commit = False
         if payload.settings_override is not None:
             settings = payload.settings_override
         else:
             settings = load_generation_settings(db)
+        program_min_hours_per_week = _load_program_faculty_min_hours(db, payload.program_id)
         logger.info(
-            "TIMETABLE GENERATION STRATEGY | user_id=%s | program_id=%s | term=%s | strategy=%s",
+            "TIMETABLE GENERATION STRATEGY | user_id=%s | program_id=%s | term=%s | requested_strategy=%s | effective=moea_sa_auto",
             current_user.id,
             payload.program_id,
             payload.term_number,
             settings.solver_strategy,
         )
 
-        result = _run_generation(
+        result = _run_generation_with_optional_progress(
             db=db,
             settings=GenerationSettingsBase.model_validate(settings.model_dump()),
             payload=payload,
+            progress_reporter=progress_reporter,
         )
+        if progress_reporter is not None:
+            progress_reporter(
+                {
+                    "stage": "postprocess",
+                    "level": "info",
+                    "progress_percent": 94.0,
+                    "message": "Applying conflict resolution and validating alternatives.",
+                }
+            )
+        resolved_conflicts = _auto_resolve_generation_conflicts(
+            db=db,
+            generation=result,
+            current_user=current_user,
+            run_label=_timestamped_generation_label(
+                prefix="gen",
+                program_id=payload.program_id,
+                term_number=payload.term_number,
+            ),
+        )
+        if progress_reporter is not None:
+            progress_reporter(
+                {
+                    "stage": "postprocess",
+                    "level": "info",
+                    "progress_percent": 95.0,
+                    "message": (
+                        "Conflict auto-resolution pass complete: "
+                        f"{len(resolved_conflicts)} conflict(s) resolved."
+                    ),
+                    "metrics": {
+                        "resolved_conflicts": len(resolved_conflicts),
+                        "best_remaining_hard_conflicts": (
+                            result.alternatives[0].hard_conflicts
+                            if result.alternatives
+                            else None
+                        ),
+                    },
+                }
+            )
+
         has_conflict_free = _retain_conflict_free_alternatives(result, context="Generation")
         if not has_conflict_free:
-             logger.warning("TIMETABLE GENERATION | No conflict-free alternatives produced")
-             # We still return the result, but with an empty alternatives list or only the best (which has conflicts)
-             # The UI should handle empty alternatives or we could raise an error.
-             # Based on requirements, we should probably ERROR out if we want to be strict.
-             if not result.alternatives:
-                 raise HTTPException(
-                     status_code=status.HTTP_400_BAD_REQUEST,
-                     detail="Scheduler could not produce a conflict-free timetable. Please adjust constraints or resources."
-                 )
+            logger.warning("TIMETABLE GENERATION | No conflict-free alternatives produced")
+            if not result.alternatives:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Scheduler could not produce a conflict-free timetable. Please adjust constraints or resources.",
+                )
+        if progress_reporter is not None:
+            progress_reporter(
+                {
+                    "stage": "postprocess",
+                    "level": "info",
+                    "progress_percent": 97.0,
+                    "message": "Persisting generated snapshot and enrichment metadata.",
+                }
+            )
+        result.auto_saved_version_label = _persist_generated_snapshot_version(
+            db=db,
+            current_user=current_user,
+            generation=result,
+            label_prefix="gen",
+            term_number=payload.term_number,
+        )
         _attach_occupancy_matrices(result)
-        faculty_map = _load_faculty_map(db)
+        faculty_map = _load_faculty_map(db, program_id=payload.program_id)
         _attach_workload_gap_suggestions(
             generation=result,
             term_number=payload.term_number,
             faculty_map=faculty_map,
+            minimum_hours_per_week=program_min_hours_per_week,
         )
 
         if payload.persist_official:
@@ -806,6 +1319,7 @@ def generate_timetable(
                     },
                 )
                 db.commit()
+                did_commit = True
                 try:
                     notify_all_users(
                         db,
@@ -817,6 +1331,7 @@ def generate_timetable(
                         background_tasks=background_tasks,
                     )
                     db.commit()
+                    did_commit = True
                 except Exception:
                     db.rollback()
                     logger.exception(
@@ -839,6 +1354,24 @@ def generate_timetable(
                     )
                 else:
                     raise
+
+        db.commit()
+        if progress_reporter is not None:
+            progress_reporter(
+                {
+                    "stage": "finalization",
+                    "level": "success",
+                    "progress_percent": 100.0,
+                    "message": "Generation completed successfully.",
+                    "metrics": {
+                        "program_id": payload.program_id,
+                        "term_number": payload.term_number,
+                        "alternatives": len(result.alternatives),
+                        "best_hard_conflicts": result.alternatives[0].hard_conflicts if result.alternatives else None,
+                        "runtime_ms": result.runtime_ms,
+                    },
+                }
+            )
 
         elapsed_ms = int((perf_counter() - started) * 1000)
         logger.info(
@@ -864,12 +1397,13 @@ def generate_timetable(
         raise
 
 
-@router.post("/timetable/generate-cycle", response_model=GenerateTimetableCycleResponse)
-def generate_timetable_cycle(
+def _generate_timetable_cycle_impl(
+    *,
     payload: GenerateTimetableCycleRequest,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
-    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks | None,
+    current_user: User,
+    db: Session,
+    progress_reporter: Callable[[dict], None] | None = None,
 ) -> GenerateTimetableCycleResponse:
     started = perf_counter()
     logger.info(
@@ -882,12 +1416,14 @@ def generate_timetable_cycle(
         payload.persist_official,
     )
     try:
+        did_commit = False
         if payload.settings_override is not None:
             settings = payload.settings_override
         else:
             settings = load_generation_settings(db)
+        program_min_hours_per_week = _load_program_faculty_min_hours(db, payload.program_id)
         logger.info(
-            "TIMETABLE CYCLE GENERATION STRATEGY | user_id=%s | program_id=%s | cycle=%s | strategy=%s",
+            "TIMETABLE CYCLE GENERATION STRATEGY | user_id=%s | program_id=%s | cycle=%s | requested_strategy=%s | effective=moea_sa_auto",
             current_user.id,
             payload.program_id,
             payload.cycle,
@@ -902,12 +1438,32 @@ def generate_timetable_cycle(
             cycle=resolved_cycle,
             requested_terms=payload.term_numbers,
         )
+        total_terms = max(1, len(term_numbers))
+        effective_alternative_count = min(5, max(payload.alternative_count, 3))
 
-        faculty_map = _load_faculty_map(db)
+        if progress_reporter is not None:
+            progress_reporter(
+                {
+                    "stage": "cycle.initialization",
+                    "level": "info",
+                    "progress_percent": 0.0,
+                    "message": f"Cycle run started for terms: {', '.join(str(term) for term in term_numbers)}.",
+                    "metrics": {
+                        "cycle": resolved_cycle,
+                        "term_numbers": term_numbers,
+                        "alternative_count": payload.alternative_count,
+                        "effective_alternative_count": effective_alternative_count,
+                        "pareto_limit": payload.pareto_limit,
+                    },
+                }
+            )
+
+        faculty_map = _load_faculty_map(db, program_id=payload.program_id)
         initial_state = {
             "terms": [],
             "reserved_slots": [],
             "resource_penalty": 0,
+            "cross_term_overlap_penalty": 0,
             "faculty_preference_penalty": 0.0,
             "workload_gap_penalty": 0.0,
             "hard_conflicts": 0,
@@ -917,28 +1473,55 @@ def generate_timetable_cycle(
         }
         candidate_states = [initial_state]
 
-        for term_number in term_numbers:
-            term_preference_map = _load_faculty_preference_map(db, term_number)
+        for term_position, term_number in enumerate(term_numbers):
+            term_preference_map = _load_faculty_preference_map(
+                db,
+                term_number,
+                program_id=payload.program_id,
+            )
             expanded_states: list[dict] = []
+            state_count = max(1, len(candidate_states))
             for state_index, state in enumerate(candidate_states):
                 generation_request = GenerateTimetableRequest(
                     program_id=payload.program_id,
                     term_number=term_number,
-                    alternative_count=payload.alternative_count,
+                    alternative_count=effective_alternative_count,
                     persist_official=False,
                     settings_override=None,
                 )
+
+                def _term_progress(event: dict) -> None:
+                    if progress_reporter is None:
+                        return
+                    event_payload = dict(event)
+                    stage = str(event_payload.get("stage") or "search")
+                    event_payload["stage"] = f"cycle.term_{term_number}.{stage}"
+                    metrics = dict(event_payload.get("metrics") or {})
+                    metrics["term_number"] = term_number
+                    metrics["state_index"] = state_index
+                    metrics["state_number"] = state_index + 1
+                    metrics["state_count"] = state_count
+                    event_payload["metrics"] = metrics
+                    raw_progress = event_payload.get("progress_percent")
+                    if isinstance(raw_progress, (int, float)):
+                        term_progress = max(0.0, min(100.0, float(raw_progress))) / 100.0
+                        state_progress = (state_index + term_progress) / state_count
+                        global_progress = ((term_position + state_progress) / total_terms) * 100.0
+                        event_payload["progress_percent"] = min(99.5, global_progress)
+                    progress_reporter(event_payload)
+
                 run_settings = GenerationSettingsBase.model_validate(settings.model_dump())
                 if run_settings.random_seed is not None:
                     run_settings.random_seed = run_settings.random_seed + (term_number * 1000) + state_index
 
                 relaxed_reserved_mode = False
                 try:
-                    generation_result = _run_generation(
+                    generation_result = _run_generation_with_optional_progress(
                         db=db,
                         settings=run_settings,
                         payload=generation_request,
                         reserved_resource_slots=state["reserved_slots"],
+                        progress_reporter=_term_progress if progress_reporter is not None else None,
                     )
                 except HTTPException as exc:
                     if not state["reserved_slots"] or not _is_no_feasible_placement_error(exc):
@@ -955,11 +1538,43 @@ def generate_timetable_cycle(
                     fallback_settings = GenerationSettingsBase.model_validate(run_settings.model_dump())
                     if fallback_settings.random_seed is not None:
                         fallback_settings.random_seed += 17
-                    generation_result = _run_generation(
+                    generation_result = _run_generation_with_optional_progress(
                         db=db,
                         settings=fallback_settings,
                         payload=generation_request,
                         reserved_resource_slots=[],
+                        progress_reporter=_term_progress if progress_reporter is not None else None,
+                    )
+                run_label = _timestamped_generation_label(
+                    prefix="cycle-run",
+                    program_id=payload.program_id,
+                    term_number=term_number,
+                )
+                resolved_conflicts = _auto_resolve_generation_conflicts(
+                    db=db,
+                    generation=generation_result,
+                    current_user=current_user,
+                    run_label=run_label,
+                )
+                if progress_reporter is not None:
+                    _term_progress(
+                        {
+                            "stage": "postprocess",
+                            "level": "info",
+                            "progress_percent": 96.0,
+                            "message": (
+                                "Conflict auto-resolution pass complete: "
+                                f"{len(resolved_conflicts)} conflict(s) resolved."
+                            ),
+                            "metrics": {
+                                "resolved_conflicts": len(resolved_conflicts),
+                                "best_remaining_hard_conflicts": (
+                                    generation_result.alternatives[0].hard_conflicts
+                                    if generation_result.alternatives
+                                    else None
+                                ),
+                            },
+                        }
                     )
                 _retain_conflict_free_alternatives(
                     generation_result,
@@ -996,13 +1611,15 @@ def generate_timetable_cycle(
                     )
                     next_hard_conflicts = state["hard_conflicts"] + alternative.hard_conflicts
                     next_soft_penalty = state["soft_penalty"] + alternative.soft_penalty
-                    next_resource_penalty = next_hard_conflicts + overlap_penalty
+                    next_cross_term_overlap_penalty = overlap_penalty
+                    next_resource_penalty = next_cross_term_overlap_penalty
+                    if relaxed_reserved_mode:
+                        next_resource_penalty += 1
                     next_workload_gap_penalty = _workload_gap_penalty(
                         term_payloads=[(item.term_number, item.payload) for item in next_terms],
                         faculty_map=faculty_map,
+                        minimum_hours_per_week=program_min_hours_per_week,
                     )
-                    if relaxed_reserved_mode:
-                        next_resource_penalty += max(1, overlap_penalty)
                     next_runtime_ms = state["runtime_ms"] + generation_result.runtime_ms
                     next_generation_map = {**state["term_generation_map"], term_number: generation_result}
 
@@ -1011,6 +1628,7 @@ def generate_timetable_cycle(
                             "terms": next_terms,
                             "reserved_slots": next_reserved_slots,
                             "resource_penalty": next_resource_penalty,
+                            "cross_term_overlap_penalty": next_cross_term_overlap_penalty,
                             "faculty_preference_penalty": next_preference_penalty,
                             "workload_gap_penalty": next_workload_gap_penalty,
                             "hard_conflicts": next_hard_conflicts,
@@ -1029,6 +1647,24 @@ def generate_timetable_cycle(
                     ),
                 )
             candidate_states = _pareto_prune(expanded_states, limit=payload.pareto_limit)
+            if progress_reporter is not None:
+                progress_reporter(
+                    {
+                        "stage": f"cycle.term_{term_number}.frontier",
+                        "level": "info",
+                        "progress_percent": min(
+                            99.7,
+                            ((term_position + 1) / total_terms) * 100.0,
+                        ),
+                        "message": (
+                            f"Term {term_number} complete. Pareto candidate states: {len(candidate_states)}."
+                        ),
+                        "metrics": {
+                            "term_number": term_number,
+                            "pareto_candidate_states": len(candidate_states),
+                        },
+                    }
+                )
 
         if not candidate_states:
             raise HTTPException(
@@ -1039,9 +1675,9 @@ def generate_timetable_cycle(
         candidate_states.sort(
             key=lambda item: (
                 item["resource_penalty"],
+                item["hard_conflicts"],
                 item["faculty_preference_penalty"],
                 item["workload_gap_penalty"],
-                item["hard_conflicts"],
                 item["soft_penalty"],
                 item["runtime_ms"],
             )
@@ -1055,6 +1691,7 @@ def generate_timetable_cycle(
                 term_suggestions = _build_workload_gap_suggestions(
                     term_payloads=[(term.term_number, term.payload)],
                     faculty_map=faculty_map,
+                    minimum_hours_per_week=program_min_hours_per_week,
                 )
                 enriched_terms.append(
                     GeneratedCycleSolutionTerm(
@@ -1071,6 +1708,7 @@ def generate_timetable_cycle(
             cycle_suggestions = _build_workload_gap_suggestions(
                 term_payloads=[(term.term_number, term.payload) for term in ordered_terms],
                 faculty_map=faculty_map,
+                minimum_hours_per_week=program_min_hours_per_week,
             )
             pareto_front.append(
                 GeneratedCycleSolution(
@@ -1086,9 +1724,10 @@ def generate_timetable_cycle(
                 )
             )
 
+        selected_terms = sorted(selected_state["terms"], key=lambda item: item.term_number)
+
         published_labels_by_term: dict[int, str] = {}
-        if payload.persist_official and selected_state["terms"]:
-            selected_terms = sorted(selected_state["terms"], key=lambda item: item.term_number)
+        if payload.persist_official and selected_terms:
             published_labels: list[str] = []
             for term in selected_terms:
                 payload_dict = term.payload.model_dump(by_alias=True)
@@ -1133,6 +1772,7 @@ def generate_timetable_cycle(
                 },
             )
             db.commit()
+            did_commit = True
             try:
                 notify_all_users(
                     db,
@@ -1147,6 +1787,7 @@ def generate_timetable_cycle(
                     background_tasks=background_tasks,
                 )
                 db.commit()
+                did_commit = True
             except Exception:
                 db.rollback()
                 logger.exception(
@@ -1167,27 +1808,51 @@ def generate_timetable_cycle(
                 generation=generation_result,
                 term_number=term_number,
                 faculty_map=faculty_map,
+                minimum_hours_per_week=program_min_hours_per_week,
+            )
+            auto_saved_label = _persist_generated_snapshot_version(
+                db=db,
+                current_user=current_user,
+                generation=generation_result,
+                label_prefix="cyclegen",
+                cycle=resolved_cycle,
+                term_number=term_number,
             )
             results.append(
                 GeneratedCycleTermResult(
                     term_number=term_number,
                     generation=generation_result,
                     published_version_label=published_labels_by_term.get(term_number),
+                    auto_saved_version_label=auto_saved_label,
                 )
             )
 
+        combined_cycle_label: str | None = None
+        if selected_terms:
+            combined_cycle_label = _persist_cycle_combined_snapshot_version(
+                db=db,
+                current_user=current_user,
+                cycle=resolved_cycle,
+                terms=selected_terms,
+                selected_solution_rank=pareto_front[0].rank if pareto_front else 1,
+                state_metrics=selected_state,
+            )
+
+        db.commit()
+
         elapsed_ms = int((perf_counter() - started) * 1000)
         logger.info(
-            "TIMETABLE CYCLE GENERATION COMPLETE | user_id=%s | program_id=%s | cycle=%s | terms=%s | pareto=%s | selected_rank=%s | wall_ms=%s",
+            "TIMETABLE CYCLE GENERATION COMPLETE | user_id=%s | program_id=%s | cycle=%s | terms=%s | pareto=%s | selected_rank=%s | combined_snapshot=%s | wall_ms=%s",
             current_user.id,
             payload.program_id,
             resolved_cycle,
             ",".join(str(term) for term in term_numbers),
             len(pareto_front),
             pareto_front[0].rank if pareto_front else None,
+            combined_cycle_label,
             elapsed_ms,
         )
-        return GenerateTimetableCycleResponse(
+        response = GenerateTimetableCycleResponse(
             program_id=payload.program_id,
             cycle=resolved_cycle,
             term_numbers=term_numbers,
@@ -1195,6 +1860,22 @@ def generate_timetable_cycle(
             pareto_front=pareto_front,
             selected_solution_rank=pareto_front[0].rank if pareto_front else None,
         )
+        if progress_reporter is not None:
+            progress_reporter(
+                {
+                    "stage": "cycle.finalization",
+                    "level": "success",
+                    "progress_percent": 100.0,
+                    "message": "Cycle MOEA-SA run completed.",
+                    "metrics": {
+                        "cycle": resolved_cycle,
+                        "terms": term_numbers,
+                        "pareto_solutions": len(pareto_front),
+                        "selected_solution_rank": response.selected_solution_rank,
+                    },
+                }
+            )
+        return response
     except Exception:
         elapsed_ms = int((perf_counter() - started) * 1000)
         logger.exception(
@@ -1205,6 +1886,230 @@ def generate_timetable_cycle(
             elapsed_ms,
         )
         raise
+
+
+def _normalize_job_level(raw: str | None) -> str:
+    if raw in {"info", "success", "warn", "error"}:
+        return raw
+    return "info"
+
+
+def _build_generation_job_status(snapshot: dict) -> GenerationJobStatusOut:
+    events = []
+    for item in snapshot.get("events", []):
+        latest_generation = None
+        raw_latest_generation = item.get("latest_generation")
+        if isinstance(raw_latest_generation, dict):
+            try:
+                latest_generation = GenerateTimetableResponse.model_validate(raw_latest_generation)
+            except Exception:
+                latest_generation = None
+        try:
+            events.append(
+                {
+                    "id": int(item.get("id", 0)),
+                    "at": item.get("at"),
+                    "stage": str(item.get("stage") or "search"),
+                    "level": _normalize_job_level(str(item.get("level") or "info")),
+                    "message": str(item.get("message") or "Update"),
+                    "progress_percent": item.get("progress_percent"),
+                    "metrics": item.get("metrics") if isinstance(item.get("metrics"), dict) else {},
+                    "latest_generation": latest_generation,
+                }
+            )
+        except Exception:
+            continue
+
+    latest_generation = None
+    raw_latest_generation = snapshot.get("latest_generation")
+    if isinstance(raw_latest_generation, dict):
+        try:
+            latest_generation = GenerateTimetableResponse.model_validate(raw_latest_generation)
+        except Exception:
+            latest_generation = None
+
+    result = None
+    raw_result = snapshot.get("result")
+    if isinstance(raw_result, dict):
+        try:
+            if snapshot.get("kind") == "cycle":
+                result = GenerateTimetableCycleResponse.model_validate(raw_result)
+            else:
+                result = GenerateTimetableResponse.model_validate(raw_result)
+        except Exception:
+            result = None
+
+    return GenerationJobStatusOut(
+        job_id=snapshot["job_id"],
+        kind=snapshot["kind"],
+        status=snapshot["status"],
+        created_at=snapshot["created_at"],
+        started_at=snapshot.get("started_at"),
+        finished_at=snapshot.get("finished_at"),
+        updated_at=snapshot.get("updated_at") or snapshot["created_at"],
+        progress_percent=snapshot.get("progress_percent"),
+        stage=snapshot.get("stage"),
+        message=snapshot.get("message"),
+        events=events,
+        last_event_id=int(snapshot.get("last_event_id", 0)),
+        latest_generation=latest_generation,
+        result=result,
+        error_message=snapshot.get("error_message"),
+        next_poll_after_ms=1200 if snapshot.get("status") in {"queued", "running"} else 2500,
+    )
+
+
+def _start_background_generation_job(
+    *,
+    kind: str,
+    owner_user: User,
+    worker: Callable[[Session, User, Callable[[dict], None]], GenerateTimetableResponse | GenerateTimetableCycleResponse],
+) -> GenerationJobAccepted:
+    created = generation_job_store.create_job(kind=kind, owner_user_id=owner_user.id)
+    job_id = created["job_id"]
+
+    def _runner() -> None:
+        db_session = SessionLocal()
+        generation_job_store.mark_running(job_id)
+        try:
+            refreshed_user = db_session.get(User, owner_user.id)
+            if refreshed_user is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="User session no longer valid for live generation",
+                )
+            result = worker(db_session, refreshed_user, lambda event: generation_job_store.append_event(job_id, event))
+            generation_job_store.append_event(
+                job_id,
+                {
+                    "stage": "job",
+                    "level": "success",
+                    "message": "Generation job finished and stopped cleanly.",
+                    "progress_percent": 100.0,
+                    "metrics": {
+                        "status": "succeeded",
+                    },
+                },
+            )
+            generation_job_store.mark_succeeded(job_id, result.model_dump(by_alias=True))
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                error_message = str(exc.detail)
+            else:
+                error_message = str(exc) or "Live generation job failed"
+            generation_job_store.append_event(
+                job_id,
+                {
+                    "stage": "job",
+                    "level": "error",
+                    "message": error_message,
+                    "progress_percent": 100.0,
+                },
+            )
+            generation_job_store.mark_failed(job_id, error_message)
+            logger.exception("Generation job failed | job_id=%s | kind=%s", job_id, kind)
+        finally:
+            db_session.close()
+
+    threading.Thread(target=_runner, daemon=True, name=f"generation-job-{job_id[:8]}").start()
+
+    return GenerationJobAccepted(
+        job_id=job_id,
+        kind=kind,
+        status=created["status"],
+        created_at=created["created_at"],
+    )
+
+
+@router.post("/timetable/generate", response_model=GenerateTimetableResponse)
+def generate_timetable(
+    payload: GenerateTimetableRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> GenerateTimetableResponse:
+    return _generate_timetable_impl(
+        payload=payload,
+        background_tasks=background_tasks,
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post(
+    "/timetable/generate/live",
+    response_model=GenerationJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_timetable_live(
+    payload: GenerateTimetableRequest,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+) -> GenerationJobAccepted:
+    return _start_background_generation_job(
+        kind="single",
+        owner_user=current_user,
+        worker=lambda db, user, reporter: _generate_timetable_impl(
+            payload=payload,
+            background_tasks=None,
+            current_user=user,
+            db=db,
+            progress_reporter=reporter,
+        ),
+    )
+
+
+@router.post("/timetable/generate-cycle", response_model=GenerateTimetableCycleResponse)
+def generate_timetable_cycle(
+    payload: GenerateTimetableCycleRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> GenerateTimetableCycleResponse:
+    return _generate_timetable_cycle_impl(
+        payload=payload,
+        background_tasks=background_tasks,
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post(
+    "/timetable/generate-cycle/live",
+    response_model=GenerationJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_timetable_cycle_live(
+    payload: GenerateTimetableCycleRequest,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+) -> GenerationJobAccepted:
+    return _start_background_generation_job(
+        kind="cycle",
+        owner_user=current_user,
+        worker=lambda db, user, reporter: _generate_timetable_cycle_impl(
+            payload=payload,
+            background_tasks=None,
+            current_user=user,
+            db=db,
+            progress_reporter=reporter,
+        ),
+    )
+
+
+@router.get("/timetable/generation-jobs/{job_id}", response_model=GenerationJobStatusOut)
+def get_generation_job_status(
+    job_id: str,
+    since_event_id: int = Query(default=0, ge=0),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+) -> GenerationJobStatusOut:
+    snapshot = generation_job_store.snapshot(job_id, since_event_id=since_event_id)
+    if snapshot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Generation job not found")
+
+    owner_user_id = snapshot.get("owner_user_id")
+    if current_user.role != UserRole.admin and owner_user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied for this generation job")
+
+    return _build_generation_job_status(snapshot)
 
 
 @router.get("/timetable/reevaluation/events", response_model=list[ReevaluationEventOut])
@@ -1273,11 +2178,13 @@ def run_curriculum_reevaluation(
         payload=generation_request,
     )
     _attach_occupancy_matrices(generation)
-    faculty_map = _load_faculty_map(db)
+    faculty_map = _load_faculty_map(db, program_id=payload.program_id)
+    program_min_hours_per_week = _load_program_faculty_min_hours(db, payload.program_id)
     _attach_workload_gap_suggestions(
         generation=generation,
         term_number=payload.term_number,
         faculty_map=faculty_map,
+        minimum_hours_per_week=program_min_hours_per_week,
     )
 
     version_label: str | None = None

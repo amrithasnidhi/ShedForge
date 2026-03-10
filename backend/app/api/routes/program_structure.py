@@ -60,13 +60,18 @@ def validate_program_course_prerequisites(
         )
 
     existing_courses = set(
-        db.execute(select(Course.id).where(Course.id.in_(prerequisite_ids))).scalars().all()
+        db.execute(
+            select(Course.id).where(
+                Course.id.in_(prerequisite_ids),
+                Course.program_id == program_id,
+            )
+        ).scalars().all()
     )
     missing_courses = sorted(set(prerequisite_ids) - existing_courses)
     if missing_courses:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Prerequisite courses not found: {', '.join(missing_courses)}",
+            detail=f"Prerequisite courses not found in this program: {', '.join(missing_courses)}",
         )
 
     mapped_prior_courses = set(
@@ -160,6 +165,11 @@ def validate_shared_lecture_group(
     course = db.get(Course, payload.course_id)
     if course is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    if course.program_id != program_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Shared lecture group course must belong to the same program",
+        )
     if course.type == CourseType.lab:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -439,6 +449,11 @@ def add_program_course(
     course = db.get(Course, payload.course_id)
     if course is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    if course.program_id != program_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Course must belong to the same program before assignment",
+        )
     existing = db.execute(
         select(ProgramCourse).where(
             ProgramCourse.program_id == program_id,

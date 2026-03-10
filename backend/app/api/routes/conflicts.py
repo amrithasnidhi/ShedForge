@@ -11,6 +11,23 @@ from app.models.faculty import Faculty
 
 router = APIRouter()
 
+
+def _prune_primary_from_slot_assistants(slot: object, primary_faculty_id: str) -> None:
+    assistant_ids = []
+    raw_assistants = getattr(slot, "assistantFacultyIds", None)
+    if raw_assistants is None:
+        raw_assistants = getattr(slot, "assistant_faculty_ids", None)
+    if isinstance(raw_assistants, list):
+        for item in raw_assistants:
+            faculty_id = str(item or "").strip()
+            if not faculty_id or faculty_id == primary_faculty_id or faculty_id in assistant_ids:
+                continue
+            assistant_ids.append(faculty_id)
+    if hasattr(slot, "assistantFacultyIds"):
+        setattr(slot, "assistantFacultyIds", assistant_ids)
+    if hasattr(slot, "assistant_faculty_ids"):
+        setattr(slot, "assistant_faculty_ids", assistant_ids)
+
 @router.post("/detect", response_model=ConflictReport)
 def detect_conflicts(
     payload: OfficialTimetablePayload,
@@ -71,6 +88,7 @@ def apply_resolution(
         new_faculty_id = action.parameters.get("new_faculty_id") or action.parameters.get("facultyId")
         if new_faculty_id:
             target_slot.facultyId = new_faculty_id
+            _prune_primary_from_slot_assistants(target_slot, new_faculty_id)
             
     elif action.action_type == "swap_slot":
         # Requires swapping heavily, usually easier structurally.

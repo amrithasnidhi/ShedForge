@@ -23,6 +23,11 @@ class LeaveSubstituteAssignmentCreate(BaseModel):
     notes: str | None = Field(default=None, max_length=1000)
 
 
+class LeaveSwapOfferCreate(BaseModel):
+    slot_id: str = Field(min_length=1, max_length=36)
+    substitute_faculty_id: str = Field(min_length=1, max_length=36)
+
+
 class LeaveSubstituteAssignmentOut(BaseModel):
     id: str
     leave_request_id: str

@@ -24,6 +24,12 @@ export interface Course {
   theoryHours?: number;
   labHours?: number;
   tutorialHours?: number;
+  batchSegregation?: boolean;
+  practicalContiguousSlots?: number;
+  assignFaculty?: boolean;
+  assignClassroom?: boolean;
+  defaultRoomId?: string | null;
+  electiveCategory?: string | null;
 }
 
 export interface Room {
@@ -49,6 +55,7 @@ export interface TimeSlot {
   batch?: string;
   studentCount?: number;
   sessionType?: "theory" | "tutorial" | "lab";
+  assistantFacultyIds?: string[];
 }
 
 export interface Conflict {
@@ -59,6 +66,9 @@ export interface Conflict {
   affected_slots: string[];
   resolution?: string;
   resolved?: boolean;
+  decision?: "yes" | "no" | null;
+  resolution_mode?: "auto" | "manual" | "ignored" | "pending" | null;
+  decision_note?: string | null;
 }
 
 export interface ResolutionAction {
@@ -79,6 +89,76 @@ export interface ConflictDecisionResult {
   resolved: boolean;
   message: string;
   published_version_label?: string | null;
+}
+
+export interface TimetableConflictReview {
+  source: "official" | "provided";
+  autoResolvedConflicts: Conflict[];
+  manuallyResolvedConflicts: Conflict[];
+  ignoredConflicts: Conflict[];
+  pendingConflicts: Conflict[];
+  unresolvedRequiredCount: number;
+  unresolvedHardCount: number;
+  constraintMismatches: string[];
+  canPublish: boolean;
+  canPublishAnyway: boolean;
+}
+
+export interface TimetableConflictResolveAllInput {
+  payload?: OfficialTimetablePayload;
+  scope?: "hard" | "all";
+  promoteOfficial?: boolean;
+  note?: string;
+}
+
+export interface TimetableConflictResolveAllResult {
+  source: "official" | "provided";
+  resolvedPayload: OfficialTimetablePayload;
+  resolvedCount: number;
+  remainingConflicts: Conflict[];
+  autoResolvedConflicts: Conflict[];
+  constraintMismatches: string[];
+  promotedVersionLabel?: string | null;
+}
+
+export type TimetableChangeRequestStatus = "pending" | "approved" | "rejected" | "applied";
+
+export interface TimetableChangeRequest {
+  id: string;
+  programId?: string | null;
+  termNumber?: number | null;
+  slotId: string;
+  requestedById: string;
+  requestedByRole: "admin" | "scheduler" | "faculty" | "student";
+  requestedByName?: string | null;
+  approverUserId?: string | null;
+  approverRole?: "admin" | "scheduler" | "faculty" | "student" | null;
+  approverName?: string | null;
+  status: TimetableChangeRequestStatus;
+  proposal: {
+    slotId: string;
+    day: string;
+    startTime: string;
+    endTime: string;
+    roomId?: string | null;
+    facultyId?: string | null;
+    assistantFacultyIds?: string[] | null;
+    section?: string | null;
+    requestKind?: "slot_move" | "resource_reassign" | "extra_class";
+    note?: string | null;
+  };
+  requestNote?: string | null;
+  decisionNote?: string | null;
+  resolutionNote?: string | null;
+  createdAt: string;
+  updatedAt?: string | null;
+  decidedAt?: string | null;
+  appliedAt?: string | null;
+}
+
+export interface TimetableChangeRequestDecisionResult {
+  request: TimetableChangeRequest;
+  message: string;
 }
 
 export interface ConstraintStatus {

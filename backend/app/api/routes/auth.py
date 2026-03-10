@@ -15,6 +15,7 @@ from app.db.bootstrap import ensure_runtime_schema_compatibility
 from app.models.faculty import Faculty
 from app.models.login_otp import LoginOtpChallenge
 from app.models.password_reset import PasswordResetToken
+from app.models.program import Program
 from app.models.user import User, UserRole
 from app.schemas.password import PasswordChange, PasswordResetConfirm, PasswordResetRequest
 from app.schemas.user import (
@@ -36,14 +37,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_FACULTY_AVAILABILITY = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
 
+def _resolve_program_id_for_faculty(db: Session, requested_program_id: str | None) -> str:
+    if requested_program_id:
+        return requested_program_id
+    fallback_program_id = db.execute(select(Program.id).order_by(Program.created_at.asc())).scalar_one_or_none()
+    if fallback_program_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No program available. Create a program before creating faculty accounts.",
+        )
+    return str(fallback_program_id)
+
+
 def ensure_faculty_profile(
     db: Session,
     *,
     name: str,
     email: str,
+    program_id: str | None,
     department: str | None,
     preferred_subject_codes: list[str] | None = None,
 ) -> bool:
+    resolved_program_id = _resolve_program_id_for_faculty(db, program_id)
     default_designation = "Assistant Professor"
     default_max_hours = constrained_max_hours(default_designation, None)
     faculty = db.execute(select(Faculty).where(Faculty.email == email)).scalar_one_or_none()
@@ -51,6 +66,7 @@ def ensure_faculty_profile(
         db.add(
             Faculty(
                 name=name,
+                program_id=resolved_program_id,
                 designation=default_designation,
                 email=email,
                 department=department or "General",
@@ -68,6 +84,9 @@ def ensure_faculty_profile(
         return True
 
     updated = False
+    if faculty.program_id != resolved_program_id:
+        faculty.program_id = resolved_program_id
+        updated = True
     if not faculty.availability:
         faculty.availability = DEFAULT_FACULTY_AVAILABILITY
         updated = True
@@ -129,13 +148,21 @@ def register(payload: UserCreate, request: Request, db: Session = Depends(get_db
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
+    resolved_program_id = payload.program_id
+    if payload.role in {UserRole.faculty, UserRole.student}:
+        resolved_program_id = _resolve_program_id_for_faculty(db, payload.program_id)
+
     user = User(
         name=payload.name,
         email=payload.email,
         hashed_password=get_password_hash(payload.password),
         role=payload.role,
+        program_id=resolved_program_id,
         department=payload.department,
         section_name=payload.section_name,
+        semester_number=payload.semester_number,
+        batch_year=payload.batch_year,
+        roll_number=payload.roll_number,
     )
     db.add(user)
 
@@ -144,6 +171,7 @@ def register(payload: UserCreate, request: Request, db: Session = Depends(get_db
             db,
             name=payload.name,
             email=payload.email,
+            program_id=resolved_program_id,
             department=payload.department,
             preferred_subject_codes=payload.preferred_subject_codes,
         )
@@ -184,6 +212,7 @@ def login(payload: UserLogin, request: Request, db: Session = Depends(get_db)) -
         db,
         name=user.name,
         email=user.email,
+        program_id=user.program_id,
         department=user.department,
     ):
         try:
@@ -236,6 +265,7 @@ def request_login_otp(payload: LoginOtpRequest, request: Request, db: Session = 
         db,
         name=user.name,
         email=user.email,
+        program_id=user.program_id,
         department=user.department,
     ):
         try:

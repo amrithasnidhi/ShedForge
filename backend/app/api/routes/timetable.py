@@ -1,8 +1,11 @@
 from collections import defaultdict
+from collections.abc import Callable
 from copy import deepcopy
+from datetime import datetime, timezone
 from html import escape
 import logging
-from math import sqrt
+from math import isclose, sqrt
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -12,6 +15,7 @@ from app.api.deps import get_current_user, get_db, require_roles
 from app.models.faculty import Faculty
 from app.models.institution_settings import InstitutionSettings
 from app.models.notification import NotificationType
+from app.models.program_constraint import ProgramConstraint
 from app.models.program_structure import (
     ElectiveConflictPolicy,
     ProgramCourse,
@@ -25,6 +29,10 @@ from app.models.program_structure import (
 from app.models.room import Room
 from app.models.semester_constraint import SemesterConstraint
 from app.models.timetable_conflict_decision import ConflictDecision, TimetableConflictDecision
+from app.models.timetable_change_request import (
+    TimetableChangeRequest,
+    TimetableChangeRequestStatus,
+)
 from app.models.timetable import OfficialTimetable
 from app.models.timetable_generation import TimetableGenerationSettings
 from app.models.timetable_version import TimetableVersion
@@ -39,6 +47,10 @@ from app.schemas.insights import (
     PerformanceTrendEntry,
     TimetableAnalytics,
     TimetableConflict,
+    TimetableConflictResolveAllIn,
+    TimetableConflictResolveAllOut,
+    TimetableConflictReviewIn,
+    TimetableConflictReviewOut,
     WorkloadChartEntry,
 )
 from app.schemas.settings import (
@@ -57,6 +69,12 @@ from app.schemas.timetable import (
     OfflinePublishResponse,
     OfficialTimetablePayload,
 )
+from app.schemas.timetable_change_request import (
+    TimetableChangeRequestDecisionIn,
+    TimetableChangeRequestDecisionOut,
+    TimetableChangeRequestOut,
+    TimetableChangeRequestProposalIn,
+)
 from app.services.audit import log_activity
 from app.services.email import EmailDeliveryError, send_email
 from app.services.notifications import create_notification, notify_all_users, notify_users
@@ -74,9 +92,252 @@ DAY_SHORT_MAP = {
     "Sun": "Sunday",
 }
 
+DAY_ORDER = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+DAY_INDEX = {day: idx for idx, day in enumerate(DAY_ORDER)}
+for short_day, long_day in DAY_SHORT_MAP.items():
+    DAY_INDEX[short_day] = DAY_INDEX[long_day]
+
+THREE_SLOT_PRACTICAL_COURSE_CODES = {"23MEE115", "23ECE285"}
+THREE_SLOT_PRACTICAL_NAME_MARKERS = {
+    "manufacturing practice",
+    "digital electronics laboratory",
+}
+
+CANONICAL_LUNCH_START_MINUTES = parse_time_to_minutes("13:15")
+CANONICAL_LUNCH_END_MINUTES = parse_time_to_minutes("14:05")
+REMOVED_LEGACY_SLOT_RANGES: set[tuple[int, int]] = {
+    (parse_time_to_minutes("10:45"), parse_time_to_minutes("11:20")),
+    (parse_time_to_minutes("11:20"), parse_time_to_minutes("12:10")),
+    (parse_time_to_minutes("12:10"), parse_time_to_minutes("13:00")),
+    (parse_time_to_minutes("14:40"), parse_time_to_minutes("15:30")),
+    (parse_time_to_minutes("15:30"), parse_time_to_minutes("16:20")),
+    (parse_time_to_minutes("16:20"), parse_time_to_minutes("16:35")),
+}
+
 
 def normalize_day(value: str) -> str:
     return DAY_SHORT_MAP.get(value, value)
+
+
+def _minutes_to_time(value: int) -> str:
+    hours = value // 60
+    minutes = value % 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _is_removed_legacy_slot_range(start: int, end: int) -> bool:
+    return (start, end) in REMOVED_LEGACY_SLOT_RANGES
+
+
+def _is_canonical_lunch_range(start: int, end: int) -> bool:
+    return start == CANONICAL_LUNCH_START_MINUTES and end == CANONICAL_LUNCH_END_MINUTES
+
+
+def _overlaps_canonical_lunch(start: int, end: int) -> bool:
+    return start < CANONICAL_LUNCH_END_MINUTES and end > CANONICAL_LUNCH_START_MINUTES
+
+
+def _day_sort_index(day: str) -> int:
+    return DAY_INDEX.get(day, len(DAY_ORDER))
+
+
+def _normalize_project_phase_text(value: str | None) -> str:
+    raw = (value or "").lower().replace("-", " ").replace("_", " ")
+    return " ".join(raw.split())
+
+
+def _is_project_phase_course(course: object | None) -> bool:
+    if course is None:
+        return False
+    name = _normalize_project_phase_text(str(getattr(course, "name", "")))
+    code = _normalize_project_phase_text(str(getattr(course, "code", "")))
+    return "project phase" in name or "project phase" in code
+
+
+def _normalize_course_identity_text(value: str | None) -> str:
+    return " ".join((value or "").strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _course_practical_hours(course: object | None) -> int:
+    if course is None:
+        return 0
+    return max(
+        0,
+        int(
+            getattr(course, "lab_hours", getattr(course, "labHours", 0))
+            or 0
+        ),
+    )
+
+
+def _course_batch_segregation_enabled(course: object | None) -> bool:
+    if course is None:
+        return True
+    value = getattr(course, "batch_segregation", getattr(course, "batchSegregation", True))
+    return bool(value)
+
+
+def _course_has_practical_component(course: object | None) -> bool:
+    return _course_practical_hours(course) > 0
+
+
+def _slot_is_practical(slot: object, course: object | None) -> bool:
+    session_type = getattr(slot, "sessionType", None)
+    if session_type is None:
+        session_type = getattr(slot, "session_type", None)
+    if isinstance(session_type, str):
+        normalized = session_type.strip().lower()
+        if normalized in {"theory", "tutorial", "lab"}:
+            return normalized == "lab"
+
+    if course is None:
+        return False
+
+    # If no explicit session marker is available, only treat the slot as practical
+    # when the course is fully practical. Mixed LTP courses default to lecture mode.
+    theory = int(getattr(course, "theory_hours", getattr(course, "theoryHours", 0)) or 0)
+    tutorial = int(getattr(course, "tutorial_hours", getattr(course, "tutorialHours", 0)) or 0)
+    practical = _course_practical_hours(course)
+    return practical > 0 and (theory + tutorial) <= 0
+
+
+def _slot_assistant_faculty_ids(slot: object) -> tuple[str, ...]:
+    raw = getattr(slot, "assistant_faculty_ids", None)
+    if raw is None:
+        raw = getattr(slot, "assistantFacultyIds", None)
+    if not isinstance(raw, list):
+        return tuple()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        faculty_id = str(item or "").strip()
+        if not faculty_id or faculty_id in seen:
+            continue
+        seen.add(faculty_id)
+        ordered.append(faculty_id)
+    return tuple(ordered)
+
+
+def _slot_all_faculty_ids(slot: object) -> tuple[str, ...]:
+    primary = str(getattr(slot, "facultyId", "") or "").strip()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    if primary:
+        ordered.append(primary)
+        seen.add(primary)
+    for assistant_id in _slot_assistant_faculty_ids(slot):
+        if assistant_id in seen:
+            continue
+        seen.add(assistant_id)
+        ordered.append(assistant_id)
+    return tuple(ordered)
+
+
+def _is_virtual_faculty_id(faculty_id: str | None) -> bool:
+    return str(faculty_id or "").strip().startswith("nr-f-")
+
+
+def _is_research_placeholder_course(course: object | None) -> bool:
+    if course is None:
+        return False
+    code = str(getattr(course, "code", "") or "").strip().upper()
+    name = str(getattr(course, "name", "") or "").strip().lower()
+    course_id = str(getattr(course, "id", "") or "").strip().lower()
+    return code.startswith("RS-") or name.startswith("research slot") or course_id.startswith("res-c-")
+
+
+def _prune_primary_from_slot_assistants(slot: object, primary_faculty_id: str) -> None:
+    assistant_ids = [faculty_id for faculty_id in _slot_assistant_faculty_ids(slot) if faculty_id != primary_faculty_id]
+    if hasattr(slot, "assistant_faculty_ids"):
+        setattr(slot, "assistant_faculty_ids", assistant_ids)
+    if hasattr(slot, "assistantFacultyIds"):
+        setattr(slot, "assistantFacultyIds", assistant_ids)
+
+
+def _set_slot_assistant_faculty_ids(slot: object, assistant_ids: list[str]) -> None:
+    if hasattr(slot, "assistant_faculty_ids"):
+        setattr(slot, "assistant_faculty_ids", assistant_ids)
+    if hasattr(slot, "assistantFacultyIds"):
+        setattr(slot, "assistantFacultyIds", assistant_ids)
+
+
+def _is_three_slot_practical_course(course: object | None) -> bool:
+    if course is None:
+        return False
+    code = str(getattr(course, "code", "") or "").strip().upper()
+    if code in THREE_SLOT_PRACTICAL_COURSE_CODES:
+        return True
+    name = _normalize_course_identity_text(str(getattr(course, "name", "")))
+    return any(marker in name for marker in THREE_SLOT_PRACTICAL_NAME_MARKERS)
+
+
+def _slot_semester_number(
+    *,
+    slot: object,
+    course_map: dict[str, object],
+    fallback_term_number: int | None,
+) -> int | None:
+    course = course_map.get(getattr(slot, "courseId", None))
+    semester = getattr(course, "semester_number", None) if course is not None else None
+    if isinstance(semester, int):
+        return semester
+    return fallback_term_number
+
+
+def _slot_semester_section_label(
+    *,
+    slot: object,
+    course_map: dict[str, object],
+    fallback_term_number: int | None,
+) -> str:
+    semester = _slot_semester_number(slot=slot, course_map=course_map, fallback_term_number=fallback_term_number)
+    section = str(getattr(slot, "section", "") or "").strip() or "?"
+    if semester is None:
+        return f"Section {section}"
+    return f"Semester {semester} Section {section}"
+
+
+def _course_computed_credits(course: object) -> float:
+    theory = int(getattr(course, "theory_hours", getattr(course, "theoryHours", 0)) or 0)
+    tutorial = int(getattr(course, "tutorial_hours", getattr(course, "tutorialHours", 0)) or 0)
+    practical = int(getattr(course, "lab_hours", getattr(course, "labHours", 0)) or 0)
+    return float(max(0, theory) + max(0, tutorial) + (max(0, practical) / 2.0))
+
+
+def _course_weekly_period_units(course: object, schedule_policy: SchedulePolicyUpdate) -> int:
+    split_units = (
+        max(0, int(getattr(course, "theory_hours", getattr(course, "theoryHours", 0)) or 0))
+        + max(0, int(getattr(course, "tutorial_hours", getattr(course, "tutorialHours", 0)) or 0))
+        + max(0, _course_practical_hours(course))
+    )
+    if split_units > 0:
+        return split_units
+    return max(0, int(getattr(course, "hoursPerWeek", 0) or 0))
+
+
+def _lab_block_slots_for_course(course: object, schedule_policy: SchedulePolicyUpdate) -> int:
+    practical_hours = _course_practical_hours(course)
+    configured = getattr(course, "practical_contiguous_slots", getattr(course, "practicalContiguousSlots", None))
+    if configured is not None:
+        try:
+            block_size = max(1, int(configured))
+        except (TypeError, ValueError):
+            block_size = 1
+    elif _is_three_slot_practical_course(course):
+        block_size = 3
+    else:
+        block_size = max(1, int(schedule_policy.lab_contiguous_slots or 2))
+    if practical_hours > 0:
+        block_size = min(block_size, practical_hours)
+    return max(1, block_size)
 
 
 def slots_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
@@ -105,6 +366,72 @@ def load_schedule_policy(db: Session) -> SchedulePolicyUpdate:
         lab_contiguous_slots=lab_contiguous_slots,
         breaks=break_windows,
     )
+
+
+def load_program_constraint(db: Session, program_id: str) -> ProgramConstraint | None:
+    return (
+        db.execute(select(ProgramConstraint).where(ProgramConstraint.program_id == program_id))
+        .scalars()
+        .first()
+    )
+
+
+def normalize_program_daily_slots(raw_slots: list[dict] | None) -> list[tuple[int, int, str, str]]:
+    normalized_by_key: dict[tuple[int, int], tuple[int, int, str, str]] = {}
+    has_canonical_lunch = False
+    has_teaching_slots = False
+    for item in raw_slots or []:
+        try:
+            start_time = str(item.get("start_time", "")).strip()
+            end_time = str(item.get("end_time", "")).strip()
+            start = parse_time_to_minutes(start_time)
+            end = parse_time_to_minutes(end_time)
+        except Exception:
+            continue
+        if end <= start:
+            continue
+        if _is_removed_legacy_slot_range(start, end):
+            continue
+        if _overlaps_canonical_lunch(start, end) and not _is_canonical_lunch_range(start, end):
+            continue
+        tag = str(item.get("tag", "teaching")).strip().lower() or "teaching"
+        if tag not in {"teaching", "block", "break", "lunch"}:
+            tag = "teaching"
+        label = str(item.get("label", "")).strip() or tag.title()
+        if _is_canonical_lunch_range(start, end):
+            tag = "lunch"
+            label = "Lunch Break"
+            has_canonical_lunch = True
+        elif tag == "lunch":
+            continue
+        elif tag == "teaching":
+            has_teaching_slots = True
+
+        normalized_by_key[(start, end)] = (start, end, tag, label)
+
+    if has_teaching_slots and not has_canonical_lunch:
+        normalized_by_key[(CANONICAL_LUNCH_START_MINUTES, CANONICAL_LUNCH_END_MINUTES)] = (
+            CANONICAL_LUNCH_START_MINUTES,
+            CANONICAL_LUNCH_END_MINUTES,
+            "lunch",
+            "Lunch Break",
+        )
+
+    normalized = sorted(normalized_by_key.values(), key=lambda slot: slot[0])
+    return normalized
+
+
+def build_teaching_segments_from_program_slots(
+    slots: list[tuple[int, int, str, str]],
+) -> tuple[list[tuple[int, int]], list[tuple[int, int, str]]]:
+    teaching_segments: list[tuple[int, int]] = []
+    blocked_segments: list[tuple[int, int, str]] = []
+    for start, end, tag, label in slots:
+        if tag == "teaching":
+            teaching_segments.append((start, end))
+        else:
+            blocked_segments.append((start, end, label))
+    return teaching_segments, blocked_segments
 
 
 def slot_overlaps_break(slot_start: int, slot_end: int, breaks: list[BreakWindowEntry]) -> BreakWindowEntry | None:
@@ -389,19 +716,44 @@ def enforce_resource_conflicts(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=f"Room conflict on {day} for room {slot.roomId}",
                         )
-                if slot.facultyId == other.facultyId and not allow_shared_lecture:
+                slot_faculty_ids = {
+                    faculty_id
+                    for faculty_id in _slot_all_faculty_ids(slot)
+                    if not _is_virtual_faculty_id(faculty_id)
+                }
+                other_faculty_ids = {
+                    faculty_id
+                    for faculty_id in _slot_all_faculty_ids(other)
+                    if not _is_virtual_faculty_id(faculty_id)
+                }
+                shared_faculty_ids = sorted(slot_faculty_ids.intersection(other_faculty_ids))
+                if shared_faculty_ids and not allow_shared_lecture:
                     if not force:
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Faculty conflict on {day} for faculty {slot.facultyId}",
+                            detail=f"Faculty conflict on {day} for faculty {', '.join(shared_faculty_ids)}",
                         )
 
-                if slot.section == other.section:
-                    course = course_by_id[slot.courseId]
-                    other_course = course_by_id[other.courseId]
+                course = course_by_id[slot.courseId]
+                other_course = course_by_id[other.courseId]
+                slot_semester = getattr(course, "semester_number", None)
+                other_semester = getattr(other_course, "semester_number", None)
+                slot_semester = slot_semester if slot_semester is not None else payload.term_number
+                other_semester = other_semester if other_semester is not None else payload.term_number
+
+                same_section_scope = (
+                    slot.section == other.section
+                    and (
+                        slot_semester is None
+                        or other_semester is None
+                        or slot_semester == other_semester
+                    )
+                )
+
+                if same_section_scope:
                     allow_parallel_lab = (
-                        getattr(course, "type", None) == "lab"
-                        and getattr(other_course, "type", None) == "lab"
+                        _slot_is_practical(slot, course)
+                        and _slot_is_practical(other, other_course)
                         and slot.courseId == other.courseId
                         and slot.batch
                         and other.batch
@@ -409,9 +761,14 @@ def enforce_resource_conflicts(
                     )
                     if not allow_parallel_lab:
                         if not force:
+                            semester_label = (
+                                f"Semester {slot_semester}"
+                                if slot_semester is not None
+                                else "Unknown semester"
+                            )
                             raise HTTPException(
                                 status_code=status.HTTP_400_BAD_REQUEST,
-                                detail=f"Section conflict on {day} for section {slot.section}",
+                                detail=f"Section conflict on {day} for section {slot.section} ({semester_label})",
                             )
 
 
@@ -425,7 +782,11 @@ def enforce_single_faculty_per_course_sections(
 
     for slot in payload.timetable_data:
         course = course_by_id.get(slot.courseId)
-        if course is not None and getattr(course, "type", None) == "lab":
+        if _slot_is_practical(slot, course):
+            continue
+        if course is not None and not bool(getattr(course, "assign_faculty", True)):
+            continue
+        if _is_virtual_faculty_id(slot.facultyId):
             continue
         faculty_ids_by_course_section[(slot.courseId, slot.section)].add(slot.facultyId)
 
@@ -459,16 +820,23 @@ def enforce_course_scheduling(
     force: bool = False,
 ) -> None:
     period_minutes = schedule_policy.period_minutes
-    lab_block_minutes = schedule_policy.period_minutes * schedule_policy.lab_contiguous_slots
-    grouped: dict[tuple[str, str, str | None], list] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str | None], list] = defaultdict(list)
     for slot in payload.timetable_data:
         course = course_by_id[slot.courseId]
-        if getattr(course, "type", None) == "lab":
-            if not slot.batch:
+        requires_batch_segregation = _course_batch_segregation_enabled(course)
+        slot_is_practical = _slot_is_practical(slot, course)
+        if slot_is_practical:
+            if requires_batch_segregation and not slot.batch:
                 if not force:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Lab timeslot {slot.id} must include a batch identifier",
+                    )
+            if not requires_batch_segregation and slot.batch:
+                if not force:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Lab timeslot {slot.id} must not include a batch when batch segregation is disabled",
                     )
             if slot.studentCount is None:
                 if not force:
@@ -493,16 +861,26 @@ def enforce_course_scheduling(
                             f"({period_minutes} minutes)"
                         ),
                     )
-        group_key = (
-            slot.courseId,
-            slot.section,
-            slot.batch if getattr(course, "type", None) == "lab" else None,
-        )
+        else:
+            if slot.batch:
+                if not force:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Non-practical timeslot {slot.id} must not include a batch identifier",
+                    )
+        session_bucket = "practical" if slot_is_practical else "lecture"
+        batch_key = slot.batch if (slot_is_practical and requires_batch_segregation) else None
+        group_key = (slot.courseId, slot.section, session_bucket, batch_key)
         grouped[group_key].append(slot)
 
-    for (course_id, section, batch), slots in grouped.items():
+    for (course_id, section, session_bucket, batch), slots in grouped.items():
         course = course_by_id[course_id]
-        required_minutes = getattr(course, "hoursPerWeek", 0) * period_minutes
+        theory_units = max(0, int(getattr(course, "theory_hours", getattr(course, "theoryHours", 0)) or 0))
+        tutorial_units = max(0, int(getattr(course, "tutorial_hours", getattr(course, "tutorialHours", 0)) or 0))
+        practical_units = _course_practical_hours(course)
+        lecture_units = theory_units + tutorial_units
+        required_units = practical_units if session_bucket == "practical" else lecture_units
+        required_minutes = required_units * period_minutes
         total_minutes = 0
         slots_sorted = sorted(slots, key=lambda s: (s.day, parse_time_to_minutes(s.startTime)))
         for slot in slots_sorted:
@@ -518,14 +896,13 @@ def enforce_course_scheduling(
                     detail=f"Scheduled duration for {label} must equal {required_minutes} minutes per week",
                 )
 
-        if getattr(course, "type", None) == "lab":
-            if required_minutes % lab_block_minutes != 0:
-                if not force:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Lab course {course_id} duration must align with lab block rules",
-                    )
-            expected_blocks = required_minutes // lab_block_minutes if required_minutes else 0
+        if session_bucket == "practical" and required_units > 0:
+            preferred_block_slots = _lab_block_slots_for_course(course, schedule_policy)
+            full_blocks, remainder = divmod(required_units, preferred_block_slots)
+            expected_block_lengths: list[int] = [preferred_block_slots * period_minutes] * full_blocks
+            if remainder > 0:
+                expected_block_lengths.append(remainder * period_minutes)
+
             blocks: list[int] = []
             current_day: str | None = None
             current_start: int | None = None
@@ -546,22 +923,23 @@ def enforce_course_scheduling(
             if current_day is not None and current_start is not None and current_end is not None:
                 blocks.append(current_end - current_start)
 
-            if expected_blocks and len(blocks) != expected_blocks:
+            blocks_sorted = sorted(blocks)
+            expected_sorted = sorted(expected_block_lengths)
+            if expected_sorted and len(blocks_sorted) != len(expected_sorted):
                 if not force:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Lab course {course_id} must be scheduled in {expected_blocks} contiguous block(s)",
+                        detail=f"Practical sessions for {course_id} must be scheduled in contiguous blocks",
                     )
-            for block_length in blocks:
-                if block_length != lab_block_minutes:
-                    if not force:
-                        raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=(
-                                f"Lab course {course_id} must use contiguous blocks of "
-                                f"{schedule_policy.lab_contiguous_slots} period(s)"
-                            ),
-                        )
+            elif expected_sorted and blocks_sorted != expected_sorted:
+                if not force:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            f"Practical sessions for {course_id} must use contiguous blocks of "
+                            f"{preferred_block_slots} period(s) by default"
+                        ),
+                    )
 
 
 def enforce_room_capacity(
@@ -649,7 +1027,11 @@ def enforce_program_credit_requirements(
 
     program_course_ids = {course.course_id for course in program_courses}
     required_course_ids = {course.course_id for course in program_courses if course.is_required}
-    scheduled_course_ids = {slot.courseId for slot in payload.timetable_data}
+    scheduled_course_ids = {
+        slot.courseId
+        for slot in payload.timetable_data
+        if not _is_research_placeholder_course(course_by_id.get(slot.courseId))
+    }
 
     missing_required = required_course_ids - scheduled_course_ids
     if missing_required:
@@ -667,19 +1049,19 @@ def enforce_program_credit_requirements(
                 detail=f"Scheduled courses not part of program term: {', '.join(sorted(extra_courses))}",
             )
 
-    total_credits = 0
+    total_credits = 0.0
     for course_id in scheduled_course_ids:
         course = course_by_id.get(course_id)
         if course is not None:
-            total_credits += getattr(course, "credits", 0)
+            total_credits += _course_computed_credits(course)
 
-    if term.credits_required > 0 and total_credits != term.credits_required:
+    if term.credits_required > 0 and not isclose(total_credits, float(term.credits_required), abs_tol=0.01):
         if not force:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"Scheduled credits ({total_credits}) must exactly match "
-                    f"program term requirement ({term.credits_required})"
+                    f"Scheduled credits ({total_credits:.2f}, computed as L+T+P/2) "
+                    f"must exactly match program term requirement ({term.credits_required:.2f})"
                 ),
             )
 
@@ -717,7 +1099,7 @@ def enforce_section_credit_aligned_minutes(
         .all()
     )
     payload_hours_by_course = {
-        course.id: max(0, int(getattr(course, "hoursPerWeek", 0)))
+        course.id: _course_weekly_period_units(course, schedule_policy)
         for course in payload.course_data
     }
     configured_hours = sum(payload_hours_by_course.get(course_id, 0) for course_id in mapped_course_ids)
@@ -733,8 +1115,11 @@ def enforce_section_credit_aligned_minutes(
         return
 
     expected_minutes = expected_hours * schedule_policy.period_minutes
+    course_by_id = {course.id: course for course in payload.course_data}
     section_windows: dict[str, set[tuple[str, int, int]]] = defaultdict(set)
     for slot in payload.timetable_data:
+        if _is_research_placeholder_course(course_by_id.get(slot.courseId)):
+            continue
         start = parse_time_to_minutes(slot.startTime)
         end = parse_time_to_minutes(slot.endTime)
         if end <= start:
@@ -1000,7 +1385,12 @@ def enforce_faculty_overload_preferences(
     db: Session,
     force: bool = False,
 ) -> None:
-    faculty_ids = {slot.facultyId for slot in payload.timetable_data}
+    faculty_ids: set[str] = set()
+    for slot in payload.timetable_data:
+        for faculty_id in _slot_all_faculty_ids(slot):
+            if _is_virtual_faculty_id(faculty_id):
+                continue
+            faculty_ids.add(faculty_id)
     if not faculty_ids:
         return
 
@@ -1011,7 +1401,10 @@ def enforce_faculty_overload_preferences(
 
     slots_by_faculty_day: dict[tuple[str, str], list] = defaultdict(list)
     for slot in payload.timetable_data:
-        slots_by_faculty_day[(slot.facultyId, slot.day)].append(slot)
+        for faculty_id in _slot_all_faculty_ids(slot):
+            if _is_virtual_faculty_id(faculty_id):
+                continue
+            slots_by_faculty_day[(faculty_id, slot.day)].append(slot)
 
     for (faculty_id, day), slots in slots_by_faculty_day.items():
         faculty = faculty_records.get(faculty_id)
@@ -1029,7 +1422,16 @@ def enforce_faculty_overload_preferences(
                     consecutive_count += 1
                 else:
                     consecutive_count = 0
-                if gap < faculty.preferred_min_break_minutes:
+                if gap < 0:
+                    if not force:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(
+                                f"Faculty {faculty.name} has overlapping sessions on {day}; "
+                                "minimum break validation failed because slot timings overlap."
+                            ),
+                        )
+                elif faculty.preferred_min_break_minutes > 0 and gap < faculty.preferred_min_break_minutes:
                     if not force:
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1047,7 +1449,7 @@ def enforce_faculty_overload_preferences(
             previous_end = end
 
 
-def _slot_fingerprints(payload: OfficialTimetablePayload) -> set[tuple[str, str, str, str, str, str, str, str]]:
+def _slot_fingerprints(payload: OfficialTimetablePayload) -> set[tuple[str, str, str, str, str, str, str, str, str]]:
     return {
         (
             slot.day,
@@ -1056,6 +1458,7 @@ def _slot_fingerprints(payload: OfficialTimetablePayload) -> set[tuple[str, str,
             slot.courseId,
             slot.roomId,
             slot.facultyId,
+            ",".join(sorted(_slot_assistant_faculty_ids(slot))),
             slot.section,
             slot.batch or "",
         )
@@ -1076,10 +1479,18 @@ def _resolve_impacted_schedule_users(
 
     affected_sections = {
         section.strip().upper()
-        for _, _, _, _, _, _, section, _ in changed_slots
+        for _, _, _, _, _, _, _, section, _ in changed_slots
         if section and section.strip()
     }
-    affected_faculty_ids = {faculty_id for _, _, _, _, _, faculty_id, _, _ in changed_slots}
+    affected_faculty_ids: set[str] = set()
+    for _, _, _, _, _, faculty_id, assistant_csv, _, _ in changed_slots:
+        if faculty_id:
+            affected_faculty_ids.add(faculty_id)
+        if assistant_csv:
+            for assistant_id in str(assistant_csv).split(","):
+                cleaned = assistant_id.strip()
+                if cleaned:
+                    affected_faculty_ids.add(cleaned)
 
     faculty_emails: set[str] = set()
     for p_load in [p for p in (old_payload, new_payload) if p]:
@@ -1203,43 +1614,95 @@ def _build_conflicts(payload: OfficialTimetablePayload, db: Session | None = Non
                     if conflict_key not in seen_pairs:
                         seen_pairs.add(conflict_key)
                         room_name = room_map.get(slot.roomId).name if slot.roomId in room_map else slot.roomId
+                        slot_scope = _slot_semester_section_label(
+                            slot=slot,
+                            course_map=course_map,
+                            fallback_term_number=payload.term_number,
+                        )
+                        other_scope = _slot_semester_section_label(
+                            slot=other,
+                            course_map=course_map,
+                            fallback_term_number=payload.term_number,
+                        )
                         conflicts.append(
                             TimetableConflict(
                                 id=f"room-{slot_pair[0]}-{slot_pair[1]}",
                                 type="room-overlap",
                                 severity="high",
-                                description=f"Room {room_name} is double-booked on {day}.",
+                                description=f"Room {room_name} is double-booked on {day} ({slot_scope} and {other_scope}).",
                                 affectedSlots=list(slot_pair),
                                 resolution="Move one class to another room or non-overlapping time slot.",
                             )
                         )
 
-                if slot.facultyId == other.facultyId and not allow_shared_lecture:
+                slot_faculty_ids = {
+                    faculty_id
+                    for faculty_id in _slot_all_faculty_ids(slot)
+                    if not _is_virtual_faculty_id(faculty_id)
+                }
+                other_faculty_ids = {
+                    faculty_id
+                    for faculty_id in _slot_all_faculty_ids(other)
+                    if not _is_virtual_faculty_id(faculty_id)
+                }
+                overlapping_faculty_ids = sorted(slot_faculty_ids.intersection(other_faculty_ids))
+                if overlapping_faculty_ids and not allow_shared_lecture:
                     conflict_key = ("faculty-overlap", slot_pair[0], slot_pair[1])
                     if conflict_key not in seen_pairs:
                         seen_pairs.add(conflict_key)
-                        faculty_name = (
-                            faculty_map.get(slot.facultyId).name if slot.facultyId in faculty_map else slot.facultyId
+                        faculty_name = ", ".join(
+                            (
+                                faculty_map.get(faculty_id).name
+                                if faculty_id in faculty_map and faculty_map.get(faculty_id) is not None
+                                else faculty_id
+                            )
+                            for faculty_id in overlapping_faculty_ids
+                        )
+                        slot_scope = _slot_semester_section_label(
+                            slot=slot,
+                            course_map=course_map,
+                            fallback_term_number=payload.term_number,
+                        )
+                        other_scope = _slot_semester_section_label(
+                            slot=other,
+                            course_map=course_map,
+                            fallback_term_number=payload.term_number,
                         )
                         conflicts.append(
                             TimetableConflict(
                                 id=f"faculty-{slot_pair[0]}-{slot_pair[1]}",
                                 type="faculty-overlap",
                                 severity="high",
-                                description=f"{faculty_name} is assigned to overlapping sessions on {day}.",
+                                description=(
+                                    f"{faculty_name} is assigned to overlapping sessions on {day} "
+                                    f"({slot_scope} and {other_scope})."
+                                ),
                                 affectedSlots=list(slot_pair),
                                 resolution="Reassign one session to another faculty member or time slot.",
                             )
                         )
 
-                if slot.section == other.section:
+                slot_course = course_map.get(slot.courseId)
+                other_course = course_map.get(other.courseId)
+                slot_semester = getattr(slot_course, "semester_number", None) if slot_course is not None else None
+                other_semester = getattr(other_course, "semester_number", None) if other_course is not None else None
+                slot_semester = slot_semester if slot_semester is not None else payload.term_number
+                other_semester = other_semester if other_semester is not None else payload.term_number
+                same_section_scope = (
+                    slot.section == other.section
+                    and (
+                        slot_semester is None
+                        or other_semester is None
+                        or slot_semester == other_semester
+                    )
+                )
+
+                if same_section_scope:
                     course_a = course_map.get(slot.courseId)
                     course_b = course_map.get(other.courseId)
                     is_parallel_lab = (
-                        course_a is not None
-                        and course_b is not None
-                        and course_a.type == "lab"
-                        and course_b.type == "lab"
+                        _slot_is_practical(slot, course_a)
+                        and _slot_is_practical(other, course_b)
                         and slot.courseId == other.courseId
                         and slot.batch
                         and other.batch
@@ -1249,12 +1712,19 @@ def _build_conflicts(payload: OfficialTimetablePayload, db: Session | None = Non
                         conflict_key = ("section-overlap", slot_pair[0], slot_pair[1])
                         if conflict_key not in seen_pairs:
                             seen_pairs.add(conflict_key)
+                            semester_label = (
+                                f"Semester {slot_semester}"
+                                if slot_semester is not None
+                                else "Unknown semester"
+                            )
                             conflicts.append(
                                 TimetableConflict(
                                     id=f"section-{slot_pair[0]}-{slot_pair[1]}",
                                     type="section-overlap",
                                     severity="high",
-                                    description=f"Section {slot.section} has overlapping classes on {day}.",
+                                    description=(
+                                        f"Section {slot.section} ({semester_label}) has overlapping classes on {day}."
+                                    ),
                                     affectedSlots=list(slot_pair),
                                     resolution="Move one class so section sessions do not overlap.",
                                 )
@@ -1306,7 +1776,11 @@ def _build_conflicts(payload: OfficialTimetablePayload, db: Session | None = Non
     slot_ids_by_course_section: dict[tuple[str, str], list[str]] = defaultdict(list)
     for slot in payload.timetable_data:
         course = course_map.get(slot.courseId)
-        if course is not None and getattr(course, "type", None) == "lab":
+        if _slot_is_practical(slot, course):
+            continue
+        if course is not None and not bool(getattr(course, "assign_faculty", True)):
+            continue
+        if _is_virtual_faculty_id(slot.facultyId):
             continue
         key = (slot.courseId, slot.section)
         faculty_ids_by_course_section[key].add(slot.facultyId)
@@ -1419,6 +1893,127 @@ def _build_conflicts(payload: OfficialTimetablePayload, db: Session | None = Non
                         )
                     )
 
+    if db is not None:
+        schedule_policy = load_schedule_policy(db)
+        period_minutes = schedule_policy.period_minutes
+        grouped_courses: dict[tuple[str, str, str, str | None], list] = defaultdict(list)
+
+        for slot in payload.timetable_data:
+            course = course_map.get(slot.courseId)
+            if course is None:
+                continue
+            requires_batch_segregation = _course_batch_segregation_enabled(course)
+            slot_is_practical = _slot_is_practical(slot, course)
+            session_bucket = "practical" if slot_is_practical else "lecture"
+            grouped_courses[
+                (
+                    slot.courseId,
+                    slot.section,
+                    session_bucket,
+                    slot.batch if (slot_is_practical and requires_batch_segregation) else None,
+                )
+            ].append(slot)
+
+        for (course_id, section, session_bucket, batch), slots in grouped_courses.items():
+            course = course_map.get(course_id)
+            if course is None:
+                continue
+
+            theory_units = max(0, int(getattr(course, "theory_hours", getattr(course, "theoryHours", 0)) or 0))
+            tutorial_units = max(0, int(getattr(course, "tutorial_hours", getattr(course, "tutorialHours", 0)) or 0))
+            practical_units = _course_practical_hours(course)
+            lecture_units = theory_units + tutorial_units
+            required_units = practical_units if session_bucket == "practical" else lecture_units
+
+            required_minutes = required_units * period_minutes
+            slots_sorted = sorted(slots, key=lambda s: (s.day, parse_time_to_minutes(s.startTime)))
+            total_minutes = sum(parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime) for slot in slots_sorted)
+            slot_ids = [slot.id for slot in slots_sorted]
+
+            key_suffix = f"{course_id}-{section}-{session_bucket}-{batch or 'all'}"
+            if required_minutes and total_minutes != required_minutes:
+                key = ("availability", f"course-duration-{key_suffix}")
+                if key not in seen_single:
+                    seen_single.add(key)
+                    label = f"{course_id} section {section}" + (f" batch {batch}" if batch else "")
+                    conflicts.append(
+                        TimetableConflict(
+                            id=f"availability-course-duration-{key_suffix}",
+                            type="availability",
+                            severity="high",
+                            description=(
+                                f"Scheduled duration for {label} is {total_minutes} minutes; "
+                                f"expected {required_minutes} minutes per week."
+                            ),
+                            affectedSlots=slot_ids,
+                            resolution="Adjust slot count/duration to match required weekly course minutes.",
+                        )
+                    )
+
+            if session_bucket != "practical" or required_units <= 0:
+                continue
+
+            preferred_block_slots = _lab_block_slots_for_course(course, schedule_policy)
+            full_blocks, remainder = divmod(required_units, preferred_block_slots)
+            expected_block_lengths: list[int] = [preferred_block_slots * period_minutes] * full_blocks
+            if remainder > 0:
+                expected_block_lengths.append(remainder * period_minutes)
+
+            blocks: list[int] = []
+            current_day: str | None = None
+            current_start: int | None = None
+            current_end: int | None = None
+
+            for slot in slots_sorted:
+                slot_start = parse_time_to_minutes(slot.startTime)
+                slot_end = parse_time_to_minutes(slot.endTime)
+                if current_day != slot.day or current_end is None or slot_start != current_end:
+                    if current_day is not None and current_start is not None and current_end is not None:
+                        blocks.append(current_end - current_start)
+                    current_day = slot.day
+                    current_start = slot_start
+                    current_end = slot_end
+                else:
+                    current_end = slot_end
+
+            if current_day is not None and current_start is not None and current_end is not None:
+                blocks.append(current_end - current_start)
+
+            blocks_sorted = sorted(blocks)
+            expected_sorted = sorted(expected_block_lengths)
+
+            if expected_sorted and len(blocks_sorted) != len(expected_sorted):
+                key = ("availability", f"practical-block-count-{key_suffix}")
+                if key not in seen_single:
+                    seen_single.add(key)
+                    conflicts.append(
+                        TimetableConflict(
+                            id=f"availability-practical-block-count-{key_suffix}",
+                            type="availability",
+                            severity="high",
+                            description=f"Practical sessions for {course_id} must be scheduled in contiguous blocks.",
+                            affectedSlots=slot_ids,
+                            resolution="Merge fragmented practical periods into contiguous blocks.",
+                        )
+                    )
+            elif expected_sorted and blocks_sorted != expected_sorted:
+                key = ("availability", f"practical-block-size-{key_suffix}")
+                if key not in seen_single:
+                    seen_single.add(key)
+                    conflicts.append(
+                        TimetableConflict(
+                            id=f"availability-practical-block-size-{key_suffix}",
+                            type="availability",
+                            severity="high",
+                            description=(
+                                f"Practical sessions for {course_id} must use contiguous blocks of "
+                                f"{preferred_block_slots} period(s) by default."
+                            ),
+                            affectedSlots=slot_ids,
+                            resolution="Restructure practical slots to match configured contiguous block size.",
+                        )
+                    )
+
     return conflicts
 
 
@@ -1426,10 +2021,12 @@ def _slot_duration_minutes(slot: object) -> int:
     return parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime)
 
 
-def _room_matches_course_type(room: object, course: object | None) -> bool:
+def _room_matches_course_type(room: object, course: object | None, *, session_type: str | None = None) -> bool:
     if course is None:
         return True
-    if getattr(course, "type", None) == "lab":
+    if session_type == "lab":
+        return getattr(room, "type", None) == "lab"
+    if session_type is None and getattr(course, "type", None) == "lab":
         return getattr(room, "type", None) == "lab"
     return True
 
@@ -1484,10 +2081,8 @@ def _is_parallel_lab_allowed(slot: object, other: object, course_map: dict[str, 
     course_a = course_map.get(slot.courseId)
     course_b = course_map.get(other.courseId)
     return (
-        course_a is not None
-        and course_b is not None
-        and getattr(course_a, "type", None) == "lab"
-        and getattr(course_b, "type", None) == "lab"
+        _slot_is_practical(slot, course_a)
+        and _slot_is_practical(other, course_b)
         and slot.courseId == other.courseId
         and slot.batch
         and other.batch
@@ -1509,9 +2104,14 @@ def _resource_placement_conflicts(
     faculty_id: str,
     course_map: dict[str, object],
     elective_pairs: set[tuple[str, str]],
+    moving_assistant_ids: tuple[str, ...] = (),
+    ignore_slot_ids: set[str] | None = None,
 ) -> bool:
+    ignored_ids = ignore_slot_ids or set()
+    moving_faculty_ids = {faculty_id}
+    moving_faculty_ids.update(item for item in moving_assistant_ids if item and not _is_virtual_faculty_id(item))
     for other in payload.timetable_data:
-        if other.id == slot_id:
+        if other.id == slot_id or other.id in ignored_ids:
             continue
         if other.day != day:
             continue
@@ -1523,7 +2123,12 @@ def _resource_placement_conflicts(
 
         if other.roomId == room_id:
             return True
-        if other.facultyId == faculty_id:
+        other_faculty_ids = {
+            other_faculty_id
+            for other_faculty_id in _slot_all_faculty_ids(other)
+            if not _is_virtual_faculty_id(other_faculty_id)
+        }
+        if moving_faculty_ids.intersection(other_faculty_ids):
             return True
         if other.section == section:
             probe = deepcopy(other.model_dump())
@@ -1578,13 +2183,15 @@ def _find_room_candidate(
     start: int,
     end: int,
     current_faculty_id: str,
+    moving_assistant_ids: tuple[str, ...] = (),
+    ignore_slot_ids: set[str] | None = None,
 ) -> str | None:
     course = course_map.get(slot.courseId)
     ranked: list[tuple[int, int, str]] = []
     for room in payload.room_data:
         if room.id == slot.roomId:
             continue
-        if not _room_matches_course_type(room, course):
+        if not _room_matches_course_type(room, course, session_type=getattr(slot, "sessionType", None)):
             continue
         if slot.studentCount is not None and room.capacity < slot.studentCount:
             continue
@@ -1608,6 +2215,8 @@ def _find_room_candidate(
             faculty_id=current_faculty_id,
             course_map=course_map,
             elective_pairs=elective_pairs,
+            moving_assistant_ids=moving_assistant_ids,
+            ignore_slot_ids=ignore_slot_ids,
         ):
             continue
         capacity_delta = room.capacity - (slot.studentCount or 0)
@@ -1627,6 +2236,8 @@ def _find_faculty_candidate(
     start: int,
     end: int,
     current_room_id: str,
+    moving_assistant_ids: tuple[str, ...] = (),
+    ignore_slot_ids: set[str] | None = None,
 ) -> str | None:
     course = course_map.get(slot.courseId)
     course_code = str(getattr(course, "code", "")).strip().upper()
@@ -1671,6 +2282,8 @@ def _find_faculty_candidate(
             faculty_id=faculty_id,
             course_map=course_map,
             elective_pairs=elective_pairs,
+            moving_assistant_ids=moving_assistant_ids,
+            ignore_slot_ids=ignore_slot_ids,
         ):
             continue
 
@@ -1693,6 +2306,467 @@ def _find_faculty_candidate(
     return ranked[0][1] if ranked else None
 
 
+def _append_unique_identifier(items: list[str], candidate: str | None) -> None:
+    if not candidate:
+        return
+    if candidate in items:
+        return
+    items.append(candidate)
+
+
+def _resolve_course_faculty_inconsistency_conflict(
+    *,
+    payload: OfficialTimetablePayload,
+    conflict: TimetableConflict,
+    slots_by_id: dict[str, object],
+    db_faculty_map: dict[str, Faculty],
+    course_map: dict[str, object],
+    elective_pairs: set[tuple[str, str]],
+) -> tuple[OfficialTimetablePayload | None, str]:
+    affected_slot_ids = [slot_id for slot_id in conflict.affected_slots if slot_id in slots_by_id]
+    if not affected_slot_ids:
+        return None, "No actionable slots found for faculty consistency repair."
+
+    target_slots = [slots_by_id[slot_id] for slot_id in affected_slot_ids]
+    if not target_slots:
+        return None, "No actionable slots found for faculty consistency repair."
+
+    faculty_payload_map = {item.id: item for item in payload.faculty_data}
+    if not faculty_payload_map:
+        return None, "Faculty metadata is unavailable for consistency repair."
+
+    course = course_map.get(target_slots[0].courseId)
+    course_code = str(getattr(course, "code", "")).strip().upper()
+    faculty_usage_by_slot: dict[str, int] = defaultdict(int)
+    assigned_minutes: dict[str, int] = defaultdict(int)
+    for item in payload.timetable_data:
+        assigned_minutes[item.facultyId] += _slot_duration_minutes(item)
+    for slot in target_slots:
+        faculty_usage_by_slot[slot.facultyId] += 1
+
+    prioritized_candidates: list[str] = []
+    for faculty_id, _count in sorted(
+        faculty_usage_by_slot.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        _append_unique_identifier(prioritized_candidates, faculty_id)
+    for faculty_id in sorted(faculty_payload_map):
+        _append_unique_identifier(prioritized_candidates, faculty_id)
+
+    best_faculty_id: str | None = None
+    best_score: tuple[float, float, float] | None = None
+    for faculty_id in prioritized_candidates:
+        faculty_payload = faculty_payload_map.get(faculty_id)
+        if faculty_payload is None:
+            continue
+        faculty_record = db_faculty_map.get(faculty_id)
+
+        additional_minutes = sum(
+            _slot_duration_minutes(slot)
+            for slot in target_slots
+            if slot.facultyId != faculty_id
+        )
+        max_hours = (
+            faculty_record.max_hours
+            if faculty_record is not None
+            else int(getattr(faculty_payload, "maxHours", 0))
+        )
+        projected_minutes = assigned_minutes.get(faculty_id, 0) + additional_minutes
+        if max_hours and projected_minutes > (max_hours * 60):
+            continue
+
+        feasible = True
+        for slot in target_slots:
+            start = parse_time_to_minutes(slot.startTime)
+            end = parse_time_to_minutes(slot.endTime)
+            if not _faculty_available_for_window(
+                faculty_payload=faculty_payload,
+                faculty_record=faculty_record,
+                day=slot.day,
+                start=start,
+                end=end,
+            ):
+                feasible = False
+                break
+            if _resource_placement_conflicts(
+                payload=payload,
+                slot_id=slot.id,
+                course_id=slot.courseId,
+                section=slot.section,
+                batch=slot.batch,
+                day=slot.day,
+                start=start,
+                end=end,
+                room_id=slot.roomId,
+                faculty_id=faculty_id,
+                course_map=course_map,
+                elective_pairs=elective_pairs,
+                moving_assistant_ids=_slot_assistant_faculty_ids(slot),
+            ):
+                feasible = False
+                break
+        if not feasible:
+            continue
+
+        preferred_codes = {
+            str(item).strip().upper()
+            for item in (faculty_record.preferred_subject_codes if faculty_record is not None else [])
+            if str(item).strip()
+        }
+        semester_preferences = (
+            dict(faculty_record.semester_preferences or {})
+            if faculty_record is not None
+            else {}
+        )
+        term_specific = semester_preferences.get(str(payload.term_number), [])
+        preferred_codes.update(str(item).strip().upper() for item in term_specific if str(item).strip())
+        preferred_bonus = 1.0 if course_code and course_code in preferred_codes else 0.0
+        continuity_bonus = float(faculty_usage_by_slot.get(faculty_id, 0))
+        remaining_capacity = (
+            float((max_hours * 60) - projected_minutes)
+            if max_hours
+            else 1_000_000.0
+        )
+        candidate_score = (continuity_bonus, preferred_bonus, remaining_capacity)
+        if best_score is None or candidate_score > best_score:
+            best_faculty_id = faculty_id
+            best_score = candidate_score
+
+    if best_faculty_id is None:
+        return None, "No common feasible faculty found to harmonize this course within the section."
+
+    if all(slot.facultyId == best_faculty_id for slot in target_slots):
+        return None, "Course-section already uses a consistent faculty assignment."
+
+    for slot in target_slots:
+        slot.facultyId = best_faculty_id
+        _prune_primary_from_slot_assistants(slot, best_faculty_id)
+    faculty_name = db_faculty_map.get(best_faculty_id).name if best_faculty_id in db_faculty_map else best_faculty_id
+    return payload, f"Resolved by harmonizing all related slots to faculty {faculty_name}."
+
+
+def _faculty_minutes_with_assistants(payload: OfficialTimetablePayload) -> dict[str, int]:
+    minutes_by_faculty: dict[str, int] = defaultdict(int)
+    for slot in payload.timetable_data:
+        duration = _slot_duration_minutes(slot)
+        for faculty_id in _slot_all_faculty_ids(slot):
+            if _is_virtual_faculty_id(faculty_id):
+                continue
+            minutes_by_faculty[faculty_id] += duration
+    return minutes_by_faculty
+
+
+def _faculty_has_timeslot_overlap(
+    *,
+    payload: OfficialTimetablePayload,
+    faculty_id: str,
+    day: str,
+    start: int,
+    end: int,
+    ignore_slot_ids: set[str] | None = None,
+) -> bool:
+    ignored = ignore_slot_ids or set()
+    for slot in payload.timetable_data:
+        if slot.id in ignored:
+            continue
+        if slot.day != day:
+            continue
+        other_start = parse_time_to_minutes(slot.startTime)
+        other_end = parse_time_to_minutes(slot.endTime)
+        if not slots_overlap(start, end, other_start, other_end):
+            continue
+        faculty_ids = {
+            item
+            for item in _slot_all_faculty_ids(slot)
+            if not _is_virtual_faculty_id(item)
+        }
+        if faculty_id in faculty_ids:
+            return True
+    return False
+
+
+def _resolve_assistant_faculty_overlap_conflict(
+    *,
+    payload: OfficialTimetablePayload,
+    conflict: TimetableConflict,
+    slots_by_id: dict[str, object],
+    db_faculty_map: dict[str, Faculty],
+    faculty_payload_map: dict[str, object],
+) -> tuple[OfficialTimetablePayload | None, str]:
+    slot_ids = [slot_id for slot_id in conflict.affected_slots if slot_id in slots_by_id]
+    if len(slot_ids) < 2:
+        return None, "Assistant overlap repair requires at least two affected slots."
+
+    slot_a = slots_by_id[slot_ids[0]]
+    slot_b = slots_by_id[slot_ids[1]]
+    shared_faculty_ids = {
+        faculty_id
+        for faculty_id in _slot_all_faculty_ids(slot_a)
+        if not _is_virtual_faculty_id(faculty_id)
+    }.intersection(
+        {
+            faculty_id
+            for faculty_id in _slot_all_faculty_ids(slot_b)
+            if not _is_virtual_faculty_id(faculty_id)
+        }
+    )
+    if not shared_faculty_ids:
+        return None, "No assistant-driven overlap detected for this conflict pair."
+
+    assigned_minutes = _faculty_minutes_with_assistants(payload)
+
+    for overlapping_faculty_id in sorted(shared_faculty_ids):
+        for target_slot, other_slot in ((slot_a, slot_b), (slot_b, slot_a)):
+            assistant_ids = list(_slot_assistant_faculty_ids(target_slot))
+            if overlapping_faculty_id not in assistant_ids:
+                continue
+
+            slot_start = parse_time_to_minutes(target_slot.startTime)
+            slot_end = parse_time_to_minutes(target_slot.endTime)
+            slot_duration = slot_end - slot_start
+            if slot_duration <= 0:
+                continue
+
+            ranked_candidates: list[tuple[float, str]] = []
+            for candidate_id, faculty_payload in faculty_payload_map.items():
+                if candidate_id == target_slot.facultyId:
+                    continue
+                if candidate_id in assistant_ids:
+                    continue
+                if candidate_id == overlapping_faculty_id:
+                    continue
+                if _is_virtual_faculty_id(candidate_id):
+                    continue
+                if candidate_id in _slot_all_faculty_ids(other_slot):
+                    continue
+
+                faculty_record = db_faculty_map.get(candidate_id)
+                if not _faculty_available_for_window(
+                    faculty_payload=faculty_payload,
+                    faculty_record=faculty_record,
+                    day=target_slot.day,
+                    start=slot_start,
+                    end=slot_end,
+                ):
+                    continue
+
+                max_hours = (
+                    int(faculty_record.max_hours)
+                    if faculty_record is not None and getattr(faculty_record, "max_hours", 0)
+                    else int(getattr(faculty_payload, "maxHours", 0))
+                )
+                projected_minutes = assigned_minutes.get(candidate_id, 0) + slot_duration
+                if max_hours and projected_minutes > (max_hours * 60):
+                    continue
+
+                if _faculty_has_timeslot_overlap(
+                    payload=payload,
+                    faculty_id=candidate_id,
+                    day=target_slot.day,
+                    start=slot_start,
+                    end=slot_end,
+                    ignore_slot_ids={target_slot.id},
+                ):
+                    continue
+
+                preferred_codes = {
+                    str(item).strip().upper()
+                    for item in (
+                        faculty_record.preferred_subject_codes if faculty_record is not None else []
+                    )
+                    if str(item).strip()
+                }
+                course_code = ""
+                for candidate_course in payload.course_data:
+                    if candidate_course.id == target_slot.courseId:
+                        course_code = str(candidate_course.code or "").strip().upper()
+                        break
+                preference_bonus = 100.0 if course_code and course_code in preferred_codes else 0.0
+                remaining_capacity = float((max_hours * 60) - projected_minutes) if max_hours else 1000000.0
+                ranked_candidates.append((preference_bonus + remaining_capacity, candidate_id))
+
+            ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+            if not ranked_candidates:
+                continue
+
+            replacement_id = ranked_candidates[0][1]
+            replaced_assistants = [replacement_id if item == overlapping_faculty_id else item for item in assistant_ids]
+            deduped: list[str] = []
+            for assistant_id in replaced_assistants:
+                if assistant_id == target_slot.facultyId or assistant_id in deduped:
+                    continue
+                deduped.append(assistant_id)
+            _set_slot_assistant_faculty_ids(target_slot, deduped)
+
+            overlapping_name = (
+                db_faculty_map.get(overlapping_faculty_id).name
+                if db_faculty_map.get(overlapping_faculty_id) is not None
+                else overlapping_faculty_id
+            )
+            replacement_name = (
+                db_faculty_map.get(replacement_id).name
+                if db_faculty_map.get(replacement_id) is not None
+                else replacement_id
+            )
+            return (
+                payload,
+                f"Resolved by replacing assistant faculty {overlapping_name} with {replacement_name}.",
+            )
+
+    return None, "No assistant reassignment candidate could resolve this overlap."
+
+
+def _resolve_practical_contiguity_conflict(
+    *,
+    payload: OfficialTimetablePayload,
+    conflict: TimetableConflict,
+    slots_by_id: dict[str, object],
+    course_map: dict[str, object],
+    db_faculty_map: dict[str, Faculty],
+    db_room_map: dict[str, object],
+    faculty_payload_map: dict[str, object],
+    room_payload_map: dict[str, object],
+    elective_pairs: set[tuple[str, str]],
+    db: Session,
+) -> tuple[OfficialTimetablePayload | None, str]:
+    slot_ids = [slot_id for slot_id in conflict.affected_slots if slot_id in slots_by_id]
+    if len(slot_ids) < 2:
+        return None, "Practical contiguity resolver needs at least two slots."
+
+    slots = [slots_by_id[slot_id] for slot_id in slot_ids]
+    base_slot = slots[0]
+    base_course = course_map.get(base_slot.courseId)
+    if base_course is None or not _slot_is_practical(base_slot, base_course):
+        return None, "Affected slots are not practical sessions."
+
+    for slot in slots:
+        if slot.courseId != base_slot.courseId or slot.section != base_slot.section or (slot.batch or None) != (base_slot.batch or None):
+            return None, "Practical contiguity repair supports one course-section-batch at a time."
+        if not _slot_is_practical(slot, base_course):
+            return None, "Affected slots include non-practical entries."
+
+    schedule_policy = load_schedule_policy(db)
+    period_minutes = schedule_policy.period_minutes
+    total_units = 0
+    for slot in slots:
+        duration = _slot_duration_minutes(slot)
+        if duration <= 0 or duration % period_minutes != 0:
+            return None, "Practical slot durations are invalid for contiguous block repair."
+        total_units += duration // period_minutes
+    if total_units <= 1:
+        return None, "Practical block already too small for contiguity repair."
+
+    preferred_block_slots = _lab_block_slots_for_course(base_course, schedule_policy)
+    full_blocks, remainder = divmod(total_units, preferred_block_slots)
+    block_units = [preferred_block_slots] * full_blocks
+    if remainder > 0:
+        block_units.append(remainder)
+    if not block_units:
+        return None, "No practical blocks computed for repair."
+
+    primary_faculty_candidates: list[str] = []
+    for slot in slots:
+        if slot.facultyId and slot.facultyId not in primary_faculty_candidates:
+            primary_faculty_candidates.append(slot.facultyId)
+    if not primary_faculty_candidates:
+        primary_faculty_candidates = [base_slot.facultyId]
+
+    room_candidates: list[str] = []
+    for slot in slots:
+        if slot.roomId and slot.roomId not in room_candidates:
+            room_candidates.append(slot.roomId)
+    if not room_candidates:
+        room_candidates = [base_slot.roomId]
+
+    sorted_slots = sorted(slots, key=lambda item: (_day_sort_index(item.day), parse_time_to_minutes(item.startTime), item.id))
+    unplaced_slots = list(sorted_slots)
+    pending_slot_ids = {slot.id for slot in sorted_slots}
+
+    for units in block_units:
+        duration_minutes = units * period_minutes
+        time_candidates = _build_time_block_candidates(
+            payload=payload,
+            db=db,
+            duration_minutes=duration_minutes,
+        )
+        if not time_candidates:
+            return None, "No timetable block candidates available for practical contiguity repair."
+
+        sorted_time_candidates = sorted(
+            time_candidates,
+            key=lambda item: (
+                0 if item[0] == base_slot.day else 1,
+                abs(_day_sort_index(item[0]) - _day_sort_index(base_slot.day)),
+                abs(item[1] - parse_time_to_minutes(base_slot.startTime)),
+            ),
+        )
+
+        selected_assignment: tuple[str, int, int, str, str] | None = None
+        for day, block_start, block_end in sorted_time_candidates:
+            for candidate_room_id in room_candidates:
+                room_record = db_room_map.get(candidate_room_id)
+                if not _room_available_for_window(room_record=room_record, day=day, start=block_start, end=block_end):
+                    continue
+                for candidate_faculty_id in primary_faculty_candidates:
+                    faculty_payload = faculty_payload_map.get(candidate_faculty_id)
+                    if faculty_payload is None:
+                        continue
+                    if not _faculty_available_for_window(
+                        faculty_payload=faculty_payload,
+                        faculty_record=db_faculty_map.get(candidate_faculty_id),
+                        day=day,
+                        start=block_start,
+                        end=block_end,
+                    ):
+                        continue
+                    if _resource_placement_conflicts(
+                        payload=payload,
+                        slot_id="__practical-block__",
+                        course_id=base_slot.courseId,
+                        section=base_slot.section,
+                        batch=base_slot.batch,
+                        day=day,
+                        start=block_start,
+                        end=block_end,
+                        room_id=candidate_room_id,
+                        faculty_id=candidate_faculty_id,
+                        course_map=course_map,
+                        elective_pairs=elective_pairs,
+                        moving_assistant_ids=_slot_assistant_faculty_ids(base_slot),
+                        ignore_slot_ids=pending_slot_ids,
+                    ):
+                        continue
+                    selected_assignment = (day, block_start, block_end, candidate_room_id, candidate_faculty_id)
+                    break
+                if selected_assignment is not None:
+                    break
+            if selected_assignment is not None:
+                break
+
+        if selected_assignment is None:
+            return None, "Could not find a conflict-free contiguous practical block assignment."
+
+        day, block_start, _block_end, candidate_room_id, candidate_faculty_id = selected_assignment
+        for offset in range(units):
+            if not unplaced_slots:
+                break
+            slot = unplaced_slots.pop(0)
+            start_minutes = block_start + (offset * period_minutes)
+            end_minutes = start_minutes + period_minutes
+            slot.day = day
+            slot.startTime = _minutes_to_time(start_minutes)
+            slot.endTime = _minutes_to_time(end_minutes)
+            slot.roomId = candidate_room_id
+            slot.facultyId = candidate_faculty_id
+            _prune_primary_from_slot_assistants(slot, candidate_faculty_id)
+            pending_slot_ids.discard(slot.id)
+
+    if unplaced_slots:
+        return None, "Practical contiguity repair could not place all affected slots."
+
+    return payload, "Resolved by moving practical sessions into contiguous block(s)."
+
+
 def _apply_best_effort_resolution(
     *,
     payload: OfficialTimetablePayload,
@@ -1700,6 +2774,63 @@ def _apply_best_effort_resolution(
     db: Session,
 ) -> tuple[OfficialTimetablePayload | None, str]:
     slots_by_id = {slot.id: slot for slot in payload.timetable_data}
+    course_map = {course.id: course for course in payload.course_data}
+    db_faculty_map = {item.id: item for item in db.execute(select(Faculty)).scalars().all()}
+    db_room_map = {item.id: item for item in db.execute(select(Room)).scalars().all()}
+    faculty_payload_map = {item.id: item for item in payload.faculty_data}
+    room_payload_map = {item.id: item for item in payload.room_data}
+    elective_pairs: set[tuple[str, str]] = set()
+    if payload.program_id and payload.term_number is not None:
+        elective_pairs = load_elective_overlap_pairs(
+            db=db,
+            program_id=payload.program_id,
+            term_number=payload.term_number,
+        )
+
+    if conflict.type == "course-faculty-inconsistency":
+        resolved_payload, message = _resolve_course_faculty_inconsistency_conflict(
+            payload=payload,
+            conflict=conflict,
+            slots_by_id=slots_by_id,
+            db_faculty_map=db_faculty_map,
+            course_map=course_map,
+            elective_pairs=elective_pairs,
+        )
+        if resolved_payload is not None:
+            return resolved_payload, message
+        return None, message
+
+    if conflict.type == "faculty-overlap":
+        resolved_payload, message = _resolve_assistant_faculty_overlap_conflict(
+            payload=payload,
+            conflict=conflict,
+            slots_by_id=slots_by_id,
+            db_faculty_map=db_faculty_map,
+            faculty_payload_map=faculty_payload_map,
+        )
+        if resolved_payload is not None:
+            return resolved_payload, message
+
+    if (
+        conflict.type == "availability"
+        and "practical sessions for" in conflict.description.lower()
+        and "contiguous block" in conflict.description.lower()
+    ):
+        resolved_payload, message = _resolve_practical_contiguity_conflict(
+            payload=payload,
+            conflict=conflict,
+            slots_by_id=slots_by_id,
+            course_map=course_map,
+            db_faculty_map=db_faculty_map,
+            db_room_map=db_room_map,
+            faculty_payload_map=faculty_payload_map,
+            room_payload_map=room_payload_map,
+            elective_pairs=elective_pairs,
+            db=db,
+        )
+        if resolved_payload is not None:
+            return resolved_payload, message
+
     target_slot_id = conflict.affected_slots[-1] if conflict.affected_slots else None
     if target_slot_id is None or target_slot_id not in slots_by_id:
         return None, "Conflict has no actionable slot reference."
@@ -1708,16 +2839,6 @@ def _apply_best_effort_resolution(
     start = parse_time_to_minutes(slot.startTime)
     end = parse_time_to_minutes(slot.endTime)
     duration = end - start
-    course_map = {course.id: course for course in payload.course_data}
-    db_faculty_map = {item.id: item for item in db.execute(select(Faculty)).scalars().all()}
-    db_room_map = {item.id: item for item in db.execute(select(Room)).scalars().all()}
-    elective_pairs: set[tuple[str, str]] = set()
-    if payload.program_id and payload.term_number is not None:
-        elective_pairs = load_elective_overlap_pairs(
-            db=db,
-            program_id=payload.program_id,
-            term_number=payload.term_number,
-        )
 
     # 1) Prefer non-temporal changes first.
     if conflict.type in {"room-overlap", "capacity", "availability"}:
@@ -1731,12 +2852,13 @@ def _apply_best_effort_resolution(
             start=start,
             end=end,
             current_faculty_id=slot.facultyId,
+            moving_assistant_ids=_slot_assistant_faculty_ids(slot),
         )
         if replacement_room:
             slot.roomId = replacement_room
             return payload, "Resolved by assigning an alternate compatible room."
 
-    if conflict.type in {"faculty-overlap", "availability"}:
+    if conflict.type in {"faculty-overlap", "availability", "course-faculty-inconsistency"}:
         replacement_faculty = _find_faculty_candidate(
             payload=payload,
             slot=slot,
@@ -1747,27 +2869,41 @@ def _apply_best_effort_resolution(
             start=start,
             end=end,
             current_room_id=slot.roomId,
+            moving_assistant_ids=_slot_assistant_faculty_ids(slot),
         )
         if replacement_faculty:
             slot.facultyId = replacement_faculty
+            _prune_primary_from_slot_assistants(slot, replacement_faculty)
             return payload, "Resolved by assigning an available faculty substitute."
 
-    # 2) If still unresolved, move the slot to the nearest valid time block.
+    # 2) If still unresolved, search relocation candidates and select the least disruptive valid placement.
     candidate_blocks = _build_time_block_candidates(payload=payload, db=db, duration_minutes=duration)
+    candidate_blocks.sort(
+        key=lambda item: (
+            0 if item[0] == slot.day else 1,
+            abs(_day_sort_index(item[0]) - _day_sort_index(slot.day)),
+            abs(item[1] - start),
+            _day_sort_index(item[0]),
+            item[1],
+        )
+    )
+    best_placement: tuple[tuple[int, int, int, int, int, int], str, int, int, str, str] | None = None
+
     for day, candidate_start, candidate_end in candidate_blocks:
         if day == slot.day and candidate_start == start:
             continue
 
-        candidate_room_id = slot.roomId
-        candidate_faculty_id = slot.facultyId
-
-        if not _room_available_for_window(
-            room_record=db_room_map.get(candidate_room_id),
+        room_candidates: list[str] = []
+        if _room_available_for_window(
+            room_record=db_room_map.get(slot.roomId),
             day=day,
             start=candidate_start,
             end=candidate_end,
         ):
-            replacement_room = _find_room_candidate(
+            _append_unique_identifier(room_candidates, slot.roomId)
+        _append_unique_identifier(
+            room_candidates,
+            _find_room_candidate(
                 payload=payload,
                 slot=slot,
                 course_map=course_map,
@@ -1776,21 +2912,23 @@ def _apply_best_effort_resolution(
                 day=day,
                 start=candidate_start,
                 end=candidate_end,
-                current_faculty_id=candidate_faculty_id,
-            )
-            if replacement_room is None:
-                continue
-            candidate_room_id = replacement_room
+                current_faculty_id=slot.facultyId,
+            ),
+        )
 
-        faculty_payload = next((item for item in payload.faculty_data if item.id == candidate_faculty_id), None)
-        if faculty_payload is None or not _faculty_available_for_window(
-            faculty_payload=faculty_payload,
-            faculty_record=db_faculty_map.get(candidate_faculty_id),
+        faculty_candidates: list[str] = []
+        current_faculty_payload = faculty_payload_map.get(slot.facultyId)
+        if current_faculty_payload is not None and _faculty_available_for_window(
+            faculty_payload=current_faculty_payload,
+            faculty_record=db_faculty_map.get(slot.facultyId),
             day=day,
             start=candidate_start,
             end=candidate_end,
         ):
-            replacement_faculty = _find_faculty_candidate(
+            _append_unique_identifier(faculty_candidates, slot.facultyId)
+        _append_unique_identifier(
+            faculty_candidates,
+            _find_faculty_candidate(
                 payload=payload,
                 slot=slot,
                 course_map=course_map,
@@ -1799,34 +2937,129 @@ def _apply_best_effort_resolution(
                 day=day,
                 start=candidate_start,
                 end=candidate_end,
-                current_room_id=candidate_room_id,
+                current_room_id=slot.roomId,
+            ),
+        )
+
+        for candidate_room_id in list(room_candidates):
+            _append_unique_identifier(
+                faculty_candidates,
+                _find_faculty_candidate(
+                    payload=payload,
+                    slot=slot,
+                    course_map=course_map,
+                    db_faculty_map=db_faculty_map,
+                    elective_pairs=elective_pairs,
+                    day=day,
+                    start=candidate_start,
+                    end=candidate_end,
+                    current_room_id=candidate_room_id,
+                ),
             )
-            if replacement_faculty is None:
+
+        for candidate_faculty_id in list(faculty_candidates):
+            _append_unique_identifier(
+                room_candidates,
+                _find_room_candidate(
+                    payload=payload,
+                    slot=slot,
+                    course_map=course_map,
+                    db_room_map=db_room_map,
+                    elective_pairs=elective_pairs,
+                    day=day,
+                    start=candidate_start,
+                    end=candidate_end,
+                    current_faculty_id=candidate_faculty_id,
+                ),
+            )
+
+        for candidate_room_id in room_candidates[:6]:
+            room_record = db_room_map.get(candidate_room_id)
+            if not _room_available_for_window(
+                room_record=room_record,
+                day=day,
+                start=candidate_start,
+                end=candidate_end,
+            ):
                 continue
-            candidate_faculty_id = replacement_faculty
+            room_payload = room_payload_map.get(candidate_room_id)
+            capacity_delta = (
+                max(0, int((room_payload.capacity if room_payload is not None else 0) - (slot.studentCount or 0)))
+                if slot.studentCount is not None
+                else 0
+            )
+            for candidate_faculty_id in faculty_candidates[:6]:
+                faculty_payload = faculty_payload_map.get(candidate_faculty_id)
+                if faculty_payload is None:
+                    continue
+                if not _faculty_available_for_window(
+                    faculty_payload=faculty_payload,
+                    faculty_record=db_faculty_map.get(candidate_faculty_id),
+                    day=day,
+                    start=candidate_start,
+                    end=candidate_end,
+                ):
+                    continue
 
-        if _resource_placement_conflicts(
-            payload=payload,
-            slot_id=slot.id,
-            course_id=slot.courseId,
-            section=slot.section,
-            batch=slot.batch,
-            day=day,
-            start=candidate_start,
-            end=candidate_end,
-            room_id=candidate_room_id,
-            faculty_id=candidate_faculty_id,
-            course_map=course_map,
-            elective_pairs=elective_pairs,
-        ):
-            continue
+                if _resource_placement_conflicts(
+                    payload=payload,
+                    slot_id=slot.id,
+                    course_id=slot.courseId,
+                    section=slot.section,
+                    batch=slot.batch,
+                    day=day,
+                    start=candidate_start,
+                    end=candidate_end,
+                    room_id=candidate_room_id,
+                    faculty_id=candidate_faculty_id,
+                    course_map=course_map,
+                    elective_pairs=elective_pairs,
+                    moving_assistant_ids=_slot_assistant_faculty_ids(slot),
+                ):
+                    continue
 
+                placement_score = (
+                    0 if day == slot.day else 1,
+                    abs(_day_sort_index(day) - _day_sort_index(slot.day)),
+                    abs(candidate_start - start),
+                    0 if candidate_room_id == slot.roomId else 1,
+                    0 if candidate_faculty_id == slot.facultyId else 1,
+                    capacity_delta,
+                )
+                if best_placement is None or placement_score < best_placement[0]:
+                    best_placement = (
+                        placement_score,
+                        day,
+                        candidate_start,
+                        candidate_end,
+                        candidate_room_id,
+                        candidate_faculty_id,
+                    )
+
+    if best_placement is not None:
+        _, day, candidate_start, candidate_end, candidate_room_id, candidate_faculty_id = best_placement
+        moved = day != slot.day or candidate_start != start
+        room_changed = candidate_room_id != slot.roomId
+        faculty_changed = candidate_faculty_id != slot.facultyId
         slot.day = day
         slot.startTime = f"{candidate_start // 60:02d}:{candidate_start % 60:02d}"
         slot.endTime = f"{candidate_end // 60:02d}:{candidate_end % 60:02d}"
         slot.roomId = candidate_room_id
         slot.facultyId = candidate_faculty_id
-        return payload, "Resolved by moving the slot to a conflict-free teaching block."
+        _prune_primary_from_slot_assistants(slot, candidate_faculty_id)
+        if moved and room_changed and faculty_changed:
+            return payload, "Resolved by relocating the slot and reassigning room/faculty."
+        if moved and room_changed:
+            return payload, "Resolved by moving the slot and assigning a compatible room."
+        if moved and faculty_changed:
+            return payload, "Resolved by moving the slot and assigning an available faculty member."
+        if moved:
+            return payload, "Resolved by moving the slot to a conflict-free teaching block."
+        if room_changed:
+            return payload, "Resolved by assigning an alternate compatible room."
+        if faculty_changed:
+            return payload, "Resolved by assigning an available faculty substitute."
+        return payload, "Resolved by applying a validated slot re-placement."
 
     return None, "No safe automatic resolution found; apply the recommendation manually."
 
@@ -1851,6 +3084,35 @@ def _decision_snapshot_to_conflict(snapshot: dict) -> TimetableConflict | None:
         return None
 
 
+def _decision_is_auto_resolved(decision: TimetableConflictDecision) -> bool:
+    note = (decision.note or "").strip().lower()
+    return note.startswith("[auto-resolved")
+
+
+def _apply_decision_metadata(
+    *,
+    conflict: TimetableConflict,
+    decision: TimetableConflictDecision | None,
+) -> None:
+    if decision is None:
+        if not conflict.resolved:
+            conflict.resolution_mode = "pending"
+        return
+
+    conflict.decision = decision.decision.value
+    conflict.decision_note = decision.note
+    if decision.decision == ConflictDecision.no:
+        conflict.resolution_mode = "ignored"
+        return
+
+    if decision.resolved:
+        conflict.resolved = True
+        conflict.resolution_mode = "auto" if _decision_is_auto_resolved(decision) else "manual"
+        return
+
+    conflict.resolution_mode = "pending"
+
+
 def _merge_conflicts_with_decisions(
     *,
     conflicts: list[TimetableConflict],
@@ -1860,8 +3122,7 @@ def _merge_conflicts_with_decisions(
     existing_ids: set[str] = set()
     for conflict in conflicts:
         decision = decisions.get(conflict.id)
-        if decision is not None and decision.decision == ConflictDecision.yes and decision.resolved:
-            conflict.resolved = True
+        _apply_decision_metadata(conflict=conflict, decision=decision)
         merged.append(conflict)
         existing_ids.add(conflict.id)
 
@@ -1872,9 +3133,267 @@ def _merge_conflicts_with_decisions(
             continue
         recovered = _decision_snapshot_to_conflict(decision.conflict_snapshot or {})
         if recovered is not None:
+            _apply_decision_metadata(conflict=recovered, decision=decision)
             merged.append(recovered)
 
     return merged
+
+
+def _categorize_conflicts_for_review(
+    conflicts: list[TimetableConflict],
+) -> tuple[list[TimetableConflict], list[TimetableConflict], list[TimetableConflict], list[TimetableConflict]]:
+    auto_resolved: list[TimetableConflict] = []
+    manually_resolved: list[TimetableConflict] = []
+    ignored: list[TimetableConflict] = []
+    pending: list[TimetableConflict] = []
+
+    for conflict in conflicts:
+        mode = (conflict.resolution_mode or "").strip().lower()
+        if mode == "ignored":
+            ignored.append(conflict)
+            continue
+        if conflict.resolved:
+            if mode == "auto":
+                auto_resolved.append(conflict)
+            else:
+                manually_resolved.append(conflict)
+            continue
+        pending.append(conflict)
+
+    def _sort_key(item: TimetableConflict) -> tuple[int, str]:
+        severity_rank = {"high": 0, "medium": 1, "low": 2}
+        return (severity_rank.get(item.severity, 3), item.type)
+
+    auto_resolved.sort(key=_sort_key)
+    manually_resolved.sort(key=_sort_key)
+    ignored.sort(key=_sort_key)
+    pending.sort(key=_sort_key)
+    return auto_resolved, manually_resolved, ignored, pending
+
+
+def _conflict_resolution_priority(conflict: TimetableConflict) -> tuple[int, int, int, str]:
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    type_rank = {
+        "section-overlap": 0,
+        "faculty-overlap": 1,
+        "room-overlap": 2,
+        "elective-overlap": 3,
+        "capacity": 4,
+        "availability": 5,
+        "course-faculty-inconsistency": 6,
+    }
+    return (
+        severity_rank.get(conflict.severity, 3),
+        type_rank.get(conflict.type, 99),
+        -len(conflict.affected_slots),
+        conflict.id,
+    )
+
+
+def _payload_conflict_resolution_signature(payload: OfficialTimetablePayload) -> tuple[tuple[str, str, str, str, str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                slot.id,
+                slot.day,
+                slot.startTime,
+                slot.endTime,
+                slot.roomId,
+                slot.facultyId,
+                ",".join(sorted(_slot_assistant_faculty_ids(slot))),
+            )
+            for slot in payload.timetable_data
+        )
+    )
+
+
+def _upsert_auto_resolved_decision(
+    *,
+    db: Session,
+    conflict: TimetableConflict,
+    current_user: User,
+    resolution_message: str,
+    note: str,
+) -> None:
+    decision = db.execute(
+        select(TimetableConflictDecision).where(TimetableConflictDecision.conflict_id == conflict.id)
+    ).scalar_one_or_none()
+    if decision is None:
+        decision = TimetableConflictDecision(
+            conflict_id=conflict.id,
+            decision=ConflictDecision.yes,
+            resolved=True,
+        )
+        db.add(decision)
+
+    snapshot = conflict.model_dump(by_alias=True)
+    snapshot["resolved"] = True
+    snapshot["resolution"] = resolution_message
+
+    decision.decision = ConflictDecision.yes
+    decision.resolved = True
+    decision.note = note
+    decision.decided_by_id = current_user.id
+    decision.conflict_snapshot = snapshot
+
+
+def _collect_constraint_mismatches(payload: OfficialTimetablePayload, db: Session) -> list[str]:
+    messages: list[str] = []
+    seen: set[str] = set()
+
+    def add_message(raw: str | None) -> None:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        messages.append(text)
+
+    def capture(action: Callable[[], None]) -> None:
+        try:
+            action()
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, list):
+                for item in detail:
+                    add_message(str(item))
+            else:
+                add_message(str(detail))
+
+    course_by_id = {course.id: course for course in payload.course_data}
+    faculty_by_id = {faculty.id: faculty for faculty in payload.faculty_data}
+    room_by_id = {room.id: room for room in payload.room_data}
+    shared_groups: list[tuple[str, str, set[str]]] = []
+    shared_groups_by_course: dict[str, list[set[str]]] = {}
+    if payload.program_id and payload.term_number is not None:
+        shared_groups = load_shared_lecture_groups(
+            db=db,
+            program_id=payload.program_id,
+            term_number=payload.term_number,
+        )
+        shared_groups_by_course = build_shared_group_lookup(shared_groups)
+
+    working_hours = load_working_hours(db)
+    schedule_policy = load_schedule_policy(db)
+    program_constraint = load_program_constraint(db, payload.program_id) if payload.program_id else None
+    program_daily_slots = normalize_program_daily_slots(
+        program_constraint.daily_time_slots if program_constraint is not None else None
+    )
+    period_minutes = schedule_policy.period_minutes
+    day_segments: dict[str, list[tuple[int, int]]] = {}
+    day_blocked_segments: dict[str, list[tuple[int, int, str]]] = {}
+    for day, hours_entry in working_hours.items():
+        if not hours_entry.enabled:
+            continue
+        if program_daily_slots:
+            teaching_segments, blocked_segments = build_teaching_segments_from_program_slots(program_daily_slots)
+            if teaching_segments:
+                day_segments[day] = teaching_segments
+            if blocked_segments:
+                day_blocked_segments[day] = blocked_segments
+            continue
+        day_start = parse_time_to_minutes(hours_entry.start_time)
+        day_end = parse_time_to_minutes(hours_entry.end_time)
+        day_segments[day] = build_teaching_segments(
+            day_start=day_start,
+            day_end=day_end,
+            period_minutes=period_minutes,
+            breaks=schedule_policy.breaks,
+        )
+        day_blocked_segments[day] = [
+            (
+                parse_time_to_minutes(item.start_time),
+                parse_time_to_minutes(item.end_time),
+                item.name,
+            )
+            for item in schedule_policy.breaks
+        ]
+
+    for slot in payload.timetable_data:
+        hours_entry = working_hours.get(slot.day)
+        segments = day_segments.get(slot.day, [])
+        slot_start = parse_time_to_minutes(slot.startTime)
+        slot_end = parse_time_to_minutes(slot.endTime)
+        if hours_entry is None or not hours_entry.enabled or not segments:
+            add_message(f"Timeslot {slot.id} occurs on a non-working day ({slot.day}).")
+            continue
+        allowed_start = min(start for start, _end in segments)
+        allowed_end = max(end for _start, end in segments)
+        if slot_start < allowed_start or slot_end > allowed_end:
+            add_message(
+                (
+                    f"Timeslot {slot.id} on {slot.day} must be within working hours "
+                    f"{hours_entry.start_time}-{hours_entry.end_time}."
+                )
+            )
+        slot_duration = slot_end - slot_start
+        if slot_duration % period_minutes != 0:
+            add_message(f"Timeslot {slot.id} must be a multiple of {period_minutes} minutes.")
+        if not is_slot_aligned_with_segments(slot_start, slot_end, segments):
+            add_message(f"Timeslot {slot.id} must align to configured teaching slot boundaries.")
+        blocked_overlap = next(
+            (
+                (start, end, label)
+                for start, end, label in day_blocked_segments.get(slot.day, [])
+                if slot_start < end and slot_end > start
+            ),
+            None,
+        )
+        if blocked_overlap is not None:
+            add_message(
+                (
+                    f"Timeslot {slot.id} overlaps non-teaching slot '{blocked_overlap[2]}' "
+                    f"({_minutes_to_time(blocked_overlap[0])}-{_minutes_to_time(blocked_overlap[1])})."
+                )
+            )
+
+    if payload.term_number is None:
+        has_constraints = db.execute(select(SemesterConstraint.id)).first() is not None
+        if has_constraints:
+            add_message("termNumber is required to validate semester constraints.")
+    else:
+        constraint = load_semester_constraint(db, payload.term_number)
+        if constraint is not None:
+            capture(lambda: enforce_semester_constraints(payload, constraint, force=False))
+
+    capture(lambda: enforce_resource_conflicts(payload, course_by_id, shared_groups_by_course, force=False))
+    capture(lambda: enforce_course_scheduling(payload, course_by_id, room_by_id, schedule_policy, force=False))
+    student_counts_by_slot: dict[str, int] = {}
+    try:
+        student_counts_by_slot = enforce_room_capacity(payload, room_by_id, db, force=False)
+    except HTTPException as exc:
+        detail = exc.detail
+        if isinstance(detail, list):
+            for item in detail:
+                add_message(str(item))
+        else:
+            add_message(str(detail))
+    capture(
+        lambda: enforce_shared_lecture_constraints(
+            payload,
+            shared_groups,
+            shared_groups_by_course,
+            room_by_id,
+            student_counts_by_slot,
+            force=False,
+        )
+    )
+    capture(lambda: enforce_section_credit_aligned_minutes(payload, db, schedule_policy, force=False))
+    capture(lambda: enforce_program_credit_requirements(payload, course_by_id, db, force=False))
+    capture(lambda: enforce_elective_overlap_constraints(payload, db, force=False))
+    capture(lambda: enforce_prerequisite_constraints(payload, db, force=False))
+    capture(lambda: enforce_faculty_overload_preferences(payload, db, force=False))
+    capture(lambda: enforce_single_faculty_per_course_sections(payload, course_by_id, faculty_by_id, force=False))
+
+    live_conflicts = _build_conflicts(payload, db)
+    metrics = _build_constraint_metrics(payload, live_conflicts)
+    for status_item in metrics:
+        if status_item.status == "satisfied":
+            continue
+        add_message(
+            f"{status_item.name}: {status_item.description} (satisfaction {status_item.satisfaction:.1f}%)."
+        )
+
+    return messages
 
 
 def _status_from_score(score: float) -> str:
@@ -1909,11 +3428,11 @@ def _build_constraint_metrics(payload: OfficialTimetablePayload, conflicts: list
         ),
     )
 
+    course_by_id = {course.id: course for course in payload.course_data}
     lab_slots = [
         slot
         for slot in payload.timetable_data
-        if (course := next((item for item in payload.course_data if item.id == slot.courseId), None)) is not None
-        and course.type == "lab"
+        if _slot_is_practical(slot, course_by_id.get(slot.courseId))
     ]
     lab_groups: dict[tuple[str, str, str], list] = defaultdict(list)
     for slot in lab_slots:
@@ -1936,9 +3455,15 @@ def _build_constraint_metrics(payload: OfficialTimetablePayload, conflicts: list
     faculty_minutes: dict[str, int] = defaultdict(int)
     faculty_max: dict[str, int] = {}
     for faculty in payload.faculty_data:
+        if _is_virtual_faculty_id(faculty.id):
+            continue
         faculty_max[faculty.id] = faculty.maxHours * 60
     for slot in payload.timetable_data:
-        faculty_minutes[slot.facultyId] += parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime)
+        duration = parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime)
+        for faculty_id in _slot_all_faculty_ids(slot):
+            if _is_virtual_faculty_id(faculty_id):
+                continue
+            faculty_minutes[faculty_id] += duration
 
     workload_hours = [minutes / 60.0 for minutes in faculty_minutes.values()]
     if workload_hours:
@@ -1991,10 +3516,16 @@ def _build_constraint_metrics(payload: OfficialTimetablePayload, conflicts: list
 def _build_workload_chart(payload: OfficialTimetablePayload) -> list[WorkloadChartEntry]:
     faculty_minutes: dict[str, int] = defaultdict(int)
     for slot in payload.timetable_data:
-        faculty_minutes[slot.facultyId] += parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime)
+        duration = parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime)
+        for faculty_id in _slot_all_faculty_ids(slot):
+            if _is_virtual_faculty_id(faculty_id):
+                continue
+            faculty_minutes[faculty_id] += duration
 
     entries: list[WorkloadChartEntry] = []
     for faculty in payload.faculty_data:
+        if _is_virtual_faculty_id(faculty.id):
+            continue
         assigned_hours = faculty_minutes.get(faculty.id, 0) / 60.0
         short_name = faculty.name.split(" ")[-1] if faculty.name else faculty.id
         entries.append(
@@ -2015,7 +3546,10 @@ def _build_daily_workload(payload: OfficialTimetablePayload) -> list[DailyWorklo
     day_faculty_minutes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for slot in payload.timetable_data:
         duration = parse_time_to_minutes(slot.endTime) - parse_time_to_minutes(slot.startTime)
-        day_faculty_minutes[slot.day][slot.facultyId] += duration
+        for faculty_id in _slot_all_faculty_ids(slot):
+            if _is_virtual_faculty_id(faculty_id):
+                continue
+            day_faculty_minutes[slot.day][faculty_id] += duration
 
     ordered_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     daily: list[DailyWorkloadEntry] = []
@@ -2097,7 +3631,9 @@ def _slice_payload_by_slots(
     selected_slots = list(slots)
     course_ids = {slot.courseId for slot in selected_slots}
     room_ids = {slot.roomId for slot in selected_slots}
-    faculty_ids = {slot.facultyId for slot in selected_slots}
+    faculty_ids: set[str] = set()
+    for slot in selected_slots:
+        faculty_ids.update(_slot_all_faculty_ids(slot))
 
     return OfficialTimetablePayload.model_validate(
         {
@@ -2163,7 +3699,11 @@ def _scope_official_payload_for_user(
 
         return _slice_payload_by_slots(
             payload,
-            [slot for slot in payload.timetable_data if slot.facultyId in faculty_ids],
+            [
+                slot
+                for slot in payload.timetable_data
+                if any(faculty_id in faculty_ids for faculty_id in _slot_all_faculty_ids(slot))
+            ],
         )
 
     return _slice_payload_by_slots(payload, [])
@@ -2213,11 +3753,11 @@ def _filter_payload_for_offline_publish(
     for slot in payload.timetable_data:
         if section_name and slot.section.strip().upper() != section_name:
             continue
-        if faculty_id and slot.facultyId != faculty_id:
+        slot_faculty_ids = _slot_all_faculty_ids(slot)
+        if faculty_id and faculty_id not in slot_faculty_ids:
             continue
         if department:
-            slot_department = faculty_department.get(slot.facultyId)
-            if slot_department != department:
+            if not any(faculty_department.get(item_id) == department for item_id in slot_faculty_ids):
                 continue
         scoped_slots.append(slot)
     return _slice_payload_by_slots(payload, scoped_slots)
@@ -2227,7 +3767,7 @@ def _sort_timetable_slots(slots: list[object]) -> list[object]:
     return sorted(
         slots,
         key=lambda slot: (
-            DAY_ORDER.get(slot.day, 99),
+            _day_sort_index(slot.day),
             parse_time_to_minutes(slot.startTime),
             slot.section,
             slot.batch or "",
@@ -2258,6 +3798,12 @@ def _build_timetable_email_content(
         course = course_by_id.get(slot.courseId)
         room = room_by_id.get(slot.roomId)
         faculty = faculty_by_id.get(slot.facultyId)
+        assistant_labels = [
+            faculty_by_id.get(assistant_id).name if faculty_by_id.get(assistant_id) is not None else assistant_id
+            for assistant_id in _slot_assistant_faculty_ids(slot)
+        ]
+        assistant_text = f" | Assist: {', '.join(assistant_labels)}" if assistant_labels else ""
+        assistant_suffix = f" (Assist: {', '.join(assistant_labels)})" if assistant_labels else ""
         batch = f" Batch {slot.batch}" if slot.batch else ""
         lines.append(
             (
@@ -2266,6 +3812,7 @@ def _build_timetable_email_content(
                 f"Section {slot.section}{batch} | "
                 f"Room {room.name if room else slot.roomId} | "
                 f"Faculty {faculty.name if faculty else slot.facultyId}"
+                f"{assistant_text}"
             )
         )
         row_html.append(
@@ -2277,7 +3824,8 @@ def _build_timetable_email_content(
             f"<td>{escape(slot.section)}</td>"
             f"<td>{escape(slot.batch or '')}</td>"
             f"<td>{escape(room.name if room else slot.roomId)}</td>"
-            f"<td>{escape(faculty.name if faculty else slot.facultyId)}</td>"
+            f"<td>{escape(faculty.name if faculty else slot.facultyId)}"
+            f"{escape(assistant_suffix)}</td>"
             "</tr>"
         )
 
@@ -2399,6 +3947,300 @@ def _send_offline_timetable_emails(
     )
 
 
+ROOM_ONLY_CONFLICT_TYPES = {
+    "room_conflict",
+    "room-overlap",
+    "room_capacity",
+    "capacity",
+    "room_type",
+}
+
+
+def _slot_has_room_overlap(slot: object, other: object) -> bool:
+    if slot.day != other.day:
+        return False
+    start_a = parse_time_to_minutes(slot.startTime)
+    end_a = parse_time_to_minutes(slot.endTime)
+    start_b = parse_time_to_minutes(other.startTime)
+    end_b = parse_time_to_minutes(other.endTime)
+    return slots_overlap(start_a, end_a, start_b, end_b)
+
+
+def _resolve_faculty_user_for_slot(payload: OfficialTimetablePayload, slot: object, db: Session) -> User | None:
+    faculty_ids = _slot_all_faculty_ids(slot)
+    faculty_map = {item.id: item for item in payload.faculty_data}
+    for faculty_id in faculty_ids:
+        faculty = faculty_map.get(faculty_id)
+        if faculty is None or not faculty.email:
+            continue
+        matched = (
+            db.execute(
+                select(User).where(
+                    func.lower(User.email) == faculty.email.strip().lower(),
+                    User.role == UserRole.faculty,
+                    User.is_active.is_(True),
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if matched is not None:
+            return matched
+    return None
+
+
+def _resolve_faculty_user_by_id(payload: OfficialTimetablePayload, faculty_id: str, db: Session) -> User | None:
+    normalized_id = str(faculty_id or "").strip()
+    if not normalized_id:
+        return None
+
+    faculty_email: str | None = None
+    faculty_map = {item.id: item for item in payload.faculty_data}
+    mapped = faculty_map.get(normalized_id)
+    if mapped is not None and mapped.email:
+        faculty_email = mapped.email.strip().lower()
+    else:
+        faculty_record = db.get(Faculty, normalized_id)
+        if faculty_record is not None and faculty_record.email:
+            faculty_email = faculty_record.email.strip().lower()
+
+    if not faculty_email:
+        return None
+
+    return (
+        db.execute(
+            select(User).where(
+                func.lower(User.email) == faculty_email,
+                User.role == UserRole.faculty,
+                User.is_active.is_(True),
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _resolve_cr_student_for_section(
+    *,
+    db: Session,
+    program_id: str | None,
+    term_number: int | None,
+    section_name: str,
+) -> User | None:
+    section = section_name.strip()
+    if not section:
+        return None
+
+    statement = select(User).where(
+        User.role == UserRole.student,
+        User.is_active.is_(True),
+        func.lower(User.section_name) == section.lower(),
+    )
+    if program_id:
+        statement = statement.where(User.program_id == program_id)
+    if term_number is not None:
+        statement = statement.where(User.semester_number == term_number)
+
+    candidates = list(
+        db.execute(
+            statement.order_by(
+                User.roll_number.asc(),
+                User.created_at.asc(),
+            )
+        ).scalars()
+    )
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def _apply_change_proposal_to_payload(
+    payload: OfficialTimetablePayload,
+    proposal: dict,
+) -> tuple[OfficialTimetablePayload, object, list[str]]:
+    proposed_slot_id = str(proposal.get("slotId") or "").strip()
+    if not proposed_slot_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing slotId in proposal")
+    day = str(proposal.get("day") or "").strip()
+    start_time = str(proposal.get("startTime") or "").strip()
+    end_time = str(proposal.get("endTime") or "").strip()
+    room_id = str(proposal.get("roomId") or "").strip() or None
+    faculty_id = str(proposal.get("facultyId") or "").strip() or None
+    section_name = str(proposal.get("section") or "").strip() or None
+    request_kind = str(proposal.get("requestKind") or "slot_move").strip().lower() or "slot_move"
+    raw_assistants = proposal.get("assistantFacultyIds")
+    assistant_faculty_ids: list[str] | None = None
+    if isinstance(raw_assistants, list):
+        seen_assistants: set[str] = set()
+        normalized_assistants: list[str] = []
+        for item in raw_assistants:
+            assistant_id = str(item or "").strip()
+            if not assistant_id or assistant_id in seen_assistants:
+                continue
+            seen_assistants.add(assistant_id)
+            normalized_assistants.append(assistant_id)
+        assistant_faculty_ids = normalized_assistants
+    if not day or not start_time or not end_time:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Proposal requires day/startTime/endTime")
+
+    updated = payload.model_copy(deep=True)
+    target_slot = next((item for item in updated.timetable_data if item.id == proposed_slot_id), None)
+    if target_slot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Requested slot not found in official timetable")
+
+    if request_kind == "extra_class":
+        new_slot = target_slot.model_copy(deep=True)
+        new_slot.id = str(uuid.uuid4())
+        new_slot.day = day
+        new_slot.startTime = start_time
+        new_slot.endTime = end_time
+        if room_id:
+            new_slot.roomId = room_id
+        if faculty_id:
+            new_slot.facultyId = faculty_id
+            _prune_primary_from_slot_assistants(new_slot, faculty_id)
+        if assistant_faculty_ids is not None:
+            new_slot.assistantFacultyIds = assistant_faculty_ids
+        if section_name:
+            new_slot.section = section_name
+        updated.timetable_data.append(new_slot)
+        return updated, new_slot, [target_slot.id, new_slot.id]
+
+    target_slot.day = day
+    target_slot.startTime = start_time
+    target_slot.endTime = end_time
+    if room_id:
+        target_slot.roomId = room_id
+    if faculty_id:
+        target_slot.facultyId = faculty_id
+        _prune_primary_from_slot_assistants(target_slot, faculty_id)
+    if assistant_faculty_ids is not None:
+        target_slot.assistantFacultyIds = assistant_faculty_ids
+    if section_name:
+        target_slot.section = section_name
+
+    return updated, target_slot, [target_slot.id]
+
+
+def _find_alternative_room_id_for_slot(payload: OfficialTimetablePayload, slot: object) -> str | None:
+    room_by_id = {item.id: item for item in payload.room_data}
+    current_room = room_by_id.get(slot.roomId)
+    student_count = int(slot.studentCount or 0)
+
+    candidates = sorted(
+        payload.room_data,
+        key=lambda room: (
+            max(0, room.capacity - student_count),
+            room.name.lower(),
+        ),
+    )
+
+    for room in candidates:
+        if room.id == slot.roomId:
+            continue
+        if current_room is not None and room.type != current_room.type:
+            continue
+        if student_count > 0 and room.capacity < student_count:
+            continue
+        has_overlap = any(
+            other.id != slot.id
+            and other.roomId == room.id
+            and _slot_has_room_overlap(slot, other)
+            for other in payload.timetable_data
+        )
+        if has_overlap:
+            continue
+        return room.id
+    return None
+
+
+def _send_timetable_distribution_emails(
+    *,
+    db: Session,
+    payload: OfficialTimetablePayload,
+) -> OfflinePublishResponse:
+    users = list(
+        db.execute(
+            select(User).where(
+                User.is_active.is_(True),
+                User.role.in_([UserRole.admin, UserRole.scheduler, UserRole.faculty, UserRole.student]),
+            )
+        ).scalars()
+    )
+
+    attempted = 0
+    sent = 0
+    skipped = 0
+    failed = 0
+    recipients: list[str] = []
+    failed_recipients: list[str] = []
+
+    for user in users:
+        if not user.email:
+            skipped += 1
+            continue
+
+        if user.role in {UserRole.admin, UserRole.scheduler}:
+            user_payload = payload
+            scope_label = "Classroom Master Timetable"
+            subject = "ShedForge Room Utilization Timetable"
+        elif user.role == UserRole.faculty:
+            user_payload = _scope_official_payload_for_user(payload, user, db)
+            scope_label = "Faculty Timetable"
+            subject = "ShedForge Faculty Timetable"
+        else:
+            user_payload = _scope_official_payload_for_user(payload, user, db)
+            scope_label = "Class Timetable"
+            subject = "ShedForge Class Timetable"
+
+        if not user_payload.timetable_data:
+            skipped += 1
+            continue
+
+        attempted += 1
+        text_content, html_content = _build_timetable_email_content(
+            user=user,
+            payload=user_payload,
+            scope_label=scope_label,
+        )
+        try:
+            send_email(
+                to_email=user.email,
+                subject=subject,
+                text_content=text_content,
+                html_content=html_content,
+            )
+            sent += 1
+            recipients.append(user.email)
+            create_notification(
+                db,
+                user_id=user.id,
+                title="Timetable Distribution",
+                message=f"{scope_label} was distributed to your inbox.",
+                notification_type=NotificationType.timetable,
+                recipient=user,
+                deliver_email=False,
+            )
+        except EmailDeliveryError:
+            failed += 1
+            failed_recipients.append(user.email)
+
+    return OfflinePublishResponse(
+        attempted=attempted,
+        sent=sent,
+        skipped=skipped,
+        failed=failed,
+        recipients=recipients,
+        failed_recipients=failed_recipients,
+        message=(
+            "Role-wise distribution completed. "
+            f"Sent: {sent}, Failed: {failed}, Skipped: {skipped}. "
+            "Faculty received faculty timetables, students received class timetables, "
+            "and admin office received room master timetable."
+        ),
+    )
+
+
 @router.get("/official", response_model=OfficialTimetablePayload)
 def get_official_timetable(
     current_user: User = Depends(get_current_user),
@@ -2414,6 +4256,22 @@ def get_official_timetable(
     """
     payload = _load_official_payload(db)
     return _scope_official_payload_for_user(payload, current_user, db)
+
+
+@router.get("/official/full", response_model=OfficialTimetablePayload)
+def get_official_timetable_full(
+    current_user: User = Depends(
+        require_roles(UserRole.admin, UserRole.scheduler, UserRole.faculty, UserRole.student)
+    ),
+    db: Session = Depends(get_db),
+) -> OfficialTimetablePayload:
+    """
+    Returns the full official timetable payload to all authenticated roles.
+
+    Used for collaborative timetable browsing where users need to inspect class/faculty/room views.
+    """
+    del current_user
+    return _load_official_payload(db)
 
 
 @router.get("/official/faculty-mapping", response_model=list[FacultyCourseSectionMappingOut])
@@ -2435,6 +4293,22 @@ def get_official_faculty_mapping(
     faculty_by_id = {item.id: item for item in scoped_payload.faculty_data}
     course_by_id = {item.id: item for item in scoped_payload.course_data}
     room_by_id = {item.id: item for item in scoped_payload.room_data}
+    allowed_faculty_ids: set[str] | None = None
+    if current_user.role == UserRole.faculty:
+        faculty_email = (current_user.email or "").strip().lower()
+        allowed_faculty_ids = {
+            item.id
+            for item in scoped_payload.faculty_data
+            if (item.email or "").strip().lower() == faculty_email
+        }
+        if not allowed_faculty_ids and faculty_email:
+            faculty_match = (
+                db.execute(select(Faculty.id).where(func.lower(Faculty.email) == faculty_email))
+                .scalars()
+                .first()
+            )
+            if faculty_match:
+                allowed_faculty_ids.add(faculty_match)
 
     assignments_by_faculty: dict[str, list[FacultyCourseSectionAssignment]] = defaultdict(list)
     assigned_minutes_by_faculty: dict[str, int] = defaultdict(int)
@@ -2448,22 +4322,46 @@ def get_official_faculty_mapping(
 
         start_min = parse_time_to_minutes(slot.startTime)
         end_min = parse_time_to_minutes(slot.endTime)
-        assigned_minutes_by_faculty[slot.facultyId] += max(0, end_min - start_min)
-
-        assignments_by_faculty[slot.facultyId].append(
-            FacultyCourseSectionAssignment(
-                course_id=course.id,
-                course_code=course.code,
-                course_name=course.name,
-                section=slot.section,
-                batch=slot.batch,
-                day=slot.day,
-                startTime=slot.startTime,
-                endTime=slot.endTime,
-                room_id=room.id,
-                room_name=room.name,
+        duration_minutes = max(0, end_min - start_min)
+        if allowed_faculty_ids is None or slot.facultyId in allowed_faculty_ids:
+            assigned_minutes_by_faculty[slot.facultyId] += duration_minutes
+            assignments_by_faculty[slot.facultyId].append(
+                FacultyCourseSectionAssignment(
+                    course_id=course.id,
+                    course_code=course.code,
+                    course_name=course.name,
+                    section=slot.section,
+                    batch=slot.batch,
+                    day=slot.day,
+                    startTime=slot.startTime,
+                    endTime=slot.endTime,
+                    room_id=room.id,
+                    room_name=room.name,
+                    assignmentRole="primary",
+                )
             )
-        )
+        for assistant_faculty_id in _slot_assistant_faculty_ids(slot):
+            assistant = faculty_by_id.get(assistant_faculty_id)
+            if assistant is None:
+                continue
+            if allowed_faculty_ids is not None and assistant_faculty_id not in allowed_faculty_ids:
+                continue
+            assigned_minutes_by_faculty[assistant_faculty_id] += duration_minutes
+            assignments_by_faculty[assistant_faculty_id].append(
+                FacultyCourseSectionAssignment(
+                    course_id=course.id,
+                    course_code=course.code,
+                    course_name=course.name,
+                    section=slot.section,
+                    batch=slot.batch,
+                    day=slot.day,
+                    startTime=slot.startTime,
+                    endTime=slot.endTime,
+                    room_id=room.id,
+                    room_name=room.name,
+                    assignmentRole="assistant",
+                )
+            )
 
     output: list[FacultyCourseSectionMappingOut] = []
     for faculty_id, assignments in assignments_by_faculty.items():
@@ -2472,7 +4370,7 @@ def get_official_faculty_mapping(
             continue
         assignments.sort(
             key=lambda item: (
-                DAY_ORDER.get(item.day, 99),
+                _day_sort_index(item.day),
                 parse_time_to_minutes(item.start_time),
                 item.course_code,
                 item.section,
@@ -2551,6 +4449,30 @@ def publish_offline_timetable_all(
     return result
 
 
+@router.post("/publish-distribution", response_model=OfflinePublishResponse)
+def publish_timetable_distribution(
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> OfflinePublishResponse:
+    official_payload = _load_official_payload(db)
+    result = _send_timetable_distribution_emails(db=db, payload=official_payload)
+    log_activity(
+        db,
+        user=current_user,
+        action="timetable.publish_distribution",
+        entity_type="official_timetable",
+        entity_id="1",
+        details={
+            "attempted": result.attempted,
+            "sent": result.sent,
+            "failed": result.failed,
+            "skipped": result.skipped,
+        },
+    )
+    db.commit()
+    return result
+
+
 @router.get("/conflicts", response_model=list[TimetableConflict])
 def get_timetable_conflicts(
     current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
@@ -2570,7 +4492,9 @@ def get_timetable_conflicts(
 @router.post("/conflicts/analyze", response_model=list[TimetableConflict])
 def analyze_timetable_conflicts(
     payload: OfficialTimetablePayload,
-    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    current_user: User = Depends(
+        require_roles(UserRole.admin, UserRole.scheduler, UserRole.faculty, UserRole.student)
+    ),
     db: Session = Depends(get_db),
 ) -> list[TimetableConflict]:
     """
@@ -2580,6 +4504,214 @@ def analyze_timetable_conflicts(
     """
     del current_user
     return _build_conflicts(payload, db)
+
+
+@router.post("/conflicts/review", response_model=TimetableConflictReviewOut)
+def review_timetable_conflicts(
+    request: TimetableConflictReviewIn,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> TimetableConflictReviewOut:
+    del current_user
+    if request.payload is not None:
+        payload = request.payload
+        source = "provided"
+    else:
+        payload = _load_official_payload(db)
+        source = "official"
+
+    decisions = _load_conflict_decision_map(db)
+    merged_conflicts = _merge_conflicts_with_decisions(
+        conflicts=_build_conflicts(payload, db),
+        decisions=decisions,
+    )
+    auto_resolved, manually_resolved, ignored_conflicts, pending_conflicts = _categorize_conflicts_for_review(
+        merged_conflicts,
+    )
+
+    unresolved_required = [
+        item for item in pending_conflicts if (item.resolution_mode or "").strip().lower() != "ignored"
+    ]
+    unresolved_hard_count = sum(1 for item in unresolved_required if item.severity == "high")
+    constraint_mismatches = _collect_constraint_mismatches(payload, db)
+    can_publish = unresolved_hard_count == 0 and not constraint_mismatches
+
+    return TimetableConflictReviewOut(
+        source=source,
+        auto_resolved_conflicts=auto_resolved,
+        manually_resolved_conflicts=manually_resolved,
+        ignored_conflicts=ignored_conflicts,
+        pending_conflicts=unresolved_required,
+        unresolved_required_count=len(unresolved_required),
+        unresolved_hard_count=unresolved_hard_count,
+        constraint_mismatches=constraint_mismatches,
+        can_publish=can_publish,
+        can_publish_anyway=True,
+    )
+
+
+@router.post("/conflicts/resolve-all", response_model=TimetableConflictResolveAllOut)
+def resolve_all_timetable_conflicts(
+    request: TimetableConflictResolveAllIn,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> TimetableConflictResolveAllOut:
+    if request.payload is not None:
+        working_payload = OfficialTimetablePayload.model_validate(request.payload.model_dump(by_alias=True))
+        source = "provided"
+    else:
+        working_payload = _load_official_payload(db)
+        source = "official"
+
+    resolved_entries: list[TimetableConflict] = []
+    max_rounds = min(400, max(40, len(working_payload.timetable_data) * 3))
+    visited_signatures: set[tuple[tuple[str, str, str, str, str, str, str], ...]] = {
+        _payload_conflict_resolution_signature(working_payload),
+    }
+    rounds = 0
+    while rounds < max_rounds:
+        rounds += 1
+        decision_map = _load_conflict_decision_map(db) if source == "official" else {}
+        merged_conflicts = _merge_conflicts_with_decisions(
+            conflicts=_build_conflicts(working_payload, db),
+            decisions=decision_map,
+        )
+        _auto_resolved, _manual_resolved, _ignored, pending = _categorize_conflicts_for_review(merged_conflicts)
+        target_conflicts = pending
+        if request.scope == "hard":
+            target_conflicts = [item for item in pending if item.severity == "high"]
+        if not target_conflicts:
+            break
+
+        pre_hard = sum(1 for item in merged_conflicts if item.severity == "high" and not item.resolved)
+        pre_total = len(merged_conflicts)
+        best_candidate: dict | None = None
+        for conflict in sorted(target_conflicts, key=_conflict_resolution_priority):
+            candidate_payload = OfficialTimetablePayload.model_validate(working_payload.model_dump(by_alias=True))
+            resolved_payload, resolution_message = _apply_best_effort_resolution(
+                payload=candidate_payload,
+                conflict=conflict,
+                db=db,
+            )
+            if resolved_payload is None:
+                continue
+
+            signature = _payload_conflict_resolution_signature(resolved_payload)
+            if signature in visited_signatures:
+                continue
+
+            post_conflicts = _build_conflicts(resolved_payload, db)
+            post_hard = sum(1 for item in post_conflicts if item.severity == "high")
+            conflict_resolved = not any(item.id == conflict.id for item in post_conflicts)
+            if not conflict_resolved and post_hard >= pre_hard and len(post_conflicts) >= pre_total:
+                continue
+
+            candidate_score = (
+                post_hard,
+                len(post_conflicts),
+                0 if conflict_resolved else 1,
+                _conflict_resolution_priority(conflict),
+            )
+            if best_candidate is None or candidate_score < best_candidate["score"]:
+                best_candidate = {
+                    "score": candidate_score,
+                    "payload": resolved_payload,
+                    "conflict": conflict,
+                    "message": resolution_message,
+                    "signature": signature,
+                    "post_conflicts": post_conflicts,
+                }
+
+        if best_candidate is None:
+            break
+
+        working_payload = best_candidate["payload"]
+        visited_signatures.add(best_candidate["signature"])
+
+        resolved_conflict = best_candidate["conflict"]
+        resolution_message = str(best_candidate["message"] or "Auto resolution applied.")
+        post_conflicts = best_candidate["post_conflicts"]
+        note = (
+            "[Auto-Resolved Bulk] "
+            f"scope={request.scope}; before={pre_total}; after={len(post_conflicts)}; "
+            f"hard_before={pre_hard}; hard_after={sum(1 for item in post_conflicts if item.severity == 'high')}; "
+            f"action={resolution_message}"
+        )
+        _upsert_auto_resolved_decision(
+            db=db,
+            conflict=resolved_conflict,
+            current_user=current_user,
+            resolution_message=resolution_message,
+            note=note,
+        )
+        resolved_record = TimetableConflict.model_validate(resolved_conflict.model_dump(by_alias=True))
+        resolved_record.resolved = True
+        resolved_record.decision = "yes"
+        resolved_record.resolution_mode = "auto"
+        resolved_record.decision_note = note
+        resolved_record.resolution = resolution_message
+        resolved_entries.append(resolved_record)
+
+    merged_final = _merge_conflicts_with_decisions(
+        conflicts=_build_conflicts(working_payload, db),
+        decisions=_load_conflict_decision_map(db) if source == "official" else {},
+    )
+    _, _, _, pending_final = _categorize_conflicts_for_review(merged_final)
+    remaining_conflicts = pending_final
+    if request.scope == "hard":
+        remaining_conflicts = [item for item in pending_final if item.severity == "high"]
+    constraint_mismatches = _collect_constraint_mismatches(working_payload, db)
+
+    promote_official = request.promote_official if request.promote_official is not None else (source == "provided")
+    promoted_version_label: str | None = None
+    if promote_official:
+        payload_dict = working_payload.model_dump(by_alias=True)
+        record = db.get(OfficialTimetable, 1)
+        if record is None:
+            record = OfficialTimetable(id=1, payload=payload_dict, updated_by_id=current_user.id)
+            db.add(record)
+        else:
+            record.payload = payload_dict
+            record.updated_by_id = current_user.id
+
+        summary = _build_analytics(working_payload, _build_conflicts(working_payload, db), db).model_dump(by_alias=True)
+        summary["source"] = "conflict-auto-resolve"
+        promoted_version_label = _next_version_label(db)
+        db.add(
+            TimetableVersion(
+                label=promoted_version_label,
+                payload=payload_dict,
+                summary=summary,
+                created_by_id=current_user.id,
+            )
+        )
+        log_activity(
+            db,
+            user=current_user,
+            action="timetable.conflicts.resolve_all.promote",
+            entity_type="official_timetable",
+            entity_id="1",
+            details={
+                "source": source,
+                "scope": request.scope,
+                "resolved_count": len(resolved_entries),
+                "remaining_conflicts": len(remaining_conflicts),
+                "constraint_mismatches": len(constraint_mismatches),
+                "note": request.note,
+                "promoted_version_label": promoted_version_label,
+            },
+        )
+
+    db.commit()
+    return TimetableConflictResolveAllOut(
+        source=source,
+        resolved_payload=working_payload,
+        resolved_count=len(resolved_entries),
+        remaining_conflicts=remaining_conflicts,
+        auto_resolved_conflicts=resolved_entries,
+        constraint_mismatches=constraint_mismatches,
+        promoted_version_label=promoted_version_label,
+    )
 
 
 @router.post("/conflicts/{conflict_id}/decision", response_model=ConflictDecisionOut)
@@ -2719,6 +4851,24 @@ def list_timetable_versions(
     return list(db.execute(select(TimetableVersion).order_by(TimetableVersion.created_at.desc())).scalars())
 
 
+@router.get("/versions/{version_id}/payload", response_model=OfficialTimetablePayload)
+def get_timetable_version_payload(
+    version_id: str,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler)),
+    db: Session = Depends(get_db),
+) -> OfficialTimetablePayload:
+    """
+    Returns the full timetable payload for a specific historical version.
+
+    Used by the Versions page to render side-by-side visual comparison.
+    """
+    del current_user
+    version = db.get(TimetableVersion, version_id)
+    if version is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+    return OfficialTimetablePayload.model_validate(version.payload)
+
+
 @router.get("/versions/compare", response_model=TimetableVersionCompare)
 def compare_timetable_versions(
     from_id: str = Query(..., alias="from"),
@@ -2797,11 +4947,24 @@ def upsert_official_timetable(
 
     working_hours = load_working_hours(db)
     schedule_policy = load_schedule_policy(db)
+    program_constraint = load_program_constraint(db, payload.program_id) if payload.program_id else None
+    program_daily_slots = normalize_program_daily_slots(
+        program_constraint.daily_time_slots if program_constraint is not None else None
+    )
     period_minutes = schedule_policy.period_minutes
     day_segments: dict[str, list[tuple[int, int]]] = {}
+    day_blocked_segments: dict[str, list[tuple[int, int, str]]] = {}
     for day, hours_entry in working_hours.items():
         if not hours_entry.enabled:
             continue
+        if program_daily_slots:
+            teaching_segments, blocked_segments = build_teaching_segments_from_program_slots(program_daily_slots)
+            if teaching_segments:
+                day_segments[day] = teaching_segments
+            if blocked_segments:
+                day_blocked_segments[day] = blocked_segments
+            continue
+
         day_start = parse_time_to_minutes(hours_entry.start_time)
         day_end = parse_time_to_minutes(hours_entry.end_time)
         day_segments[day] = build_teaching_segments(
@@ -2810,19 +4973,28 @@ def upsert_official_timetable(
             period_minutes=period_minutes,
             breaks=schedule_policy.breaks,
         )
+        day_blocked_segments[day] = [
+            (
+                parse_time_to_minutes(item.start_time),
+                parse_time_to_minutes(item.end_time),
+                item.name,
+            )
+            for item in schedule_policy.breaks
+        ]
 
     for slot in payload.timetable_data:
         hours_entry = working_hours.get(slot.day)
-        if hours_entry is None or not hours_entry.enabled:
+        segments = day_segments.get(slot.day, [])
+        if hours_entry is None or not hours_entry.enabled or not segments:
             if not force:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Timeslot {slot.id} occurs on a non-working day ({slot.day})",
                 )
-        allowed_start = parse_time_to_minutes(hours_entry.start_time)
-        allowed_end = parse_time_to_minutes(hours_entry.end_time)
         slot_start = parse_time_to_minutes(slot.startTime)
         slot_end = parse_time_to_minutes(slot.endTime)
+        allowed_start = min(start for start, _end in segments)
+        allowed_end = max(end for _start, end in segments)
         if slot_start < allowed_start or slot_end > allowed_end:
             if not force:
                 raise HTTPException(
@@ -2839,20 +5011,27 @@ def upsert_official_timetable(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Timeslot {slot.id} must be a multiple of {period_minutes} minutes",
                 )
-        if not is_slot_aligned_with_segments(slot_start, slot_end, day_segments.get(slot.day, [])):
+        if not is_slot_aligned_with_segments(slot_start, slot_end, segments):
             if not force:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Timeslot {slot.id} must align to configured period boundaries and break windows",
+                    detail=f"Timeslot {slot.id} must align to configured teaching slot boundaries",
                 )
-        overlapping_break = slot_overlaps_break(slot_start, slot_end, schedule_policy.breaks)
-        if overlapping_break is not None:
+        blocked_overlap = next(
+            (
+                (start, end, label)
+                for start, end, label in day_blocked_segments.get(slot.day, [])
+                if slot_start < end and slot_end > start
+            ),
+            None,
+        )
+        if blocked_overlap is not None:
             if not force:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
-                        f"Timeslot {slot.id} overlaps break '{overlapping_break.name}' "
-                        f"({overlapping_break.start_time}-{overlapping_break.end_time})"
+                        f"Timeslot {slot.id} overlaps non-teaching slot '{blocked_overlap[2]}' "
+                        f"({_minutes_to_time(blocked_overlap[0])}-{_minutes_to_time(blocked_overlap[1])})"
                     ),
                 )
 
@@ -2984,3 +5163,337 @@ def upsert_official_timetable(
         )
     db.refresh(record)
     return OfficialTimetablePayload.model_validate(record.payload)
+
+
+def _serialize_change_request_rows(
+    rows: list[TimetableChangeRequest],
+    db: Session,
+) -> list[TimetableChangeRequestOut]:
+    user_ids: set[str] = set()
+    for row in rows:
+        if row.requested_by_id:
+            user_ids.add(row.requested_by_id)
+        if row.approver_user_id:
+            user_ids.add(row.approver_user_id)
+
+    user_name_by_id: dict[str, str] = {}
+    if user_ids:
+        for item in db.execute(select(User.id, User.name).where(User.id.in_(user_ids))).all():
+            user_name_by_id[str(item.id)] = str(item.name)
+
+    result: list[TimetableChangeRequestOut] = []
+    for row in rows:
+        model = TimetableChangeRequestOut.model_validate(row)
+        result.append(
+            model.model_copy(
+                update={
+                    "requested_by_name": user_name_by_id.get(row.requested_by_id),
+                    "approver_name": user_name_by_id.get(row.approver_user_id) if row.approver_user_id else None,
+                }
+            )
+        )
+    return result
+
+
+@router.get("/change-requests", response_model=list[TimetableChangeRequestOut])
+def list_timetable_change_requests(
+    status_filter: TimetableChangeRequestStatus | None = Query(default=None, alias="status"),
+    mine: bool = Query(default=False),
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler, UserRole.faculty, UserRole.student)),
+    db: Session = Depends(get_db),
+) -> list[TimetableChangeRequestOut]:
+    statement = select(TimetableChangeRequest)
+    if status_filter is not None:
+        statement = statement.where(TimetableChangeRequest.status == status_filter)
+
+    if current_user.role not in {UserRole.admin, UserRole.scheduler}:
+        statement = statement.where(
+            (TimetableChangeRequest.requested_by_id == current_user.id)
+            | (TimetableChangeRequest.approver_user_id == current_user.id)
+        )
+    elif mine:
+        statement = statement.where(
+            (TimetableChangeRequest.requested_by_id == current_user.id)
+            | (TimetableChangeRequest.approver_user_id == current_user.id)
+        )
+
+    rows = list(
+        db.execute(
+            statement.order_by(TimetableChangeRequest.created_at.desc())
+        ).scalars()
+    )
+    return _serialize_change_request_rows(rows, db)
+
+
+@router.post("/change-requests", response_model=TimetableChangeRequestOut, status_code=status.HTTP_201_CREATED)
+def propose_timetable_change_request(
+    payload: TimetableChangeRequestProposalIn,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler, UserRole.faculty, UserRole.student)),
+    db: Session = Depends(get_db),
+) -> TimetableChangeRequestOut:
+    official_payload = _load_official_payload(db)
+    target_slot = next((item for item in official_payload.timetable_data if item.id == payload.slot_id), None)
+    if target_slot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Selected slot is not present in official timetable")
+    request_kind = (payload.request_kind or "slot_move").strip().lower()
+
+    if payload.room_id is not None and not any(item.id == payload.room_id for item in official_payload.room_data):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected roomId is not valid for this timetable")
+
+    if payload.faculty_id is not None and not any(item.id == payload.faculty_id for item in official_payload.faculty_data):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected facultyId is not valid for this timetable")
+
+    if payload.assistant_faculty_ids:
+        invalid_assistants = [
+            faculty_id
+            for faculty_id in payload.assistant_faculty_ids
+            if not any(item.id == faculty_id for item in official_payload.faculty_data)
+        ]
+        if invalid_assistants:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid assistantFacultyIds provided: {', '.join(invalid_assistants)}",
+            )
+
+    approver_user: User | None = None
+    approver_role: str | None = None
+
+    if current_user.role == UserRole.student:
+        user_section = (current_user.section_name or "").strip().lower()
+        if user_section and user_section != target_slot.section.strip().lower():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Students can only propose changes for their own section",
+            )
+        if payload.faculty_id:
+            approver_user = _resolve_faculty_user_by_id(official_payload, payload.faculty_id, db)
+        else:
+            approver_user = _resolve_faculty_user_for_slot(official_payload, target_slot, db)
+        approver_role = UserRole.faculty.value
+    elif current_user.role == UserRole.faculty:
+        faculty_email = (current_user.email or "").strip().lower()
+        allowed_faculty_ids: set[str] = {
+            item.id
+            for item in official_payload.faculty_data
+            if (item.email or "").strip().lower() == faculty_email
+        }
+        if not allowed_faculty_ids and faculty_email:
+            faculty_profile = (
+                db.execute(select(Faculty).where(func.lower(Faculty.email) == faculty_email))
+                .scalars()
+                .first()
+            )
+            if faculty_profile is not None:
+                allowed_faculty_ids.add(faculty_profile.id)
+
+        if not allowed_faculty_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Faculty profile is not mapped to your user account",
+            )
+
+        if target_slot.facultyId not in allowed_faculty_ids and not any(
+            item in allowed_faculty_ids for item in _slot_assistant_faculty_ids(target_slot)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Faculty can only propose changes for slots assigned to them",
+            )
+        target_faculty_id = (payload.faculty_id or "").strip()
+        if target_faculty_id and target_faculty_id not in allowed_faculty_ids:
+            approver_user = _resolve_faculty_user_by_id(official_payload, target_faculty_id, db)
+            approver_role = UserRole.faculty.value
+        else:
+            approver_user = _resolve_cr_student_for_section(
+                db=db,
+                program_id=official_payload.program_id,
+                term_number=official_payload.term_number,
+                section_name=target_slot.section,
+            )
+            approver_role = UserRole.student.value
+    else:
+        approver_user = current_user
+        approver_role = current_user.role.value
+
+    if approver_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No eligible approver could be resolved for this request",
+        )
+
+    request_row = TimetableChangeRequest(
+        program_id=official_payload.program_id,
+        term_number=official_payload.term_number,
+        slot_id=payload.slot_id,
+        requested_by_id=current_user.id,
+        requested_by_role=current_user.role.value,
+        approver_user_id=approver_user.id,
+        approver_role=approver_role,
+        status=TimetableChangeRequestStatus.pending,
+        proposal=payload.model_dump(by_alias=True),
+        request_note=(payload.note or "").strip() or None,
+    )
+    db.add(request_row)
+    db.flush()
+
+    create_notification(
+        db,
+        user_id=approver_user.id,
+        title="Timetable Change Request",
+        message=(
+            f"{current_user.name} requested a {request_kind.replace('_', ' ')} for slot {payload.slot_id} "
+            f"({payload.day} {payload.start_time}-{payload.end_time})."
+        ),
+        notification_type=NotificationType.timetable,
+        recipient=approver_user,
+        deliver_email=False,
+    )
+    log_activity(
+        db,
+        user=current_user,
+        action="timetable.change_request.propose",
+        entity_type="timetable_change_request",
+        entity_id=request_row.id,
+        details={
+            "slot_id": payload.slot_id,
+            "request_kind": request_kind,
+            "requested_by_role": current_user.role.value,
+            "approver_user_id": approver_user.id,
+            "approver_role": approver_role,
+        },
+    )
+    db.commit()
+    db.refresh(request_row)
+    return _serialize_change_request_rows([request_row], db)[0]
+
+
+@router.post("/change-requests/{request_id}/decision", response_model=TimetableChangeRequestDecisionOut)
+def decide_timetable_change_request(
+    request_id: str,
+    payload: TimetableChangeRequestDecisionIn,
+    current_user: User = Depends(require_roles(UserRole.admin, UserRole.scheduler, UserRole.faculty, UserRole.student)),
+    db: Session = Depends(get_db),
+) -> TimetableChangeRequestDecisionOut:
+    request_row = db.get(TimetableChangeRequest, request_id)
+    if request_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found")
+
+    if request_row.status != TimetableChangeRequestStatus.pending:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Change request is already {request_row.status.value}",
+        )
+
+    if current_user.role not in {UserRole.admin, UserRole.scheduler} and request_row.approver_user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You are not allowed to decide this request")
+
+    decision_note = (payload.note or "").strip() or None
+
+    if payload.decision == "reject":
+        request_row.status = TimetableChangeRequestStatus.rejected
+        request_row.decision_note = decision_note
+        request_row.decided_at = datetime.now(timezone.utc)
+        db.add(request_row)
+        db.commit()
+        db.refresh(request_row)
+        return TimetableChangeRequestDecisionOut(
+            request=_serialize_change_request_rows([request_row], db)[0],
+            message="Change request rejected.",
+        )
+
+    official_payload = _load_official_payload(db)
+    updated_payload, updated_slot, affected_slot_ids = _apply_change_proposal_to_payload(
+        official_payload,
+        request_row.proposal,
+    )
+    impacted_conflicts = [
+        item
+        for item in _build_conflicts(updated_payload, db)
+        if not item.resolved and any(slot_id in item.affected_slots for slot_id in affected_slot_ids)
+    ]
+
+    resolution_note_parts: list[str] = []
+    if impacted_conflicts:
+        room_only = all(item.conflict_type in ROOM_ONLY_CONFLICT_TYPES for item in impacted_conflicts)
+        if not room_only:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Proposed change introduces non-room conflicts. "
+                    "Please submit a different proposal."
+                ),
+            )
+
+        alternative_room_id = _find_alternative_room_id_for_slot(updated_payload, updated_slot)
+        if alternative_room_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only room conflict was found, but no alternative free room is available.",
+            )
+        updated_slot.roomId = alternative_room_id
+        resolution_note_parts.append(f"Room adjusted automatically to {alternative_room_id}.")
+
+        remaining_after_room_fix = [
+            item
+            for item in _build_conflicts(updated_payload, db)
+            if not item.resolved and any(slot_id in item.affected_slots for slot_id in affected_slot_ids)
+        ]
+        if remaining_after_room_fix:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not auto-resolve room conflicts for the approved request.",
+            )
+
+    version_label = f"Change Request {request_row.id[:8]}"
+    upsert_official_timetable(
+        payload=updated_payload,
+        version_label=version_label,
+        force=False,
+        current_user=current_user,
+        db=db,
+    )
+
+    request_row.status = TimetableChangeRequestStatus.applied
+    request_row.decision_note = decision_note
+    request_row.decided_at = datetime.now(timezone.utc)
+    request_row.applied_at = datetime.now(timezone.utc)
+    if resolution_note_parts:
+        request_row.resolution_note = " ".join(resolution_note_parts)
+    db.add(request_row)
+
+    requester = db.get(User, request_row.requested_by_id)
+    if requester is not None:
+        create_notification(
+            db,
+            user_id=requester.id,
+            title="Timetable Change Request Applied",
+            message=(
+                f"Your change request for slot {request_row.slot_id} was approved and applied."
+            ),
+            notification_type=NotificationType.timetable,
+            recipient=requester,
+            deliver_email=False,
+        )
+
+    log_activity(
+        db,
+        user=current_user,
+        action="timetable.change_request.apply",
+        entity_type="timetable_change_request",
+        entity_id=request_row.id,
+        details={
+            "slot_id": request_row.slot_id,
+            "request_kind": str((request_row.proposal or {}).get("requestKind") or "slot_move"),
+            "requester_id": request_row.requested_by_id,
+            "approver_id": request_row.approver_user_id,
+            "decision_note": decision_note,
+            "resolution_note": request_row.resolution_note,
+        },
+    )
+    db.commit()
+    db.refresh(request_row)
+
+    return TimetableChangeRequestDecisionOut(
+        request=_serialize_change_request_rows([request_row], db)[0],
+        message="Change request approved and timetable updated.",
+    )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -156,12 +156,22 @@ class GeneratedAlternative(BaseModel):
     occupancy_matrix: OccupancyMatrix | None = None
 
 
+class AutoResolvedConflictEntry(BaseModel):
+    conflict_id: str = Field(min_length=1, max_length=255)
+    conflict_type: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=500)
+    resolution: str = Field(min_length=1, max_length=500)
+    resolved: bool = True
+
+
 class GenerateTimetableResponse(BaseModel):
     alternatives: list[GeneratedAlternative]
     settings_used: GenerationSettingsBase
     runtime_ms: int
     published_version_label: str | None = None
     publish_warning: str | None = None
+    auto_saved_version_label: str | None = None
+    auto_resolved_conflicts: list[AutoResolvedConflictEntry] = Field(default_factory=list)
 
 
 class GenerateTimetableCycleRequest(BaseModel):
@@ -203,6 +213,7 @@ class GeneratedCycleTermResult(BaseModel):
     term_number: int
     generation: GenerateTimetableResponse
     published_version_label: str | None = None
+    auto_saved_version_label: str | None = None
 
 
 class GeneratedCycleSolutionTerm(BaseModel):
@@ -235,6 +246,47 @@ class GenerateTimetableCycleResponse(BaseModel):
     results: list[GeneratedCycleTermResult]
     pareto_front: list[GeneratedCycleSolution] = Field(default_factory=list)
     selected_solution_rank: int | None = None
+
+
+GenerationJobKind = Literal["single", "cycle"]
+GenerationJobStatus = Literal["queued", "running", "succeeded", "failed"]
+
+
+class GenerationJobAccepted(BaseModel):
+    job_id: str
+    kind: GenerationJobKind
+    status: GenerationJobStatus
+    created_at: datetime
+
+
+class GenerationJobEvent(BaseModel):
+    id: int = Field(ge=1)
+    at: datetime
+    stage: str = Field(min_length=1, max_length=100)
+    level: Literal["info", "success", "warn", "error"] = "info"
+    message: str = Field(min_length=1, max_length=500)
+    progress_percent: float | None = Field(default=None, ge=0.0, le=100.0)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    latest_generation: GenerateTimetableResponse | None = None
+
+
+class GenerationJobStatusOut(BaseModel):
+    job_id: str
+    kind: GenerationJobKind
+    status: GenerationJobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    updated_at: datetime
+    progress_percent: float | None = Field(default=None, ge=0.0, le=100.0)
+    stage: str | None = None
+    message: str | None = None
+    events: list[GenerationJobEvent] = Field(default_factory=list)
+    last_event_id: int = Field(default=0, ge=0)
+    latest_generation: GenerateTimetableResponse | None = None
+    result: GenerateTimetableResponse | GenerateTimetableCycleResponse | None = None
+    error_message: str | None = Field(default=None, max_length=1000)
+    next_poll_after_ms: int = Field(default=1500, ge=250, le=10_000)
 
 
 class ReevaluationEventOut(BaseModel):

@@ -31,6 +31,7 @@ class AvailabilityWindow(BaseModel):
 
 
 class FacultyBase(BaseModel):
+    program_id: str | None = Field(default=None, min_length=1, max_length=36)
     name: str = Field(min_length=1, max_length=200)
     designation: str = Field(default="Faculty", min_length=1, max_length=200)
     email: EmailStr
@@ -94,6 +95,7 @@ class FacultyCreate(FacultyBase):
 
 
 class FacultyUpdate(BaseModel):
+    program_id: str | None = Field(default=None, min_length=1, max_length=36)
     name: str | None = Field(default=None, min_length=1, max_length=200)
     designation: str | None = Field(default=None, min_length=1, max_length=200)
     email: EmailStr | None = None

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import os
 import re
+import math
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
 
 from app.core.security import get_password_hash
 from app.db.bootstrap import ensure_runtime_schema_compatibility
+from app.db.base import Base
 from app.db.session import SessionLocal
 from app.models.course import Course, CourseType
 from app.models.faculty import Faculty
@@ -27,6 +29,7 @@ from app.services.workload import constrained_max_hours
 
 DEFAULT_PASSWORD = os.getenv("SEED_DEFAULT_PASSWORD", "ShedForge123!")
 RESET_PASSWORDS = os.getenv("SEED_RESET_PASSWORDS", "true").strip().lower() in {"1", "true", "yes", "on"}
+RESET_ALL_DATA = os.getenv("SEED_RESET_ALL", "true").strip().lower() in {"1", "true", "yes", "on"}
 MOCK_EMAIL_DOMAIN = os.getenv("SEED_MOCK_EMAIL_DOMAIN", "university.edu").strip().lower() or "university.edu"
 ACADEMIC_YEAR = os.getenv("SEED_ACADEMIC_YEAR", "2026-2027").strip() or "2026-2027"
 SEMESTER_CYCLE = os.getenv("SEED_SEMESTER_CYCLE", "odd").strip().lower()
@@ -262,21 +265,40 @@ def build_room_availability() -> list[dict]:
     ]
 
 
-def resolve_hour_split(item: CurriculumItem) -> tuple[int, int, int, int, int]:
-    if item.course_type == CourseType.lab:
-        raw_hours = max(2, item.l + item.t + item.p)
-        if raw_hours % 2 != 0:
-            raw_hours += 1
-        return 0, raw_hours, 0, raw_hours, 2
+def reset_database(session) -> None:
+    for table in reversed(Base.metadata.sorted_tables):
+        session.execute(table.delete())
+    session.flush()
 
+
+def resolve_hour_split(item: CurriculumItem) -> tuple[int, int, int, int, int]:
     theory_hours = max(0, item.l)
-    tutorial_hours = max(0, item.t + item.p)
-    weekly_hours = theory_hours + tutorial_hours
+    tutorial_hours = max(0, item.t)
+    lab_hours = max(0, item.p)
+    weekly_hours = theory_hours + tutorial_hours + lab_hours
     if weekly_hours <= 0:
         weekly_hours = max(1, item.credits if item.credits > 0 else 1)
         theory_hours = weekly_hours
+        lab_hours = 0
         tutorial_hours = 0
-    return theory_hours, 0, tutorial_hours, weekly_hours, 1
+    return theory_hours, lab_hours, tutorial_hours, weekly_hours, 1
+
+
+def compute_ltp_credits(l: int, t: int, p: int) -> float:
+    raw = float(max(0, l) + max(0, t) + (max(0, p) / 2.0))
+    # Institutional framework uses designated credits (rounded down to whole credits).
+    return float(max(0, math.floor(raw + 1e-9)))
+
+
+def practical_contiguous_slots(code: str, lab_hours: int) -> int:
+    if lab_hours <= 0:
+        return 1
+    normalized_code = code.strip().upper()
+    if normalized_code in {"23MEE115", "23ECE285"}:
+        return min(3, lab_hours)
+    if normalized_code in {"23CSE399", "23CSE498", "23CSE499"}:
+        return min(2, lab_hours)
+    return min(2, lab_hours)
 
 
 def upsert_user(
@@ -285,8 +307,12 @@ def upsert_user(
     name: str,
     email: str,
     role: UserRole,
+    program_id: str | None,
     department: str | None,
     section_name: str | None,
+    semester_number: int | None = None,
+    batch_year: int | None = None,
+    roll_number: str | None = None,
 ) -> User:
     normalized_email = normalize_email(email)
     existing = session.execute(
@@ -300,16 +326,24 @@ def upsert_user(
             email=normalized_email,
             hashed_password=hashed_password,
             role=role,
+            program_id=program_id if role in {UserRole.faculty, UserRole.student} else None,
             department=department,
             section_name=section_name if role == UserRole.student else None,
+            semester_number=semester_number if role == UserRole.student else None,
+            batch_year=batch_year if role == UserRole.student else None,
+            roll_number=roll_number if role == UserRole.student else None,
             is_active=True,
         )
         session.add(existing)
     else:
         existing.name = name
         existing.role = role
+        existing.program_id = program_id if role in {UserRole.faculty, UserRole.student} else None
         existing.department = department
         existing.section_name = section_name if role == UserRole.student else None
+        existing.semester_number = semester_number if role == UserRole.student else None
+        existing.batch_year = batch_year if role == UserRole.student else None
+        existing.roll_number = roll_number if role == UserRole.student else None
         existing.is_active = True
         if RESET_PASSWORDS:
             existing.hashed_password = hashed_password
@@ -320,6 +354,7 @@ def upsert_user(
 def upsert_faculty(
     session,
     *,
+    program_id: str,
     name: str,
     designation: str,
     email: str,
@@ -340,6 +375,7 @@ def upsert_faculty(
 
     if existing is None:
         existing = Faculty(
+            program_id=program_id,
             name=name,
             designation=designation,
             email=normalized_email,
@@ -356,6 +392,7 @@ def upsert_faculty(
         )
         session.add(existing)
     else:
+        existing.program_id = program_id
         existing.name = name
         existing.designation = designation
         existing.email = normalized_email
@@ -384,6 +421,12 @@ def upsert_program(session) -> Program:
             duration_years=4,
             sections=8,
             total_students=32 * 65,
+            default_section_capacity=65,
+            home_building="Academic Block",
+            course_mapping_enabled=True,
+            faculty_mapping_enabled=True,
+            student_mapping_enabled=True,
+            room_mapping_enabled=True,
         )
         session.add(program)
     else:
@@ -393,6 +436,12 @@ def upsert_program(session) -> Program:
         program.duration_years = 4
         program.sections = 8
         program.total_students = 32 * 65
+        program.default_section_capacity = 65
+        program.home_building = "Academic Block"
+        program.course_mapping_enabled = True
+        program.faculty_mapping_enabled = True
+        program.student_mapping_enabled = True
+        program.room_mapping_enabled = True
     session.flush()
     return program
 
@@ -494,7 +543,7 @@ def upsert_semester_constraints(session) -> None:
                 setattr(constraint, key, value)
 
 
-def upsert_rooms(session) -> None:
+def upsert_rooms(session, program: Program) -> None:
     floor_labels = {
         1: "Ground Floor",
         2: "First Floor",
@@ -507,11 +556,12 @@ def upsert_rooms(session) -> None:
             for index in range(1, 4):
                 room_name = f"{wing}{floor}0{index}"
                 room = session.execute(
-                    select(Room).where(Room.name == room_name)
+                    select(Room).where(Room.program_id == program.id, Room.name == room_name)
                 ).scalar_one_or_none()
                 capacity = [60, 65, 70][index - 1]
                 if room is None:
                     room = Room(
+                        program_id=program.id,
                         name=room_name,
                         building=f"Academic Block - {floor_labels[floor]}",
                         capacity=capacity,
@@ -532,10 +582,11 @@ def upsert_rooms(session) -> None:
     for index in range(1, 6):
         room_name = f"LAB-{index}"
         room = session.execute(
-            select(Room).where(Room.name == room_name)
+            select(Room).where(Room.program_id == program.id, Room.name == room_name)
         ).scalar_one_or_none()
         if room is None:
             room = Room(
+                program_id=program.id,
                 name=room_name,
                 building="Academic Block - Laboratory Wing",
                 capacity=70,
@@ -575,14 +626,21 @@ def upsert_courses_and_mappings(session, program: Program, faculty_by_key: dict[
         theory_hours, lab_hours, tutorial_hours, hours_per_week, duration_hours = resolve_hour_split(item)
         faculty_id = real_teacher.id if real_teacher and item.code.upper() in preferred_real_codes else None
         course = session.execute(
-            select(Course).where(Course.code == item.code)
+            select(Course).where(
+                Course.program_id == program.id,
+                Course.code == item.code,
+            )
         ).scalar_one_or_none()
+        credits = compute_ltp_credits(theory_hours, tutorial_hours, lab_hours)
+        is_project_phase = "project phase" in item.name.lower()
+        contiguous_slots = practical_contiguous_slots(item.code, lab_hours)
         if course is None:
             course = Course(
+                program_id=program.id,
                 code=item.code,
                 name=item.name,
                 type=item.course_type,
-                credits=item.credits,
+                credits=credits,
                 duration_hours=duration_hours,
                 sections=len(SECTION_NAMES),
                 hours_per_week=hours_per_week,
@@ -591,13 +649,16 @@ def upsert_courses_and_mappings(session, program: Program, faculty_by_key: dict[
                 theory_hours=theory_hours,
                 lab_hours=lab_hours,
                 tutorial_hours=tutorial_hours,
+                batch_segregation=not is_project_phase,
+                practical_contiguous_slots=contiguous_slots,
                 faculty_id=faculty_id,
             )
             session.add(course)
         else:
+            course.program_id = program.id
             course.name = item.name
             course.type = item.course_type
-            course.credits = item.credits
+            course.credits = credits
             course.duration_hours = duration_hours
             course.sections = len(SECTION_NAMES)
             course.hours_per_week = hours_per_week
@@ -606,6 +667,8 @@ def upsert_courses_and_mappings(session, program: Program, faculty_by_key: dict[
             course.theory_hours = theory_hours
             course.lab_hours = lab_hours
             course.tutorial_hours = tutorial_hours
+            course.batch_segregation = not is_project_phase
+            course.practical_contiguous_slots = contiguous_slots
             course.faculty_id = faculty_id
         session.flush()
 
@@ -636,7 +699,7 @@ def upsert_courses_and_mappings(session, program: Program, faculty_by_key: dict[
                 mapping.prerequisite_course_ids = []
 
 
-def seed_faculty_and_faculty_users(session) -> dict[str, Faculty]:
+def seed_faculty_and_faculty_users(session, program: Program) -> dict[str, Faculty]:
     used_emails = {normalize_email(ADMIN_PROFILE["email"]), normalize_email(REAL_STUDENT_PROFILE["email"])}
     preferred_pool, term_by_code = build_default_preferences()
     faculty_by_key: dict[str, Faculty] = {}
@@ -671,6 +734,7 @@ def seed_faculty_and_faculty_users(session) -> dict[str, Faculty]:
 
         faculty = upsert_faculty(
             session,
+            program_id=program.id,
             name=name,
             designation=designation,
             email=email,
@@ -682,6 +746,7 @@ def seed_faculty_and_faculty_users(session) -> dict[str, Faculty]:
             name=name,
             email=email,
             role=UserRole.faculty,
+            program_id=program.id,
             department=DEPARTMENT,
             section_name=None,
         )
@@ -690,12 +755,13 @@ def seed_faculty_and_faculty_users(session) -> dict[str, Faculty]:
     return faculty_by_key
 
 
-def seed_admin_and_students(session) -> None:
+def seed_admin_and_students(session, program: Program) -> None:
     upsert_user(
         session,
         name=ADMIN_PROFILE["name"],
         email=ADMIN_PROFILE["email"],
         role=ADMIN_PROFILE["role"],
+        program_id=None,
         department=ADMIN_PROFILE["department"],
         section_name=ADMIN_PROFILE["section_name"],
     )
@@ -705,8 +771,12 @@ def seed_admin_and_students(session) -> None:
         name=REAL_STUDENT_PROFILE["name"],
         email=REAL_STUDENT_PROFILE["email"],
         role=REAL_STUDENT_PROFILE["role"],
+        program_id=program.id,
         department=REAL_STUDENT_PROFILE["department"],
         section_name=REAL_STUDENT_PROFILE["section_name"],
+        semester_number=1,
+        batch_year=1,
+        roll_number="CSE-A-0001",
     )
 
     for section in SECTION_NAMES:
@@ -716,8 +786,12 @@ def seed_admin_and_students(session) -> None:
                 name=f"Mock Student {section}{index}",
                 email=f"student.{section.lower()}{index}@{MOCK_EMAIL_DOMAIN}",
                 role=UserRole.student,
+                program_id=program.id,
                 department=DEPARTMENT,
                 section_name=section,
+                semester_number=1,
+                batch_year=1,
+                roll_number=f"CSE-{section}-{index:03d}",
             )
 
 
@@ -728,6 +802,7 @@ def ensure_all_faculty_have_users(session) -> None:
             name=faculty.name,
             email=faculty.email,
             role=UserRole.faculty,
+            program_id=faculty.program_id,
             department=faculty.department,
             section_name=None,
         )
@@ -743,14 +818,17 @@ def count_by_role(session) -> dict[str, int]:
 def main() -> None:
     ensure_runtime_schema_compatibility()
     with SessionLocal() as session:
+        if RESET_ALL_DATA:
+            reset_database(session)
+
         program = upsert_program(session)
         upsert_terms_and_sections(session, program)
         upsert_institution_settings(session)
         upsert_semester_constraints(session)
-        upsert_rooms(session)
+        upsert_rooms(session, program)
 
-        faculty_by_key = seed_faculty_and_faculty_users(session)
-        seed_admin_and_students(session)
+        faculty_by_key = seed_faculty_and_faculty_users(session, program)
+        seed_admin_and_students(session, program)
         upsert_courses_and_mappings(session, program, faculty_by_key)
         ensure_all_faculty_have_users(session)
 

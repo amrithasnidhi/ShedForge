@@ -1,4 +1,4 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 function getAuthHeaders(): HeadersInit {
   if (typeof window === "undefined") {
@@ -25,6 +25,32 @@ async function handleResponse<T>(response: Response, errorMessage: string): Prom
   return response.json() as Promise<T>;
 }
 
+function resolveApiBaseCandidates(): string[] {
+  const candidates = new Set<string>([API_BASE_URL]);
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host) {
+      candidates.add(`http://${host}:8000`);
+    }
+    candidates.add("http://localhost:8000");
+    candidates.add("http://127.0.0.1:8000");
+  }
+  return Array.from(candidates);
+}
+
+async function fetchWithApiFallback(path: string, init?: RequestInit): Promise<Response> {
+  const candidates = resolveApiBaseCandidates();
+  let lastError: Error | null = null;
+  for (const base of candidates) {
+    try {
+      return await fetch(`${base}${path}`, init);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error("Network error");
+    }
+  }
+  throw lastError ?? new Error("Unable to reach backend API");
+}
+
 export type ProgramDegree = "BS" | "MS" | "PhD";
 
 export interface Program {
@@ -36,6 +62,12 @@ export interface Program {
   duration_years: number;
   sections: number;
   total_students: number;
+  default_section_capacity: number;
+  home_building: string | null;
+  course_mapping_enabled: boolean;
+  faculty_mapping_enabled: boolean;
+  student_mapping_enabled: boolean;
+  room_mapping_enabled: boolean;
 }
 
 export type ProgramCreate = Omit<Program, "id">;
@@ -329,6 +361,7 @@ export type CourseType = "theory" | "lab" | "elective";
 
 export interface Course {
   id: string;
+  program_id: string;
   code: string;
   name: string;
   type: CourseType;
@@ -336,26 +369,33 @@ export interface Course {
   duration_hours: number;
   sections: number;
   hours_per_week: number;
-   semester_number: number;
-   batch_year: number;
-   theory_hours: number;
-   lab_hours: number;
-   tutorial_hours: number;
+  semester_number: number;
+  batch_year: number;
+  theory_hours: number;
+  lab_hours: number;
+  tutorial_hours: number;
+  batch_segregation: boolean;
+  practical_contiguous_slots: number;
+  assign_faculty: boolean;
+  assign_classroom: boolean;
+  default_room_id?: string | null;
+  elective_category?: string | null;
   faculty_id?: string | null;
 }
 
-export type CourseCreate = Omit<Course, "id">;
+export type CourseCreate = Omit<Course, "id" | "program_id"> & { program_id?: string };
 export type CourseUpdate = Partial<CourseCreate>;
 
-export async function listCourses(): Promise<Course[]> {
-  const response = await fetch(`${API_BASE_URL}/api/courses`, {
+export async function listCourses(programId?: string): Promise<Course[]> {
+  const query = programId ? `?program_id=${encodeURIComponent(programId)}` : "";
+  const response = await fetchWithApiFallback(`/api/courses/${query}`, {
     headers: getAuthHeaders(),
   });
   return handleResponse<Course[]>(response, "Unable to load courses");
 }
 
 export async function createCourse(payload: CourseCreate): Promise<Course> {
-  const response = await fetch(`${API_BASE_URL}/api/courses`, {
+  const response = await fetch(`${API_BASE_URL}/api/courses/`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...getAuthHeaders() },
     body: JSON.stringify(payload),
@@ -386,6 +426,7 @@ export type RoomType = "lecture" | "lab" | "seminar";
 
 export interface Room {
   id: string;
+  program_id: string;
   name: string;
   building: string;
   capacity: number;
@@ -395,13 +436,15 @@ export interface Room {
   availability_windows: Array<{ day: string; start_time: string; end_time: string }>;
 }
 
-export type RoomCreate = Omit<Room, "id" | "availability_windows"> & {
+export type RoomCreate = Omit<Room, "id" | "program_id" | "availability_windows"> & {
+  program_id?: string;
   availability_windows?: Array<{ day: string; start_time: string; end_time: string }>;
 };
 export type RoomUpdate = Partial<RoomCreate>;
 
-export async function listRooms(): Promise<Room[]> {
-  const response = await fetch(`${API_BASE_URL}/api/rooms`, {
+export async function listRooms(programId?: string): Promise<Room[]> {
+  const query = programId ? `?program_id=${encodeURIComponent(programId)}` : "";
+  const response = await fetch(`${API_BASE_URL}/api/rooms${query}`, {
     headers: getAuthHeaders(),
   });
   return handleResponse<Room[]>(response, "Unable to load rooms");
@@ -440,6 +483,7 @@ export async function updateRoom(roomId: string, payload: RoomUpdate): Promise<R
 
 export interface Faculty {
   id: string;
+  program_id: string;
   name: string;
   designation: string;
   email: string;
@@ -456,6 +500,7 @@ export interface Faculty {
 }
 
 export interface FacultyCreate {
+  program_id?: string;
   name: string;
   email: string;
   department: string;
@@ -473,8 +518,9 @@ export interface FacultyCreate {
 
 export type FacultyUpdate = Partial<Omit<Faculty, "id">>;
 
-export async function listFaculty(): Promise<Faculty[]> {
-  const response = await fetch(`${API_BASE_URL}/api/faculty`, {
+export async function listFaculty(programId?: string): Promise<Faculty[]> {
+  const query = programId ? `?program_id=${encodeURIComponent(programId)}` : "";
+  const response = await fetch(`${API_BASE_URL}/api/faculty${query}`, {
     headers: getAuthHeaders(),
   });
   return handleResponse<Faculty[]>(response, "Unable to load faculty");
@@ -529,14 +575,19 @@ export interface StudentUser {
   id: string;
   name: string;
   email: string;
+  program_id: string | null;
   department: string | null;
   section_name: string | null;
+  semester_number: number | null;
+  batch_year: number | null;
+  roll_number: string | null;
   is_active: boolean;
   created_at: string;
 }
 
-export async function listStudents(): Promise<StudentUser[]> {
-  const response = await fetch(`${API_BASE_URL}/api/students`, {
+export async function listStudents(programId?: string): Promise<StudentUser[]> {
+  const query = programId ? `?program_id=${encodeURIComponent(programId)}` : "";
+  const response = await fetch(`${API_BASE_URL}/api/students${query}`, {
     headers: getAuthHeaders(),
   });
   return handleResponse<StudentUser[]>(response, "Unable to load students");

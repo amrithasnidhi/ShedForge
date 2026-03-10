@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Integer, JSON, String
+from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -17,9 +17,13 @@ class RoomType(str, Enum):
 
 class Room(Base):
     __tablename__ = "rooms"
+    __table_args__ = (
+        UniqueConstraint("program_id", "name", name="uq_rooms_program_name"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    name: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    program_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     building: Mapped[str] = mapped_column(String(200), nullable=False)
     capacity: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
     type: Mapped[RoomType] = mapped_column(SAEnum(RoomType, name="room_type"), nullable=False)

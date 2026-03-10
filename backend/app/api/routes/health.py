@@ -27,9 +27,33 @@ def health_live() -> dict:
 @router.get("/health/ready")
 def health_ready() -> JSONResponse:
     required_columns = {
-        "users": {"id", "email", "role", "section_name"},
-        "faculty": {"id", "email", "preferred_subject_codes", "semester_preferences"},
-        "courses": {"id", "semester_number", "batch_year", "theory_hours", "lab_hours", "tutorial_hours"},
+        "users": {
+            "id",
+            "email",
+            "role",
+            "section_name",
+            "program_id",
+            "semester_number",
+            "batch_year",
+            "roll_number",
+        },
+        "faculty": {"id", "email", "program_id", "preferred_subject_codes", "semester_preferences"},
+        "courses": {
+            "id",
+            "code",
+            "program_id",
+            "semester_number",
+            "batch_year",
+            "theory_hours",
+            "lab_hours",
+            "tutorial_hours",
+            "batch_segregation",
+            "practical_contiguous_slots",
+            "assign_faculty",
+            "assign_classroom",
+            "default_room_id",
+            "elective_category",
+        },
         "institution_settings": {"id", "academic_year", "semester_cycle"},
     }
     db_ok = True
